@@ -1,0 +1,10 @@
+# Nada da árvore de planejamento nem de desenvolvimento entra na imagem.
+.git
+.planning
+.claude
+data
+frontend/node_modules
+**/__pycache__
+.venv
+.pytest_cache
+.ruff_cache
