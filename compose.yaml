@@ -1,0 +1,34 @@
+# Compose de desenvolvimento do Baixou (D-04, na raiz — decisão D-04).
+# Dois serviços da MESMA imagem; a única comunicação entre eles é o SQLite
+# em /data (modo WAL). Ambos aplicam as migrações na subida — a corrida é
+# resolvida pelo lock do banco (BEGIN IMMEDIATE + busy_timeout), então não
+# há ordenação entre serviços nem serviço migrate one-shot (D-03).
+# O compose de instalação (imagem do GHCR, porta em 127.0.0.1) é artefato da Fase 6.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "baixou.web.main"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      # Mede a vida do worker via /healthz (sem login, sem dados no corpo).
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "baixou.worker.main"]
+    volumes:
+      - ./data:/data
+
+# O volume precisa ser de armazenamento LOCAL: WAL não funciona em NFS/mount
+# de rede. No Docker Desktop do Windows, se o bind mount ./data mostrar
+# flakiness de lock do SQLite, trocar por volume nomeado é a adaptação correta
+# (dev-only; o alvo de referência é Linux).
