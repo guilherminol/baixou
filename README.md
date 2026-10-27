@@ -55,15 +55,22 @@ degradação de fontes/canais aparece na página, nunca derruba o `/healthz`.
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a
 subida, com a mensagem nomeando a variável** (o valor nunca aparece em logs ou
-erros). Segredos aceitarão também o sufixo `_FILE` (valor lido de um arquivo,
-convenção dos secrets do Docker) — o mecanismo completo chega na Fase 1, plano
-02.
+erros).
+
+**Segredos aceitam o sufixo `_FILE`** (convenção dos secrets do Docker): com
+`NOME_FILE=/caminho/do/arquivo`, o valor de `NOME` é lido do arquivo (uma
+newline final é removida). A **variável de ambiente tem prioridade sobre o
+arquivo** — se `NOME` e `NOME_FILE` existem, o valor de `NOME` vence e o
+arquivo não é lido. Arquivo ausente ou ilegível também impede a subida,
+nomeando a variável `NOME_FILE`. O valor lido de um `_FILE` nunca aparece em
+log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
+`TELEGRAM_TOKEN_FILE`), inclusive os que chegam em fases futuras.
 
 | Variável     | Padrão              | Função                          |
 | ------------ | ------------------- | ------------------------------- |
 | `DATA_DIR`   | `/data`             | Pasta do banco SQLite           |
-| `TZ_MARKET`  | `America/Sao_Paulo` | Fuso do pregão da B3            |
-| `POLL_MINUTES` | `15`              | Intervalo das rodadas do worker |
+| `TZ_MARKET`  | `America/Sao_Paulo` | Fuso do pregão da B3 (nome de zona IANA, nunca offset) |
+| `POLL_MINUTES` | `15`              | Intervalo das rodadas do worker (inteiro > 0) |
 | `LOG_LEVEL`  | `info`              | Nível do log (`debug`, `info`, `warning`, `error`) |
 
 ## Estrutura
