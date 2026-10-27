@@ -155,9 +155,7 @@ def test_round_heartbeat_refreshes_lock_timestamp(db):
     assert worker_main.acquire_instance_lock(db, "host-a:111", _TTL_S) is True
     before = db.execute("SELECT worker_lock_at FROM run WHERE id = 1").fetchone()["worker_lock_at"]
     worker_main.run_round(db)
-    row = db.execute(
-        "SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1"
-    ).fetchone()
+    row = db.execute("SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1").fetchone()
     assert row["worker_id"] == "host-a:111"
     assert row["worker_lock_at"] >= before  # lock fresco é efeito do batimento
     assert row["last_run"] is not None
@@ -169,9 +167,7 @@ def test_clean_stop_finishes_startup_round_and_releases_lock(settings, db):
     stop.set()  # como após SIGTERM: uma rodada de subida e sai limpo
     worker_main.serve_until(db, settings, stop)
     worker_main.release_instance_lock(db, "host-a:111")  # o finally do main()
-    row = db.execute(
-        "SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1"
-    ).fetchone()
+    row = db.execute("SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1").fetchone()
     assert row["worker_id"] is None
     assert row["worker_lock_at"] is None
     assert row["last_run"] is not None  # rodada de subida terminou (não pela metade)
