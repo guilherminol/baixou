@@ -2,7 +2,9 @@
 
 Stdlib puro — este módulo é importado pelo worker (D-07): proibido dotenv e
 pydantic. Uma variável inválida impede a subida nomeando a variável; o valor
-lido nunca aparece na mensagem nem no log (K2). Segredos aceitam o sufixo
+lido nunca aparece na mensagem nem no log (K2). O padrão de cada variável só
+se aplica quando ela está de fato ausente do ambiente — um valor presente,
+mesmo vazio, segue para a validação. Segredos aceitam o sufixo
 ``_FILE`` (convenção dos secrets do Docker): ``NOME_FILE`` lê o valor de um
 arquivo; a variável ``NOME`` direta tem prioridade sobre o arquivo.
 """
@@ -81,7 +83,12 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
             return value
         return None
 
-    data_dir = Path(resolve("DATA_DIR") or "/data")
+    raw_data_dir = resolve("DATA_DIR")
+    if raw_data_dir is None:  # padrão só na ausência real — string vazia é valor inválido
+        raw_data_dir = "/data"
+    if not raw_data_dir.strip():
+        _fail("DATA_DIR", "o caminho não pode ser vazio")
+    data_dir = Path(raw_data_dir)
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         probe = data_dir / ".baixou-write-probe"
@@ -90,7 +97,9 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     except OSError:
         _fail("DATA_DIR", "a pasta não pôde ser criada nem gravada")
 
-    tz_market = resolve("TZ_MARKET") or "America/Sao_Paulo"
+    tz_market = resolve("TZ_MARKET")
+    if tz_market is None:  # ausente → padrão; string vazia segue para a validação
+        tz_market = "America/Sao_Paulo"
     try:
         ZoneInfo(tz_market)  # nome de zona IANA, nunca offset (Pitfall 5)
     except ZoneInfoNotFoundError, ValueError, KeyError:
@@ -99,14 +108,20 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
             "use o nome de uma zona IANA (ex.: America/Sao_Paulo), nunca um offset",
         )
 
+    raw_poll = resolve("POLL_MINUTES")
+    if raw_poll is None:  # ausente → padrão; string vazia falha no int abaixo
+        raw_poll = "15"
     try:
-        poll_minutes = int((resolve("POLL_MINUTES") or "15").strip())
+        poll_minutes = int(raw_poll.strip())
     except ValueError:
         _fail("POLL_MINUTES", "use um inteiro maior que zero")
     if poll_minutes <= 0:
         _fail("POLL_MINUTES", "use um inteiro maior que zero")
 
-    log_level = (resolve("LOG_LEVEL") or "info").strip().lower()
+    log_level = resolve("LOG_LEVEL")
+    if log_level is None:  # ausente → padrão; string vazia não está no conjunto
+        log_level = "info"
+    log_level = log_level.strip().lower()
     if log_level not in _VALID_LOG_LEVELS:
         _fail("LOG_LEVEL", f"use um de: {', '.join(_VALID_LOG_LEVELS)}")
 
