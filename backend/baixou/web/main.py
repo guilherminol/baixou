@@ -40,7 +40,10 @@ def create_app(settings: Settings) -> FastAPI:
             return Response(status_code=503)
         try:
             recorded = datetime.fromisoformat(str(last_run).replace("Z", "+00:00"))
-        except ValueError:
+        except TypeError, ValueError:
+            # Qualquer falha de parse → 503 com corpo vazio; exceção NUNCA
+            # chega ao cliente. O corpo é vazio também no 503: sem causa, sem
+            # versão (proibição K1 / T-01-08 — o /healthz é só sinal de vida).
             return Response(status_code=503)
         if recorded.tzinfo is None:
             return Response(status_code=503)
