@@ -8,7 +8,7 @@ sem cabeçalhos de versão — mede a vida do worker (run.last_run) contra
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import uvicorn
 from fastapi import FastAPI, Response
@@ -45,7 +45,7 @@ def create_app(settings: Settings) -> FastAPI:
         if recorded.tzinfo is None:
             return Response(status_code=503)
 
-        age = datetime.now(timezone.utc) - recorded
+        age = datetime.now(UTC) - recorded
         if timedelta(0) <= age < deadline:
             return Response(status_code=200)
         return Response(status_code=503)

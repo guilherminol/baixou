@@ -9,7 +9,6 @@ exatamente 1 linha e as 10 tabelas íntegras.
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 
 import pytest
@@ -34,9 +33,7 @@ def _schema_state(db_path) -> tuple[list[str], set[str]]:
     """Versões em schema_migrations e nomes de tabelas do banco."""
     conn = connect(db_path, timeout_s=WORKER_TIMEOUT_S)
     try:
-        versions = [
-            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
-        ]
+        versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -74,7 +71,8 @@ def test_newer_schema_is_refused(settings, capsys):
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     with conn:
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES ('9999', '2020-01-01T00:00:00Z')"
+            "INSERT INTO schema_migrations (version, applied_at) "
+            "VALUES ('9999', '2020-01-01T00:00:00Z')"
         )
     conn.close()
 
