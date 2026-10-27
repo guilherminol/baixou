@@ -38,6 +38,20 @@ uv run python -m baixou.web.main      # em outro
 uv run pytest                          # testes (sem rede)
 ```
 
+Notas da Opção 1 (Docker):
+
+- Os dados vivem no volume nomeado `baixou-data` e persistem entre subidas.
+  `docker compose down` mantém o volume; `docker compose down -v` apaga o
+  volume e o banco.
+- Nenhum passo de preparação de pasta é necessário na máquina: o dono correto
+  do `/data` vem da imagem no primeiro uso — é isso que torna a primeira
+  subida verde em Linux.
+- Já subiu com a montagem de diretório anterior? O volume novo nasce vazio e
+  os dados antigos do diretório do host não migram sozinhos — antes da Fase 2
+  não existe dado de valor no banco; recomeçar é seguro.
+- Os serviços reiniciam sozinhos após um crash (política `unless-stopped`);
+  uma parada explícita com `docker stop` continua sendo respeitada.
+
 ## Contrato do `/healthz`
 
 `GET /healthz` mede a vida do **worker**, não do mercado:
