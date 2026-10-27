@@ -12,7 +12,7 @@ pelos chamadores. Nunca registra tokens, senhas ou valores de segredo.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 _LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40}
 _min_level = _LEVELS["info"]
@@ -48,7 +48,7 @@ def log(
     numeric = _LEVELS.get(level.strip().lower())
     if numeric is None or numeric < _min_level:
         return
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     parts = [timestamp, level.strip().upper(), component, event]
     parts.extend(f"{key}={_format_value(value)}" for key, value in fields.items())
     line = " ".join(parts)

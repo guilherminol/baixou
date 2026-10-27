@@ -9,7 +9,7 @@ no plano 01-02.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from baixou.core.config import load_settings
@@ -59,7 +59,7 @@ def test_worker_heartbeat_then_healthz_returns_200_with_empty_body(settings):
 def test_stale_heartbeat_older_than_3x_interval_returns_503_with_empty_body(settings):
     apply_migrations(settings.db_path)
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
-    stale = datetime.now(timezone.utc) - timedelta(minutes=3 * settings.poll_minutes)
+    stale = datetime.now(UTC) - timedelta(minutes=3 * settings.poll_minutes)
     with write_tx(conn):
         conn.execute("UPDATE run SET last_run = ? WHERE id = 1", (stale.isoformat(),))
     conn.close()
@@ -74,7 +74,7 @@ def test_worker_records_last_run_as_utc_iso_8601(db):
     row = db.execute("SELECT last_run FROM run WHERE id = 1").fetchone()
     parsed = datetime.fromisoformat(row["last_run"].replace("Z", "+00:00"))
     assert parsed.tzinfo is not None
-    age = datetime.now(timezone.utc) - parsed
+    age = datetime.now(UTC) - parsed
     assert timedelta(0) <= age < timedelta(minutes=1)
 
 

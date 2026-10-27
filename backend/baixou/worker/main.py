@@ -11,7 +11,7 @@ import signal
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from baixou.core.config import load_settings
@@ -22,7 +22,7 @@ from baixou.worker.scheduler import next_slot, wait_until
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def run_round(conn: sqlite3.Connection) -> float:
@@ -65,7 +65,7 @@ def main() -> None:
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     _log_round_completed(run_round(conn))  # ao subir: rodada imediata
     while not stop.is_set():
-        target = next_slot(datetime.now(timezone.utc), settings.poll_minutes, tz)
+        target = next_slot(datetime.now(UTC), settings.poll_minutes, tz)
         if wait_until(target, stop):
             _log_round_completed(run_round(conn))
     conn.close()

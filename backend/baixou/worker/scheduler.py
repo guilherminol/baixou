@@ -9,7 +9,7 @@ NTP são absorvidos.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 _MAX_SLICE_S = 60.0
@@ -28,10 +28,10 @@ def next_slot(now_utc: datetime, minutes: int, tz: ZoneInfo) -> datetime:
     elapsed_s = (local - midnight).total_seconds()
     k = int(elapsed_s // (minutes * 60)) + 1
     candidate_local = midnight + step * k
-    candidate = candidate_local.astimezone(timezone.utc)
+    candidate = candidate_local.astimezone(UTC)
     while candidate <= now_utc:  # segurança para transições de fuso (DST)
         candidate_local = candidate_local + step
-        candidate = candidate_local.astimezone(timezone.utc)
+        candidate = candidate_local.astimezone(UTC)
     return candidate
 
 
@@ -41,7 +41,7 @@ def wait_until(target: datetime, stop: threading.Event) -> bool:
     Devolve True quando o alvo chega; False se ``stop`` foi acionado antes.
     """
     while not stop.is_set():
-        remaining_s = (target - datetime.now(timezone.utc)).total_seconds()
+        remaining_s = (target - datetime.now(UTC)).total_seconds()
         if remaining_s <= 0:
             return True
         stop.wait(min(remaining_s, _MAX_SLICE_S))

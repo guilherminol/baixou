@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from baixou.core.db import WORKER_TIMEOUT_S, connect
@@ -31,7 +31,7 @@ def default_migrations_dir() -> Path:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ensure_wal(conn: sqlite3.Connection) -> None:
@@ -114,7 +114,8 @@ def apply_migrations(db_path: str | Path, migrations_dir: Path | None = None) ->
                 + path.read_text(encoding="utf-8")
                 + "\nINSERT INTO schema_migrations (version, applied_at) "
                 + f"SELECT '{version}', '{_utc_now_iso()}' "
-                + f"WHERE NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '{version}');\n"
+                + "WHERE NOT EXISTS (SELECT 1 FROM schema_migrations "
+                + f"WHERE version = '{version}');\n"
                 + "COMMIT;\n"
             )
             try:
