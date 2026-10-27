@@ -45,6 +45,24 @@ def test_defaults_without_env(monkeypatch, tmp_path):
     assert settings.secrets == {}
 
 
+@pytest.mark.parametrize("variable", ["DATA_DIR", "TZ_MARKET", "POLL_MINUTES", "LOG_LEVEL"])
+def test_empty_string_exits_naming_variable(monkeypatch, tmp_path, capsys, variable):
+    """String vazia definida é inválida: impede a subida nomeando a variável (SC-3/WR-01).
+
+    O padrão só vale quando a variável está de fato ausente — um valor presente,
+    mesmo vazio, segue para a validação do campo e sai por config_invalid.
+    """
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, variable, captured)
+    if variable == "DATA_DIR":
+        assert "caminho" in captured.out + captured.err  # hint PT-BR: não pode ser vazio
+
+
 def test_poll_minutes_not_numeric_exits_naming_variable(monkeypatch, tmp_path, capsys):
     """POLL_MINUTES="abc" impede a subida; o valor nunca aparece na saída."""
     _base_env(monkeypatch, tmp_path)
