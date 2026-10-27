@@ -12,8 +12,9 @@ services:
     command: ["python", "-m", "baixou.web.main"]
     ports:
       - "127.0.0.1:8000:8000"
+    restart: unless-stopped
     volumes:
-      - ./data:/data
+      - baixou-data:/data
     healthcheck:
       # Mede a vida do worker via /healthz (sem login, sem dados no corpo).
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
@@ -25,10 +26,23 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     command: ["python", "-m", "baixou.worker.main"]
+    restart: unless-stopped
     volumes:
-      - ./data:/data
+      - baixou-data:/data
 
-# O volume precisa ser de armazenamento LOCAL: WAL não funciona em NFS/mount
-# de rede. No Docker Desktop do Windows, se o bind mount ./data mostrar
-# flakiness de lock do SQLite, trocar por volume nomeado é a adaptação correta
-# (dev-only; o alvo de referência é Linux).
+volumes:
+  baixou-data:
+
+# Por que volume NOMEADO e não diretório do host (CR-01 da revisão da Fase 1):
+# em Linux — o alvo de referência — o daemon cria o diretório de um bind mount
+# inexistente como root:root, e o contêiner roda como usuário não-root (baixou);
+# o probe de escrita do DATA_DIR recebe PermissionError e o fail-fast encerra os
+# dois serviços na primeira subida. O volume nomeado não tem esse problema: o
+# primeiro uso copia para o volume o dono do ponto de montagem da imagem —
+# baixou:baixou, pelo chown de /data no docker/Dockerfile (não mexer nele: é a
+# outra metade do mecanismo). O volume é de armazenamento LOCAL por definição
+# (driver local padrão): WAL não funciona em NFS/mount de rede.
+# A política unless-stopped devolve o serviço após crash; um `docker stop`
+# explícito continua sendo respeitado (WR-03 da revisão). Continua sem
+# ordenação nem serviço extra entre os serviços (D-03): a política cobre
+# recuperação pós-crash, não ordem de subida.
