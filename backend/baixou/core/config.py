@@ -91,9 +91,11 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     data_dir = Path(raw_data_dir)
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
-        probe = data_dir / ".baixou-write-probe"
+        # Nome por pid: web e worker sobem juntos (D-03) e cada processo só
+        # enxerga e limpa o próprio probe — sem corrida write/unlink entre eles.
+        probe = data_dir / f".baixou-write-probe.{os.getpid()}"
         probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        probe.unlink(missing_ok=True)
     except OSError:
         _fail("DATA_DIR", "a pasta não pôde ser criada nem gravada")
 

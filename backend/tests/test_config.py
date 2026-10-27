@@ -9,6 +9,8 @@ segredo jamais pode aparecer em log, mensagem de erro ou exceção (K2).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from baixou.core.config import load_settings
 
@@ -182,3 +184,27 @@ def test_unknown_env_variables_are_tolerated(monkeypatch, tmp_path):
     monkeypatch.setenv("FUTURA_VARIAVEL", "qualquer")
     settings = load_settings()
     assert settings.poll_minutes == 15
+
+
+def test_probe_cleanup_leaves_no_probe_files(monkeypatch, tmp_path):
+    """Após a subida, nenhum arquivo de probe (prefixo .baixou-write-probe) resta no DATA_DIR."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+
+    load_settings()
+
+    assert list((tmp_path / "data").glob(".baixou-write-probe*")) == []
+
+
+def test_probe_of_other_process_survives(monkeypatch, tmp_path):
+    """A subida remove apenas o próprio probe — o legado de outro pid continua lá."""
+    _base_env(monkeypatch, tmp_path)
+    data = tmp_path / "data"
+    data.mkdir()
+    legacy = data / ".baixou-write-probe.999999"
+    legacy.write_text("outro-processo", encoding="utf-8")
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+
+    load_settings()
+
+    assert legacy.exists()
