@@ -1,0 +1,108 @@
+"""Runner de migrações SQL numeradas, transacional e apply-once (D-03).
+
+Aplicado na subida por AMBOS os serviços: a corrida de migração é resolvida
+pelo lock do banco (``BEGIN IMMEDIATE`` + busy_timeout). Recusa banco gravado
+por versão mais nova do código. Migrações nunca são editadas após publicadas.
+"""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+from baixou.core.db import WORKER_TIMEOUT_S, connect
+from baixou.core.log import log
+
+_MIGRATION_RE = re.compile(r"^(\d+)_.*\.sql$")
+
+
+def default_migrations_dir() -> Path:
+    """Diretório de migrações relativo ao pacote (funciona no repo e na imagem)."""
+    return Path(__file__).resolve().parents[2] / "migrations"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _discover(migrations_dir: Path) -> list[tuple[str, Path]]:
+    found = [
+        (m.group(1), p)
+        for p in sorted(migrations_dir.glob("*.sql"))
+        if (m := _MIGRATION_RE.match(p.name))
+    ]
+    return found
+
+
+def apply_migrations(db_path: str | Path, migrations_dir: Path | None = None) -> list[str]:
+    """Aplica as migrações pendentes; devolve a lista aplicada nesta chamada."""
+    migrations_dir = migrations_dir if migrations_dir is not None else default_migrations_dir()
+    migrations = _discover(migrations_dir)
+    known_versions = {version for version, _ in migrations}
+
+    conn = connect(db_path, timeout_s=WORKER_TIMEOUT_S)
+    applied_now: list[str] = []
+    try:
+        # Fora de transação (conexão em autocommit): journal_mode é persistente
+        # no arquivo e não muda dentro de uma transação.
+        conn.execute("PRAGMA journal_mode = WAL").fetchone()
+        # O runner garante a tabela de controle antes de 0001 (IF NOT EXISTS:
+        # mesmo esquema criado pela própria migração). DDL executa em
+        # autocommit — commitado imediatamente.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        applied = {
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+
+        unknown = applied - known_versions
+        if unknown:
+            log(
+                "error",
+                "db",
+                "newer_schema_refused",
+                versions=",".join(sorted(unknown)),
+                text=(
+                    "o banco foi gravado por uma versão mais recente do projeto; "
+                    "abrir com esta versão é recusado"
+                ),
+            )
+            raise SystemExit("banco mais novo que o código — migrações recusadas")
+
+        for version, path in migrations:
+            if version in applied:
+                continue
+            script = (
+                "BEGIN IMMEDIATE;\n"
+                + path.read_text(encoding="utf-8")
+                + "\nINSERT INTO schema_migrations (version, applied_at) "
+                + f"VALUES ('{version}', '{_utc_now_iso()}');\nCOMMIT;\n"
+            )
+            try:
+                # Transacional: o próprio script faz BEGIN IMMEDIATE ... COMMIT
+                # (a conexão está em isolation_level=None, sem controle
+                # implícito do Python). O ROLLBACK abaixo é de resgate — nunca
+                # DDL pela metade.
+                conn.executescript(script)
+            except sqlite3.Error:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass  # falhou antes do BEGIN — nada a desfazer
+                raise
+            applied_now.append(version)
+            log(
+                "info",
+                "db",
+                "migration_applied",
+                version=version,
+                text=f"migração {version} aplicada",
+            )
+    finally:
+        conn.close()
+    return applied_now
