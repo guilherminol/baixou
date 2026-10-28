@@ -392,10 +392,14 @@ def test_round_brapi_not_found_marks_item_and_recovers_next_round(
     seed_watch(db, "PETR4", "b3")
     seed_watch(db, "VALE3", "b3")
 
+    vale3_calls = {"count": 0}
+
     def handler(request: httpx.Request) -> httpx.Response:
         symbol = request.url.path.rsplit("/", 1)[-1]
         if symbol == "VALE3":
-            return httpx.Response(404, json={"message": "not found"})
+            vale3_calls["count"] += 1
+            if vale3_calls["count"] == 1:  # só a primeira rodada falha
+                return httpx.Response(404, json={"message": "not found"})
         return httpx.Response(
             200,
             json={
