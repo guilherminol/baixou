@@ -292,7 +292,7 @@ def test_b3_every_n_rounds_invalid_exits_naming_variable(monkeypatch, tmp_path, 
 
 
 def test_b3_every_n_rounds_valid_value_is_parsed_and_keeps_poll_minutes(monkeypatch, tmp_path):
-    """"3" → 3; o intervalo das rodadas (e o TTL do lock /healthz) não muda (D-01)."""
+    """ "3" → 3; o intervalo das rodadas (e o TTL do lock /healthz) não muda (D-01)."""
     _base_env(monkeypatch, tmp_path)
     monkeypatch.setenv("B3_EVERY_N_ROUNDS", "3")
     settings = load_settings()
