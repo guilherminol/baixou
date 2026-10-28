@@ -633,9 +633,7 @@ def test_round_binance_blocked_on_both_hosts_round_survives(
     assert "unavailable" in out  # a falha do lote é registrada com o kind
 
 
-def test_round_two_crypto_symbols_fetch_in_one_compact_batch(
-    db, settings, monkeypatch, fake_http
-):
+def test_round_two_crypto_symbols_fetch_in_one_compact_batch(db, settings, monkeypatch, fake_http):
     """G-03-3: rodada com DOIS itens cripto busca TODOS no lote único (POLL-02).
 
     O handler reproduz o modo de falha REAL provado ao vivo (03-UAT.md):
