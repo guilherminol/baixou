@@ -29,13 +29,19 @@ from baixou.core.log import configure, log
 from baixou.core.migrations import apply_migrations
 from baixou.worker.scheduler import next_slot, wait_until
 from baixou.worker.sources import binance, brapi
-from baixou.worker.sources.base import QuoteResult, SourceError
+from baixou.worker.sources.base import QuoteResult, SourceError, b3_market_open
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # Timeout explícito do cliente httpx compartilhado do round (Performance Trap
 # do research: um só cliente por rodada, conexão reaproveitada entre chamadas).
 _SOURCE_TIMEOUT_S = 10.0
+
+# Fase do divisor de cadência da B3 (D-01): contador interno ao processo — a
+# rodada de subida conta (fase 0) e um reinício zera (consequência aceita de
+# D-01; a válvula de escape é a própria env, manual). Nunca altera o intervalo
+# das rodadas nem o TTL do lock — esses derivam só de settings.poll_minutes.
+_cadence_rounds = 0
 
 
 def _utc_now_iso() -> str:
@@ -113,10 +119,15 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     fonte; a semântica completa de falha (``last_error``,
     ``consecutive_failures``, quarentena) é o plano 02-02 — aqui a fonte que
     falhou só não recebe linha "ok". Duração via time.monotonic (nunca
-    time.time). Filtro de pregão da B3 e cadência (D-01) entram na Task 3;
-    nesta fatia todos os tickers são consultados.
+    time.time). SC-1/D-01: a B3 só é consultada dentro do pregão (seg–sex
+    10h–18h no fuso TZ_MARKET, via ``b3_market_open``) e quando a fase do
+    divisor ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo.
     """
+    global _cadence_rounds
+
     started = time.monotonic()
+    b3_due = _cadence_rounds % settings.b3_every_n_rounds == 0
+    _cadence_rounds += 1  # a rodada de subida conta (fase 0); reinício zera (D-01)
     watch_rows = conn.execute("SELECT symbol, market FROM watch ORDER BY symbol, market").fetchall()
     b3_symbols = [row["symbol"] for row in watch_rows if row["market"] == "b3"]
     crypto_symbols = [row["symbol"] for row in watch_rows if row["market"] == "crypto"]
@@ -125,7 +136,7 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     source_errors: dict[str, SourceError] = {}
     attempted: list[str] = []
     with httpx.Client(timeout=_SOURCE_TIMEOUT_S) as client:
-        if b3_symbols:
+        if b3_symbols and b3_due and b3_market_open(datetime.now(UTC), settings.tz_market):
             attempted.append("brapi")
             try:
                 for symbol in b3_symbols:  # serializado: um símbolo por chamada
