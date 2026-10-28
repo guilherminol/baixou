@@ -3,7 +3,9 @@
 Publica no MESMO contrato do Telegram (D-16): título obrigatório — o tópico
 funciona como senha do canal público e NUNCA vira título, corpo, log ou erro
 (T-03-02) — e o resultado tipado substitui a exceção. O POST vai para
-``{NTFY_URL}/`` com o payload JSON {"topic", "title", "body"}; o endereço de
+``{NTFY_URL}/`` com o payload JSON {"topic", "title", "message"} — o
+esquema "Publish as JSON" do ntfy lê o corpo em "message" (G-03-2); o
+endereço de
 abrir ("click") entra só com NOTIFY_CLICK_URL definido (D-14: vazio omite) e
 o token opcional vira o cabeçalho "Authorization: Bearer" (D-14). Prioridade
 e tags ficam de fora (discrição registrada no CONTEXT da fase). Mapa de
@@ -39,7 +41,10 @@ def send(client: httpx.Client, settings: Settings, title: str, body: str) -> Not
     (T-03-02, como no token do Telegram — T-03-01).
     """
     url = f"{settings.ntfy_url.rstrip('/')}/"
-    payload: dict[str, str] = {"topic": settings.ntfy_topic, "title": title, "body": body}
+    # "message" é a chave do corpo no esquema "Publish as JSON" do ntfy
+    # (G-03-2): "body" é chave desconhecida — o serviço a ignora e publica o
+    # corpo default "triggered" (sondas ao vivo no tópico real provaram).
+    payload: dict[str, str] = {"topic": settings.ntfy_topic, "title": title, "message": body}
     if settings.notify_click_url:
         payload["click"] = settings.notify_click_url  # vazio omite o botão de abrir (D-14)
     headers = {"Authorization": f"Bearer {settings.ntfy_token}"} if settings.ntfy_token else {}
