@@ -1,4 +1,4 @@
-"""Notificadores do worker: contrato comum + Telegram (ntfy chega no 03-02).
+"""Notificadores do worker: contrato comum + Telegram + ntfy (NOTIF-01).
 
 Interface pequena e comum da arquitetura (§Interfaces de fontes e
 notificadores): cada canal é um módulo que envia uma mensagem com título

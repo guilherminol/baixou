@@ -18,8 +18,7 @@ from dataclasses import dataclass
 
 from baixou.core.config import Settings
 
-# Ordem fixa de envio entre canais (D-16). O ntfy entra aqui na expansão do
-# plano 03-02 — a costura já é esta lista; nada além dela muda.
+# Ordem fixa de envio entre canais (D-16): telegram → ntfy.
 CHANNEL_ORDER: tuple[str, ...] = ("telegram", "ntfy")
 
 
@@ -39,10 +38,12 @@ def configured_channels(settings: Settings) -> list[tuple[str, Callable]]:
     O import dos módulos é feito aqui dentro para não fechar ciclo com
     ``base`` (os canais importam ``NotificationResult`` deste módulo).
     """
-    from baixou.worker.notifiers import telegram
+    from baixou.worker.notifiers import ntfy, telegram
 
     channels: list[tuple[str, Callable]] = []
     for channel in CHANNEL_ORDER:
         if channel == "telegram" and telegram.is_configured(settings):
             channels.append(("telegram", telegram.send))
+        elif channel == "ntfy" and ntfy.is_configured(settings):
+            channels.append(("ntfy", ntfy.send))
     return channels
