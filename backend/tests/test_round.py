@@ -633,6 +633,54 @@ def test_round_binance_blocked_on_both_hosts_round_survives(
     assert "unavailable" in out  # a falha do lote é registrada com o kind
 
 
+def test_round_two_crypto_symbols_fetch_in_one_compact_batch(
+    db, settings, monkeypatch, fake_http
+):
+    """G-03-3: rodada com DOIS itens cripto busca TODOS no lote único (POLL-02).
+
+    O handler reproduz o modo de falha REAL provado ao vivo (03-UAT.md):
+    parâmetro ``symbols`` com espaço após a vírgula → a Binance recusa o
+    lote com HTTP 400 code -1100 → kind=unexpected e a RODADA INTEIRA perde
+    a cotação cripto (consecutive_failures acumulando, nenhum preço gravado).
+    Compacto, o mesmo lote volta 200 com os dois preços.
+    """
+    seed_watch(db, "BTCUSDT", "crypto")
+    seed_watch(db, "ETHUSDT", "crypto")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("symbols") != '["BTCUSDT","ETHUSDT"]':
+            return httpx.Response(
+                400,
+                json={
+                    "code": -1100,
+                    "msg": "Illegal characters found in parameter; 'symbols'.",
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {"symbol": "BTCUSDT", "price": "270000.0"},
+                {"symbol": "ETHUSDT", "price": "1800.0"},
+            ],
+        )
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+    worker_main.run_round(db, settings)
+
+    binance_requests = [r for r in fake_http.requests if r.url.host == "api.binance.com"]
+    assert len(binance_requests) == 1  # lote único: UMA requisição de peso 4 (nunca 1-a-1)
+    assert binance_requests[0].url.params["symbols"] == '["BTCUSDT","ETHUSDT"]'  # a CRUA
+
+    for symbol, price in (("BTCUSDT", 270000.0), ("ETHUSDT", 1800.0)):
+        row = db.execute("SELECT * FROM quote WHERE symbol = ?", (symbol,)).fetchone()
+        assert row is not None and row["price"] == price  # preço gravado para AMBOS
+
+    binance_state = db.execute("SELECT * FROM source_state WHERE source = 'binance'").fetchone()
+    assert binance_state["consecutive_failures"] == 0
+    assert binance_state["last_ok_at"] is not None
+
+
 # --- 02-03 Task 1 (D-05, D-06): contagem persistida da cota brapi ---
 
 

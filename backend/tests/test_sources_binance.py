@@ -64,6 +64,35 @@ def test_fetch_batch_happy_path_array_shape():
     datetime.strptime(quotes["BTCUSDT"].price_at, _TS_FORMAT)  # UTC ISO-8601
 
 
+def test_fetch_batch_multi_symbol_sends_compact_json_param():
+    """G-03-3: o parâmetro ``symbols`` sai compacto — sem espaço após a vírgula.
+
+    A Binance rejeita o lote com HTTP 400 code -1100 ("Illegal characters
+    found in parameter") quando a string do parâmetro tem espaço (prova ao
+    vivo no 03-UAT.md). O teste feliz existente decodifica o parâmetro com
+    ``json.loads`` e por isso é cego ao espaço — aqui a STRING CRUA do
+    parâmetro é a árbitra do contrato com a gramática real da Binance.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"symbol": "BTCUSDT", "price": "27000.10"},
+                {"symbol": "ETHUSDT", "price": "1800.55"},
+            ],
+        )
+
+    with _mock_client(handler, requests) as client:
+        quotes, errors = binance.fetch_batch(client, ["BTCUSDT", "ETHUSDT"])
+
+    assert len(requests) == 1  # o lote único continua sendo UMA requisição (POLL-02)
+    assert requests[0].url.params["symbols"] == '["BTCUSDT","ETHUSDT"]'  # a string CRUA
+    assert set(quotes) == {"BTCUSDT", "ETHUSDT"}
+    assert errors == {}  # lote aceito: nenhum 1-a-1
+
+
 def test_fetch_batch_single_symbol_object_shape_is_tolerated():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"symbol": "BTCUSDT", "price": "27000.10"})
