@@ -11,8 +11,10 @@ próprios; aqui a rodada consulta todos os tickers (stub consciente da Task 1).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -21,30 +23,38 @@ from baixou.core.config import load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect
 from baixou.core.migrations import apply_migrations
 from baixou.worker import main as worker_main
+from baixou.worker.sources.base import b3_market_open
 
 _Handler = Callable[[httpx.Request], httpx.Response]
 
 # Quarta-feira 16:00 UTC = 13:00 em Brasília (UTC-3): dentro do pregão (SC-1).
 _MARKET_OPEN_NOW = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
+# Domingo 15:00 UTC = 12:00 em Brasília: fora do pregão (SC-1).
+_MARKET_CLOSED_NOW = datetime(2026, 11, 1, 15, 0, 0, tzinfo=UTC)
 
 
-def _freeze_clock_inside_market(monkeypatch) -> None:
-    """Fixa o ``datetime`` do módulo worker.main num instante dentro do pregão.
-
-    Mesmo mecanismo dos testes de pregão: determinismo total da rodada — o
-    congelamento é inerte para os casos que consultam todos os tickers e
-    garante que a chamada brapi continue acontecendo depois de o filtro de
-    pregão da Task 3 existir.
-    """
+def _freeze_clock(monkeypatch, now_utc: datetime) -> None:
+    """Fixa o ``datetime`` do módulo worker.main num instante arbitrário (determinismo)."""
 
     class _Frozen(datetime):
         @classmethod
         def now(cls, tz=None):
             if tz is not None:
-                return _MARKET_OPEN_NOW.astimezone(tz)
-            return _MARKET_OPEN_NOW.replace(tzinfo=None)
+                return now_utc.astimezone(tz)
+            return now_utc.replace(tzinfo=None)
 
     monkeypatch.setattr(worker_main, "datetime", _Frozen)
+
+
+def _freeze_clock_inside_market(monkeypatch) -> None:
+    """Congela o relógio dentro do pregão — inerte para a Task 1, define a Task 3."""
+    _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+
+@pytest.fixture(autouse=True)
+def _reset_cadence_rounds(monkeypatch):
+    """Todo teste observa o contador de cadência na fase 0 (ordem de execução irrelevante)."""
+    monkeypatch.setattr(worker_main, "_cadence_rounds", 0, raising=False)
 
 
 class _FakeHttp:
@@ -86,7 +96,7 @@ def seed_watch(conn: sqlite3.Connection, symbol: str, market: str) -> None:
     )
 
 
-def test_round_records_both_markets_and_marks_run_ok(db, settings, fake_http):
+def test_round_records_both_markets_and_marks_run_ok(db, settings, monkeypatch, fake_http):
     seed_watch(db, "PETR4", "b3")
     seed_watch(db, "BTCUSDT", "crypto")
 
@@ -108,6 +118,7 @@ def test_round_records_both_markets_and_marks_run_ok(db, settings, fake_http):
         return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "270000.0"}])
 
     fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
     worker_main.run_round(db, settings)
 
     requests = fake_http.requests
@@ -139,7 +150,7 @@ def test_round_records_both_markets_and_marks_run_ok(db, settings, fake_http):
     assert run_row["worker_lock_at"] is not None
 
 
-def test_round_fetches_b3_one_symbol_per_call_serialized(db, settings, fake_http):
+def test_round_fetches_b3_one_symbol_per_call_serialized(db, settings, monkeypatch, fake_http):
     seed_watch(db, "PETR4", "b3")
     seed_watch(db, "VALE3", "b3")
 
@@ -162,6 +173,7 @@ def test_round_fetches_b3_one_symbol_per_call_serialized(db, settings, fake_http
         )
 
     fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
     worker_main.run_round(db, settings)
 
     brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
@@ -216,3 +228,114 @@ def test_round_transmits_configured_brapi_token(tmp_path, monkeypatch, fake_http
         assert dict(brapi_request.url.params).get("token") == "tok-da-env-123"
     finally:
         conn.close()
+
+
+# --- Task 3 (SC-1, D-01): pregão da B3 e cadência divisória ---
+
+
+@pytest.mark.parametrize(
+    ("moment_utc", "expected"),
+    [
+        (datetime(2026, 10, 26, 12, 59, tzinfo=UTC), False),  # segunda 09:59 BRT
+        (datetime(2026, 10, 26, 13, 0, tzinfo=UTC), True),  # segunda 10:00 BRT (inclusivo)
+        (datetime(2026, 10, 28, 20, 59, tzinfo=UTC), True),  # quarta 17:59 BRT
+        (datetime(2026, 10, 30, 21, 0, tzinfo=UTC), False),  # sexta 18:00 BRT (exclusivo)
+        (datetime(2026, 10, 31, 15, 0, tzinfo=UTC), False),  # sábado 12:00 BRT
+        # Sexta 2018-02-16 na DST histórica (UTC-2): 12:00 UTC = 10:00 local → aberto
+        (datetime(2018, 2, 16, 12, 0, tzinfo=UTC), True),
+    ],
+)
+def test_b3_market_open_parametric_table(moment_utc, expected):
+    """Tabela de instantes do Pitfall 5 (com DST histórica como saneamento do tzdata)."""
+    assert b3_market_open(moment_utc, "America/Sao_Paulo") is expected
+
+
+def _happy_handlers() -> _Handler:
+    """Respostas felizes por host para os dois mercados."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "brapi.dev":
+            symbol = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": symbol,
+                            "regularMarketPrice": 38.25,
+                            "regularMarketTime": 1793154000,
+                            "regularMarketChangePercent": -1.3,
+                        }
+                    ]
+                },
+            )
+        symbols = json.loads(request.url.params["symbols"])
+        return httpx.Response(
+            200, json=[{"symbol": symbol, "price": "270000.0"} for symbol in symbols]
+        )
+
+    return handler
+
+
+def test_round_outside_market_hours_skips_b3_but_still_fetches_crypto(
+    db, settings, monkeypatch, fake_http
+):
+    """Fora do pregão (domingo): ZERO requisições à brapi; cripto segue; batimento fica."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    fake_http.route(_happy_handlers())
+    _freeze_clock(monkeypatch, _MARKET_CLOSED_NOW)
+
+    worker_main.run_round(db, settings)
+
+    brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
+    assert brapi_requests == []  # nenhum ticker da B3 é consultado (SC-1)
+
+    crypto = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert crypto is not None and crypto["price"] == 270000.0  # cripto é o dia todo
+
+    b3_quote = db.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert b3_quote is None  # nada de brapi foi consultado, nada é gravado
+
+    run_row = db.execute(
+        "SELECT last_run, worker_lock_at FROM run WHERE id = 1"
+    ).fetchone()
+    assert run_row["last_run"] is not None  # batimento incondicional
+    assert run_row["worker_lock_at"] is not None
+
+
+def test_round_b3_cadence_divisor_consults_only_on_multiples(db, settings, fake_http, monkeypatch):
+    """B3_EVERY_N_ROUNDS=3: rodadas 0 e 3 consultam a B3; 1, 2, 4 e 5 não; cripto sempre.
+
+    Rodadas dirigidas consecutivamente dentro de um único teste — o contador é
+    interno ao processo e o fixture autouse o observa na fase 0 (D-01).
+    """
+    cadence_settings = replace(settings, b3_every_n_rounds=3)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    for round_index in range(6):
+        worker_main.run_round(db, cadence_settings)
+        brapi_so_far = sum(1 for r in fake_http.requests if r.url.host == "brapi.dev")
+        expected_b3 = round_index // 3 + 1  # consultas após as rodadas 0..5: 1,1,1,2,2,2
+        assert brapi_so_far == expected_b3, f"rodada {round_index}"
+
+    assert sum(1 for r in fake_http.requests if r.url.host == "api.binance.com") == 6
+
+
+def test_round_with_empty_watch_only_records_heartbeat(db, settings, monkeypatch, fake_http):
+    """Watch vazio: nenhuma requisição às fontes e rodada completa com batimento (proibição)."""
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    assert fake_http.requests == []  # rodada vazia continua sendo rodada
+    run_row = db.execute(
+        "SELECT last_run, worker_lock_at FROM run WHERE id = 1"
+    ).fetchone()
+    assert run_row["last_run"] is not None
+    assert run_row["worker_lock_at"] is not None
+    assert db.execute("SELECT COUNT(*) AS n FROM source_state").fetchone()["n"] == 0
