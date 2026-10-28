@@ -27,6 +27,7 @@ from baixou.core.config import Settings, load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, check_sqlite_version, connect, write_tx
 from baixou.core.log import configure, log
 from baixou.core.migrations import apply_migrations
+from baixou.worker import quota
 from baixou.worker.scheduler import next_slot, wait_until
 from baixou.worker.sources import binance, brapi
 from baixou.worker.sources.base import QuoteResult, SourceError, b3_market_open
@@ -146,7 +147,10 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo, menos
     os símbolos em quarentena (``last_fetch_error = 'not_found'`` em quote —
     D-02, estado derivado da coluna da 0002, que a cascata limpa ao recriar
-    a linha em watch).
+    a linha em watch). POLL-03/D-05/D-06: cada ``fetch_one`` da brapi soma 1
+    na cota mensal persistida (tabela quota, linha source="brapi") e o
+    registro entra na MESMA transação única — virada do mês UTC, aviso único
+    de 80% e porta de cota vivem em worker.quota; chamada bloqueada não soma.
     """
     global _cadence_rounds
 
@@ -162,12 +166,14 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     failures: dict[str, list[SourceError]] = {}
     successes: dict[str, int] = {}
     attempted: list[str] = []
+    brapi_calls = 0  # fetch_one executados da brapi nesta rodada (POLL-03)
     with httpx.Client(timeout=_SOURCE_TIMEOUT_S) as client:
         if b3_symbols and b3_due and b3_market_open(datetime.now(UTC), settings.tz_market):
             attempted.append("brapi")
             brapi_errors: list[SourceError] = []
             brapi_ok = 0
             for symbol in b3_symbols:  # serializado: um símbolo por chamada
+                brapi_calls += 1  # cada fetch_one executado soma 1 na cota (POLL-03)
                 try:
                     quotes[(symbol, "b3")] = brapi.fetch_one(client, symbol, settings.brapi_token)
                     brapi_ok += 1
@@ -239,6 +245,10 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
                 """,
                 (symbol, market, exc.kind),
             )
+        # Cota da brapi (POLL-03/D-05/D-06): soma as chamadas efetuadas na
+        # MESMA transação única; virada UTC e transições de aviso são do
+        # registro (log é stdout, pode sair aqui dentro). Bloqueadas não chegam.
+        quota.record_round_calls(conn, settings, brapi_calls)
         for source in attempted:
             if source in source_errors:
                 conn.execute(
