@@ -1,0 +1,48 @@
+# Compose de desenvolvimento do Baixou (D-04, na raiz — decisão D-04).
+# Dois serviços da MESMA imagem; a única comunicação entre eles é o SQLite
+# em /data (modo WAL). Ambos aplicam as migrações na subida — a corrida é
+# resolvida pelo lock do banco (BEGIN IMMEDIATE + busy_timeout), então não
+# há ordenação entre serviços nem serviço migrate one-shot (D-03).
+# O compose de instalação (imagem do GHCR, porta em 127.0.0.1) é artefato da Fase 6.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "baixou.web.main"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    volumes:
+      - baixou-data:/data
+    healthcheck:
+      # Mede a vida do worker via /healthz (sem login, sem dados no corpo).
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "baixou.worker.main"]
+    restart: unless-stopped
+    volumes:
+      - baixou-data:/data
+
+volumes:
+  baixou-data:
+
+# Por que volume NOMEADO e não diretório do host (CR-01 da revisão da Fase 1):
+# em Linux — o alvo de referência — o daemon cria o diretório de um bind mount
+# inexistente como root:root, e o contêiner roda como usuário não-root (baixou);
+# o probe de escrita do DATA_DIR recebe PermissionError e o fail-fast encerra os
+# dois serviços na primeira subida. O volume nomeado não tem esse problema: o
+# primeiro uso copia para o volume o dono do ponto de montagem da imagem —
+# baixou:baixou, pelo chown de /data no docker/Dockerfile (não mexer nele: é a
+# outra metade do mecanismo). O volume é de armazenamento LOCAL por definição
+# (driver local padrão): WAL não funciona em NFS/mount de rede.
+# A política unless-stopped devolve o serviço após crash; um `docker stop`
+# explícito continua sendo respeitado (WR-03 da revisão). Continua sem
+# ordenação nem serviço extra entre os serviços (D-03): a política cobre
+# recuperação pós-crash, não ordem de subida.
