@@ -297,9 +297,7 @@ def test_round_outside_market_hours_skips_b3_but_still_fetches_crypto(
     b3_quote = db.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
     assert b3_quote is None  # nada de brapi foi consultado, nada é gravado
 
-    run_row = db.execute(
-        "SELECT last_run, worker_lock_at FROM run WHERE id = 1"
-    ).fetchone()
+    run_row = db.execute("SELECT last_run, worker_lock_at FROM run WHERE id = 1").fetchone()
     assert run_row["last_run"] is not None  # batimento incondicional
     assert run_row["worker_lock_at"] is not None
 
@@ -333,9 +331,7 @@ def test_round_with_empty_watch_only_records_heartbeat(db, settings, monkeypatch
     worker_main.run_round(db, settings)
 
     assert fake_http.requests == []  # rodada vazia continua sendo rodada
-    run_row = db.execute(
-        "SELECT last_run, worker_lock_at FROM run WHERE id = 1"
-    ).fetchone()
+    run_row = db.execute("SELECT last_run, worker_lock_at FROM run WHERE id = 1").fetchone()
     assert run_row["last_run"] is not None
     assert run_row["worker_lock_at"] is not None
     assert db.execute("SELECT COUNT(*) AS n FROM source_state").fetchone()["n"] == 0
