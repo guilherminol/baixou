@@ -13,12 +13,38 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 import httpx
 import pytest
+from baixou.core.config import load_settings
+from baixou.core.db import WORKER_TIMEOUT_S, connect
+from baixou.core.migrations import apply_migrations
 from baixou.worker import main as worker_main
 
 _Handler = Callable[[httpx.Request], httpx.Response]
+
+# Quarta-feira 16:00 UTC = 13:00 em Brasília (UTC-3): dentro do pregão (SC-1).
+_MARKET_OPEN_NOW = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
+
+
+def _freeze_clock_inside_market(monkeypatch) -> None:
+    """Fixa o ``datetime`` do módulo worker.main num instante dentro do pregão.
+
+    Mesmo mecanismo dos testes de pregão: determinismo total da rodada — o
+    congelamento é inerte para os casos que consultam todos os tickers e
+    garante que a chamada brapi continue acontecendo depois de o filtro de
+    pregão da Task 3 existir.
+    """
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return _MARKET_OPEN_NOW.astimezone(tz)
+            return _MARKET_OPEN_NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(worker_main, "datetime", _Frozen)
 
 
 class _FakeHttp:
@@ -146,3 +172,47 @@ def test_round_fetches_b3_one_symbol_per_call_serialized(db, settings, fake_http
         for row in db.execute("SELECT symbol, price FROM quote WHERE market = 'b3'")
     }
     assert stored == prices
+
+
+def test_round_transmits_configured_brapi_token(tmp_path, monkeypatch, fake_http):
+    """Config validada é consumida pela fonte (Task 2): BRAPI_TOKEN chega à brapi.
+
+    Settings construído via ``load_settings(environ)`` com ``BRAPI_TOKEN``
+    definido; a requisição capturada pelo MockTransport carrega o valor
+    configurado no query param — prova de que a config não é morta. O relógio
+    fica fixado dentro do pregão (mesmo mecanismo da Task 3).
+    """
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("TZ_MARKET", "America/Sao_Paulo")
+    monkeypatch.setenv("POLL_MINUTES", "15")
+    monkeypatch.setenv("LOG_LEVEL", "info")
+    monkeypatch.setenv("BRAPI_TOKEN", "tok-da-env-123")
+    settings = load_settings()
+    apply_migrations(settings.db_path)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        seed_watch(conn, "PETR4", "b3")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": "PETR4",
+                            "regularMarketPrice": 38.25,
+                            "regularMarketTime": 1793154000,
+                            "regularMarketChangePercent": -1.3,
+                        }
+                    ]
+                },
+            )
+
+        fake_http.route(handler)
+        _freeze_clock_inside_market(monkeypatch)
+        worker_main.run_round(conn, settings)
+
+        brapi_request = next(r for r in fake_http.requests if r.url.host == "brapi.dev")
+        assert dict(brapi_request.url.params).get("token") == "tok-da-env-123"
+    finally:
+        conn.close()
