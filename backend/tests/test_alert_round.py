@@ -120,7 +120,12 @@ def _seed_petr4(conn: sqlite3.Connection, target: float = 10.0) -> None:
 
 
 def _brapi_price(price: float) -> _Handler:
-    """Handler que responde o preço na brapi e aceita o POST do Telegram."""
+    """Handler que responde o preço na brapi e aceita o POST do Telegram.
+
+    ``regularMarketTime`` 1793203200 = 2026-10-28T16:00:00Z — cotação FRESCA
+    em relação ao relógio congelado (o gate de frescor por idade, D-11, não
+    avalia cotação velha; idade 0/15 min fica dentro do limite da B3, 75 min).
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "brapi.dev":
@@ -131,7 +136,7 @@ def _brapi_price(price: float) -> _Handler:
                         {
                             "symbol": "PETR4",
                             "regularMarketPrice": price,
-                            "regularMarketTime": 1793154000,
+                            "regularMarketTime": 1793203200,
                             "regularMarketChangePercent": -6.0,
                         }
                     ]
@@ -193,7 +198,10 @@ def test_round_repeated_below_target_does_not_resend(alert_env, monkeypatch, fak
 
 
 def test_round_channel_refusal_keeps_item_waiting(alert_env, monkeypatch, fake_http, capsys):
-    """Telegram 500: nenhum canal aceitou — só notify_state é gravado; a rodada seguinte tenta de novo."""
+    """Telegram 500: nenhum canal aceitou — só notify_state é gravado.
+
+    A rodada seguinte tenta de novo (SC-3).
+    """
     settings, conn = alert_env
     _seed_petr4(conn, target=10.0)
     telegram_up = {"on": False}

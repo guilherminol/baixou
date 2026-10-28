@@ -37,9 +37,7 @@ _NTFY_TOPIC = "baixou-testes"
 _FRESH_PRICE_AT = "2026-10-28T15:50:00Z"
 
 
-def _configure_env(
-    monkeypatch, tmp_path, *, telegram: bool = True, ntfy: bool = True
-) -> Settings:
+def _configure_env(monkeypatch, tmp_path, *, telegram: bool = True, ntfy: bool = True) -> Settings:
     """Envs de teste com os canais pedidos; devolve Settings carregadas."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("TZ_MARKET", "America/Sao_Paulo")
@@ -364,3 +362,153 @@ def test_target_change_reevaluates_next_round(both_channels):
     assert quote["alerted"] == 1  # 11.0 ≤ NOVO alvo 12.0: cruza e dispara
     assert quote["alerted_target"] == 12.0  # alvo novo gravado no disparo
     assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+
+
+# --- Task 3 (D-11, SC-5, ALERT-02): gate de frescor por idade ok/stale/closed/none ---
+
+# Sábado 16:00 UTC = 13:00 em Brasília: B3 FORA do pregão (fim de semana — SC-1).
+_MARKET_CLOSED_NOW = datetime(2026, 10, 31, 16, 0, 0, tzinfo=UTC)
+
+
+def test_freshness_derivation_table(both_channels):
+    """Tabela D-11: none/ok/stale/closed com borda inclusiva e closed acima de stale."""
+    settings, conn = both_channels
+    _seed_item(conn, symbol="NOPX", price=None)  # sem preço: none
+    _seed_item(conn, symbol="NOAT", price=9.50, price_at=None)  # sem price_at: none
+    _seed_item(conn, symbol="FRESH", price_at="2026-10-28T15:50:00Z")  # 10 min: ok
+    _seed_item(conn, symbol="EDGE", price_at="2026-10-28T14:45:00Z")  # 75 min exatos: ok
+    _seed_item(conn, symbol="STALE", price_at="2026-10-28T14:44:00Z")  # 76 min: stale
+    _seed_item(conn, symbol="CLOSED", price_at="2026-10-28T15:50:00Z")
+
+    assert alerts.freshness_state(_quote_row(conn, "NOPX"), settings, _MARKET_OPEN_NOW) == "none"
+    assert alerts.freshness_state(_quote_row(conn, "NOAT"), settings, _MARKET_OPEN_NOW) == "none"
+    assert alerts.freshness_state(_quote_row(conn, "FRESH"), settings, _MARKET_OPEN_NOW) == "ok"
+    edge = _quote_row(conn, "EDGE")
+    assert alerts.freshness_state(edge, settings, _MARKET_OPEN_NOW) == "ok"  # borda INCLUSIVA
+    stale = _quote_row(conn, "STALE")
+    assert alerts.freshness_state(stale, settings, _MARKET_OPEN_NOW) == "stale"
+    closed = _quote_row(conn, "CLOSED")
+    # closed tem PRECEDÊNCIA sobre a idade: fora do pregão é closed mesmo com cotação velha
+    assert alerts.freshness_state(closed, settings, _MARKET_CLOSED_NOW) == "closed"
+
+
+def test_crypto_never_closed_and_uses_30m_limit(both_channels):
+    """Cripto é 24/7: nunca devolve closed; o limite de idade é o da cripto (30 min)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn, symbol="BTCUSDT", market="crypto", price_at="2026-10-31T15:30:00Z"
+    )  # 30 min exatos: ok (borda inclusiva)
+    _seed_item(
+        conn, symbol="ETHUSDT", market="crypto", price_at="2026-10-31T15:29:00Z"
+    )  # 31 min: stale
+    btc = _quote_row(conn, "BTCUSDT", "crypto")
+    eth = _quote_row(conn, "ETHUSDT", "crypto")
+    # fim de semana: a B3 estaria closed; a cripto segue ok (mercado não fecha)
+    assert alerts.freshness_state(btc, settings, _MARKET_CLOSED_NOW) == "ok"
+    assert alerts.freshness_state(eth, settings, _MARKET_CLOSED_NOW) == "stale"
+
+
+def test_stale_quote_never_evaluates(both_channels):
+    """stale: acima do limite não avalia — preço abaixo do alvo não dispara (D-11)."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, price_at="2026-10-28T14:00:00Z")  # 120 min: acima de 75
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("cotação stale não avalia: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0
+    assert quote["notify_state"] is None  # nenhum envio nem escrita fora de "ok"
+    assert recorder.requests == []
+
+
+def test_age_at_exact_limit_still_evaluates(both_channels):
+    """Borda inclusiva no gate: idade IGUAL ao limite (75 min) cruza e dispara."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, price_at="2026-10-28T14:45:00Z")  # exatamente 75 min
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # idade == limite é "ok": avalia e dispara
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+
+
+def test_b3_closed_holds_last_quote_without_evaluating(both_channels):
+    """b3 fora do pregão: mantém a cotação sem reavaliar — nem cruzamento, nem rearme."""
+    settings, conn = both_channels
+    # aguardando com preço abaixo do alvo: o cruzamento NÃO sai fora do pregão
+    _seed_item(conn, symbol="WAIT", price=9.50)
+    # alertado com preço acima da margem: o rearme NÃO acontece fora do pregão
+    _seed_item(
+        conn,
+        symbol="HELD",
+        target=10.0,
+        price=12.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("mercado fechado não reavalia: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_CLOSED_NOW)
+
+    wait = _quote_row(conn, "WAIT")
+    assert wait["alerted"] == 0
+    assert wait["notify_state"] is None
+    held = _quote_row(conn, "HELD")
+    assert held["alerted"] == 1  # permanece alertado até o pregão abrir
+    assert held["alerted_target"] == 10.0
+    assert held["alerted_at"] == _SEEDED_ALERTED_AT
+    assert recorder.requests == []
+
+
+def test_missing_price_or_timestamp_never_evaluates(both_channels):
+    """none: sem preço ou sem price_at nunca avalia — nenhuma escrita, nenhum envio."""
+    settings, conn = both_channels
+    _seed_item(conn, symbol="NOPX", price=None)
+    _seed_item(conn, symbol="NOAT", price=9.50, price_at=None)
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("estado none nunca avalia")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    for symbol in ("NOPX", "NOAT"):
+        quote = _quote_row(conn, symbol)
+        assert quote["alerted"] == 0
+        assert quote["notify_state"] is None
+    assert recorder.requests == []
+
+
+def test_source_failure_with_fresh_price_still_evaluates(both_channels):
+    """D-11: a fonte que falhou na rodada não invalida a cotação anterior dentro do limite."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, last_fetch_error="unavailable")  # erro + preço preservado
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # o que bloqueia é preço NULL, não o erro gravado
+    assert quote["last_fetch_error"] == "unavailable"

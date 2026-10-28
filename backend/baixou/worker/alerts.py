@@ -34,12 +34,14 @@ o próximo cruzamento reenvia por todos (arquitetura).
 
 Item com NENHUM canal configurado não gera envio nem escrita de entrega
 (lista vazia — avisos desligados, D-08); rearme e troca de alvo independem de
-canal (mudança de estado do item). Sem cotação (price ou price_at ausentes —
-estado "none") o item nunca é avaliado. ``alerted_at`` é histórico — "hora do
+canal (mudança de estado do item). ``alerted_at`` é histórico — "hora do
 último disparo" (ALERT-04) — e SOBREVIVE a rearme e a troca de alvo; após o
 rearme, um novo cruzamento para baixo dispara NOVO aviso e grava novo
-alerted_at/alerted_target. O gate de frescor por idade (ok/stale/closed/none)
-entra na Task 3 deste plano.
+alerted_at/alerted_target. O GATE de frescor por idade (``freshness_state``:
+ok/stale/closed/none — D-11/SC-5) envolve TODA a avaliação: só estado "ok"
+avalia qualquer transição (troca de alvo, rearme, cruzamento); sem cotação
+("none"), velha ("stale") ou B3 fora do pregão ("closed") nada é enviado nem
+escrito.
 
 Eventos: ``alert_sent`` (uma vez por cruzamento entregue),
 ``alert_delivery_failed`` por canal recusado, ``alert_rearmed`` e
@@ -55,7 +57,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -65,6 +67,7 @@ from baixou.core.db import write_tx
 from baixou.core.log import log
 from baixou.worker import messages
 from baixou.worker.notifiers.base import CHANNEL_ORDER, NotificationResult, configured_channels
+from baixou.worker.sources.base import b3_market_open
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -79,6 +82,58 @@ def _rearm_threshold(target: float, rearm_pct: int) -> Decimal:
     representação decimal finita — o que fontes e seeds produzem.
     """
     return Decimal(str(target)) * (100 + rearm_pct) / 100
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    """Parse estrito do formato de timestamp do banco; None se ilegível.
+
+    Mesmo padrão de ``worker.main._parse_ts`` — replicado aqui porque ``main``
+    importa este módulo (importar de volta fecharia ciclo).
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def freshness_state(row: sqlite3.Row, settings: Settings, now_utc: datetime) -> str:
+    """Deriva o estado de frescor da cotação: ``ok`` | ``stale`` | ``closed`` | ``none``.
+
+    Estado DERIVADO por idade + pregão + presença de preço — sem coluna nova
+    (nenhuma migração); as Fases 4–5 derivam o MESMO estado para a página
+    (D-11). Tabela da arquitetura §Frescor da cotação:
+
+    - ``none``: price ou price_at ausentes (também ilegíveis — sem eles não há
+      como aferir idade). A linha nunca avalia, inclusive a que tem
+      ``last_fetch_error`` e preço NULL — o que bloqueia é preço ausente, não
+      o erro gravado (resolução "empty" de ALERT-04).
+    - ``closed``: B3 fora do pregão (``b3_market_open`` False) — mantém a
+      última cotação sem reavaliar; tem PRECEDÊNCIA sobre a idade. Cripto
+      nunca é closed (mercado 24/7).
+    - ``stale``: idade acima do limite por mercado (STALE_MINUTES_B3 75 /
+      STALE_MINUTES_CRYPTO 30) — não avalia.
+    - ``ok``: o resto — borda INCLUSIVA (idade IGUAL ao limite é ok).
+
+    Consequência D-11: a fonte que falhou na rodada NÃO invalida a cotação
+    anterior dentro do limite — ``last_fetch_error`` não entra nesta derivação.
+    """
+    if row["price"] is None or row["price_at"] is None:
+        return "none"
+    if row["market"] == "b3" and not b3_market_open(now_utc, settings.tz_market):
+        return "closed"
+    price_at = _parse_ts(row["price_at"])
+    if price_at is None:
+        return "none"
+    if row["market"] == "b3":
+        limit = timedelta(minutes=settings.stale_minutes_b3)
+    else:
+        limit = timedelta(minutes=settings.stale_minutes_crypto)
+    if now_utc - price_at > limit:
+        return "stale"
+    return "ok"
 
 
 def _notify_state(results: dict[str, NotificationResult]) -> str:
@@ -143,7 +198,11 @@ def _deliver(
                 text=f"falha de entrega no canal {channel}: {result.kind}",
             )
 
-    accepted = [channel for channel in CHANNEL_ORDER if results.get(channel) is not None and results[channel].ok]
+    accepted = [
+        channel
+        for channel in CHANNEL_ORDER
+        if results.get(channel) is not None and results[channel].ok
+    ]
     with write_tx(conn):  # write_tx curta PRÓPRIA do resultado (T-02-01)
         if accepted:
             conn.execute(
@@ -187,8 +246,7 @@ def _reset_alert_state(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     """
     with write_tx(conn):
         conn.execute(
-            "UPDATE quote SET alerted = 0, alerted_target = NULL "
-            "WHERE symbol = ? AND market = ?",
+            "UPDATE quote SET alerted = 0, alerted_target = NULL WHERE symbol = ? AND market = ?",
             (row["symbol"], row["market"]),
         )
 
@@ -235,12 +293,14 @@ def process_alerts(
 
     Chamar APÓS a write_tx das cotações da rodada: lê ``watch`` LEFT JOIN
     ``quote`` fora de transação (ordem determinística symbol, market), aplica a
-    precedência por item e envia pelos canais fora de transação (rede nunca
-    dentro de write_tx — T-02-01), gravando cada resultado em write_tx curta
-    própria. Item alertado passa por ``_evaluate_alerted`` — troca de alvo e
-    rearme mudam estado sem mensagem, com ``alerted_at`` preservado; item
-    aguardando com preço ≤ alvo (borda inclusiva) dispara a entrega multi-canal.
-    ``now_utc`` (aware) vira o ``alerted_at`` no formato de timestamp do banco.
+    precedência por item sob o GATE de frescor (``freshness_state`` — só estado
+    "ok" avalia qualquer transição: D-11/SC-5) e envia pelos canais fora de
+    transação (rede nunca dentro de write_tx — T-02-01), gravando cada
+    resultado em write_tx curta própria. Item alertado passa por
+    ``_evaluate_alerted`` — troca de alvo e rearme mudam estado sem mensagem,
+    com ``alerted_at`` preservado; item aguardando com preço ≤ alvo (borda
+    inclusiva) dispara a entrega multi-canal. ``now_utc`` (aware) vira o
+    ``alerted_at`` no formato de timestamp do banco.
     """
     rows = conn.execute(
         """
@@ -255,8 +315,8 @@ def process_alerts(
 
     channels = configured_channels(settings)
     for row in rows:
-        if row["price"] is None or row["price_at"] is None:
-            continue  # estado "none": sem cotação gravada, nunca avalia
+        if freshness_state(row, settings, now_utc) != "ok":
+            continue  # none/stale/closed não avaliam NENHUMA transição (D-11/SC-5)
         if row["alerted"]:
             _evaluate_alerted(conn, row, settings)  # troca de alvo → rearme → nada
             continue
