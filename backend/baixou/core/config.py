@@ -133,6 +133,35 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     if log_level not in _VALID_LOG_LEVELS:
         _fail("LOG_LEVEL", f"use um de: {', '.join(_VALID_LOG_LEVELS)}")
 
+    # Fase 2 (POLL-01/POLL-02): segredo da brapi — resolve() já manda para
+    # ``secrets`` quando lido via _FILE; sem validação de conteúdo além do
+    # vazio. O valor nunca chega ao log nem à exceção (K2). Ausente → padrão
+    # "" (token opcional); string vazia DEFINIDA é inválida (WR-01).
+    raw_token = resolve("BRAPI_TOKEN")
+    brapi_token = "" if raw_token is None else raw_token
+    if raw_token is not None and not brapi_token.strip():
+        _fail("BRAPI_TOKEN", "defina o token da brapi ou remova a variável")
+
+    raw_limit = resolve("BRAPI_MONTHLY_LIMIT")
+    if raw_limit is None:  # ausente → padrão; string vazia falha no int abaixo
+        raw_limit = "15000"
+    try:
+        brapi_monthly_limit = int(raw_limit.strip())
+    except ValueError:
+        _fail("BRAPI_MONTHLY_LIMIT", "use um inteiro maior que zero")
+    if brapi_monthly_limit <= 0:
+        _fail("BRAPI_MONTHLY_LIMIT", "use um inteiro maior que zero")
+
+    raw_cadence = resolve("B3_EVERY_N_ROUNDS")
+    if raw_cadence is None:  # ausente → padrão (PRD: consultar toda rodada, D-01)
+        raw_cadence = "1"
+    try:
+        b3_every_n_rounds = int(raw_cadence.strip())
+    except ValueError:  # "1.5" e "abc" caem aqui
+        _fail("B3_EVERY_N_ROUNDS", "use um inteiro maior ou igual a 1")
+    if b3_every_n_rounds < 1:
+        _fail("B3_EVERY_N_ROUNDS", "use um inteiro maior ou igual a 1")
+
     # Qualquer NOME_FILE no ambiente é resolvido — mesmo sem campo próprio em
     # Settings (fases futuras adicionam nomes; variáveis desconhecidas são
     # toleradas). NOME presente vence: o arquivo nem é lido.
@@ -147,5 +176,8 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         tz_market=tz_market,
         poll_minutes=poll_minutes,
         log_level=log_level,
+        brapi_token=brapi_token,
+        brapi_monthly_limit=brapi_monthly_limit,
+        b3_every_n_rounds=b3_every_n_rounds,
         secrets=secrets,
     )
