@@ -142,7 +142,7 @@ def test_round_crossing_below_sends_telegram_and_marks_alerted(
     payload = json.loads(telegram_requests[0].content)
     assert payload["chat_id"] == _TELEGRAM_CHAT_ID
     assert "Baixou: PETR4" in payload["text"]  # título estável (D-03)
-    assert "9.50" in payload["text"]  # o preço está no corpo (D-01)
+    assert "R$ 9,50" in payload["text"]  # o preço está no corpo, com moeda PT-BR (D-01/D-02)
 
     quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
     assert quote["alerted"] == 1

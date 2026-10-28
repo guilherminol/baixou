@@ -68,7 +68,8 @@ def process_alerts(
     rows = conn.execute(
         """
         SELECT w.symbol AS symbol, w.market AS market, w.target_below AS target_below,
-               q.price AS price, q.price_at AS price_at, q.alerted AS alerted
+               q.price AS price, q.price_at AS price_at, q.change_pct AS change_pct,
+               q.alerted AS alerted
         FROM watch w
         LEFT JOIN quote q ON q.symbol = w.symbol AND q.market = w.market
         ORDER BY w.symbol, w.market
@@ -85,7 +86,13 @@ def process_alerts(
         symbol = row["symbol"]
         title = messages.alert_title(symbol)
         body = messages.price_alert_body(
-            row["price"], row["target_below"], row["price_at"], settings.tz_market
+            symbol,
+            row["market"],
+            row["price"],
+            row["target_below"],
+            row["change_pct"],
+            row["price_at"],
+            settings,
         )
         results: list[tuple[str, NotificationResult]] = []
         for channel, send in channels:
