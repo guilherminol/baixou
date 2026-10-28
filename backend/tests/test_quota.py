@@ -124,3 +124,60 @@ def test_quota_warning_80_emitted_exactly_once(db, settings, monkeypatch, capsys
     with write_tx(db):
         quota.record_round_calls(db, limit10, 2)  # rodada seguinte: NÃO repete
     assert "quota_warning_80" not in capsys.readouterr().out
+
+
+# --- 02-03 Task 2 (D-05, SC-4): porta a 100%, transição única e desbloqueio ---
+
+
+def test_b3_quota_allows_door_arithmetic(db, settings, monkeypatch):
+    """Porta: gravado 8 de 10 deixa sair mais 2 (a que cruza ainda executa); gravado 10 fecha."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _freeze_month(monkeypatch, datetime(2026, 10, 28, 12, 0, tzinfo=UTC))
+    assert quota.b3_quota_allows(db, limit10, 0) is True  # sem linha: porta aberta
+
+    db.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', '2026-10', 8, 1)"
+    )
+    assert quota.b3_quota_allows(db, limit10, 0) is True  # 8 < 10
+    assert quota.b3_quota_allows(db, limit10, 1) is True  # 9 < 10: a penúltima sai
+    assert quota.b3_quota_allows(db, limit10, 2) is False  # 8+2 >= 10: porta fechada
+
+    db.execute("UPDATE quota SET calls = 10")
+    assert quota.b3_quota_allows(db, limit10, 0) is False  # 100%: nada mais sai
+
+
+def test_quota_exhausted_emitted_once_at_crossing(db, settings, monkeypatch, capsys):
+    """limit=10: quota_exhausted sai EXATAMENTE uma vez, quando calls cruza o limite."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _freeze_month(monkeypatch, datetime(2026, 10, 28, 12, 0, tzinfo=UTC))
+
+    with write_tx(db):
+        quota.record_round_calls(db, limit10, 9)  # 9 < 10: a porta ainda está aberta
+    assert "quota_exhausted" not in capsys.readouterr().out
+
+    with write_tx(db):
+        quota.record_round_calls(db, limit10, 1)  # 9+1=10 → cruza
+    assert capsys.readouterr().out.count("quota_exhausted") == 1
+
+    with write_tx(db):
+        quota.record_round_calls(db, limit10, 0)  # porta fechada: nenhuma chamada nova sai
+    assert "quota_exhausted" not in capsys.readouterr().out  # transição derivada: não repete
+
+
+def test_quota_unlocks_after_utc_rollover(db, settings, monkeypatch):
+    """Porta fechada + virada UTC: a primeira rodada do mês novo destrava (D-06)."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _freeze_month(monkeypatch, datetime(2026, 10, 28, 12, 0, tzinfo=UTC))
+    with write_tx(db):
+        quota.record_round_calls(db, limit10, 10)
+    assert quota.b3_quota_allows(db, limit10, 0) is False  # fechada a 100%
+
+    _freeze_month(monkeypatch, datetime(2026, 11, 1, 2, 0, tzinfo=UTC))
+    # Primeira rodada do mês novo — mesmo SEM chamada (pregão fechado), o reset acontece:
+    with write_tx(db):
+        quota.record_round_calls(db, limit10, 0)
+    row = _quota_row(db)
+    assert row["month"] == "2026-11"
+    assert row["calls"] == 0
+    assert row["warned_80"] == 0
+    assert quota.b3_quota_allows(db, limit10, 0) is True  # destravada já na primeira rodada
