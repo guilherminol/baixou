@@ -512,3 +512,57 @@ def test_source_failure_with_fresh_price_still_evaluates(both_channels):
     quote = _quote_row(conn)
     assert quote["alerted"] == 1  # o que bloqueia é preço NULL, não o erro gravado
     assert quote["last_fetch_error"] == "unavailable"
+
+
+# --- Bordas do requisito (validação Nyquist da fase) ---
+
+
+def test_crossing_at_exact_target_price_alerts(both_channels):
+    """Preço IGUAL ao alvo cruza (borda inclusiva ≤ — D-12): dispara e grava o alerta.
+
+    A igualdade não é "acima do alvo": o cruzamento para baixo inclui o preço
+    exatamente no alvo — mesma disciplina de borda inclusiva do rearme (D-12).
+    """
+    settings, conn = both_channels
+    _seed_item(conn, target=10.0, price=10.0)  # 10.0 ≤ 10.0: na borda exata
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # igualdade CRUZA e dispara
+    assert quote["alerted_target"] == 10.0
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+    assert len(recorder.requests) == 2  # os DOIS canais receberam o aviso
+
+
+def test_suspect_variation_notes_delivery_without_blocking(both_channels):
+    """ALERT-02: variação ≥ SUSPECT_PCT sai como nota no aviso ENTREGUE, sem bloquear.
+
+    A nota de conferência (D-04/D-10) é linha extra do corpo que viaja no aviso
+    real pelos canais — a entrega acontece normalmente (D-04: nunca bloqueia).
+    """
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, change_pct=-25.0)  # |−25| ≥ 20: variação suspeita
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # a nota de conferência NÃO bloqueia o alerta (D-04)
+    bodies = []
+    for request in recorder.requests:
+        payload = json.loads(request.content)
+        bodies.append(payload.get("text") or payload.get("body") or "")
+    assert len(bodies) == 2  # entregue pelos DOIS canais
+    assert all("evento corporativo" in b for b in bodies)  # a nota viaja no aviso real

@@ -10,6 +10,7 @@ exatamente 1 linha por versão e as tabelas íntegras.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
@@ -154,3 +155,29 @@ def test_journal_mode_is_wal_after_apply(settings):
     finally:
         conn.close()
     assert mode.lower() == "wal"
+
+
+def test_watch_direction_column_defaults_to_below_and_refuses_others(settings):
+    """ALERT-01: watch.direction nasce 'below' e o CHECK recusa qualquer outro valor.
+
+    O requisito manda o esquema nascer com a coluna direction (v0.1 aceita só
+    'below'): o padrão sem env explícito e a recusa do CHECK são comportamento
+    do esquema 0001, provados por INSERT real.
+    """
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        conn.execute(
+            "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', 10.0)"
+        )
+        row = conn.execute("SELECT direction FROM watch WHERE symbol = 'PETR4'").fetchone()
+        assert row["direction"] == "below"  # padrão do esquema v0.1
+
+        with pytest.raises(sqlite3.IntegrityError):  # v0.1 só aceita 'below'
+            conn.execute(
+                "INSERT INTO watch (symbol, market, target_below, direction) "
+                "VALUES ('BTCUSDT', 'crypto', 10.0, 'above')"
+            )
+    finally:
+        conn.close()
