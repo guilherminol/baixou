@@ -158,7 +158,12 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     ``alerts.process_alerts`` avalia o cruzamento para baixo (borda inclusiva),
     envia os avisos FORA de transação com o MESMO cliente da rodada e grava
     alerted/alerted_at/alerted_target/notify_state em write_tx curta própria
-    (rede de notificação nunca dentro de transação — T-02-01).
+    (rede de notificação nunca dentro de transação — T-02-01). Na sequência
+    (ALERT-03/D-05/D-06), ``alerts.process_operational`` entrega os avisos
+    operacionais — falha prolongada e volta ao normal da fonte (um aviso por
+    EPISÓDIO) e cota 80%/100% da brapi (único por mês) — com as flags de
+    entrega em notify_episode (migração 0003), sem tocar quota.py nem as
+    colunas de quote dos itens (D-07).
     """
     global _cadence_rounds
 
@@ -330,6 +335,14 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
         # write_tx das cotações, envia FORA de transação (o cliente é o mesmo
         # da rodada) e grava o resultado em write_tx curta própria (T-02-01).
         alerts.process_alerts(conn, settings, client, datetime.now(UTC))
+
+        # Fase 3 (ALERT-03/D-05/D-06): avisos operacionais na sequência —
+        # episódios de fonte e de cota. source_outcomes sai do que a PRÓPRIA
+        # rodada tentou (successes/source_errors — nada de reler o banco para
+        # descobrir o que aconteceu aqui); o estado ENTRE rodadas fica no
+        # banco (source_state, quota e notify_episode da migração 0003).
+        source_outcomes = {source: source_errors.get(source, "ok") for source in attempted}
+        alerts.process_operational(conn, settings, client, datetime.now(UTC), source_outcomes)
 
     log("info", "worker", "heartbeat")
     return time.monotonic() - started

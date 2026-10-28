@@ -43,13 +43,36 @@ avalia qualquer transição (troca de alvo, rearme, cruzamento); sem cotação
 ("none"), velha ("stale") ou B3 fora do pregão ("closed") nada é enviado nem
 escrito.
 
+Avisos operacionais (D-05/D-06/D-07 — ``process_operational``, chamada após
+``process_alerts`` na rodada): episódios de FONTE — falha prolongada
+(``source_state.consecutive_failures`` ≥ FAIL_NOTIFY_AFTER, valor já gravado
+pela write_tx da rodada) e volta ao normal — e de COTA da brapi (80% e 100%
+do mês UTC), todos com o MESMO formato do aviso de preço ("Baixou: <evento>",
+corpo PT-BR) e a MESMA regra de entrega. O estado do episódio vive na tabela
+``notify_episode`` (migração 0003) e a flag marca ENTREGA, não a transição
+(D-06): linha AUSENTE = episódio não iniciado; delivered=0 = pendente, o
+aviso reenvia toda rodada até o primeiro aceite (alcançando inclusive canais
+configurados depois do início do episódio); delivered=1 = entregue, nunca
+mais NESTE episódio. A TRANSIÇÃO de recuperação APAGA a chave de falha
+(encerrando SEM envio o aviso pendente — reenviar "fonte com falha" depois
+da normalização seria informação falsa) e grava por UPSERT a de recovery: o
+episódio fecha com o estado zerado, então um SEGUNDO ciclo
+falha→recuperação da mesma fonte emite os dois avisos DE NOVO — um aviso por
+EPISÓDIO, não por lifetime da fonte (ALERT-03). As chaves de cota carregam o
+mês UTC (``quota:warned80:{YYYY-MM}``/``quota:exhausted:{YYYY-MM}``) — a
+virada do mês abre episódio naturalmente novo; a linha de quota (month,
+calls, warned_80) e a porta de 100% da Fase 2 ficam INTOCADAS — a mensagem é
+derivada da linha persistida, quota.py não muda. Avisos operacionais NUNCA
+tocam alerted/alerted_at/alerted_target/notify_state de item nenhum (D-07).
+
 Eventos: ``alert_sent`` (uma vez por cruzamento entregue),
 ``alert_delivery_failed`` por canal recusado, ``alert_rearmed`` e
-``alert_target_changed`` (mudanças de estado sem envio) — citam kind e código
-HTTP quando falha de canal, nunca URL, token, tópico ou chat_id
-(K2/T-03-01/T-03-02). Estilo de worker/quota.py: funções de módulo, leitura
-fora de transação, escrita só em write_tx do chamador (aqui: write_tx própria
-do resultado do alerta).
+``alert_target_changed`` (mudanças de estado sem envio),
+``source_notify_alert`` e ``quota_notify_alert`` (avisos operacionais) —
+citam kind e código HTTP quando falha de canal, nunca URL, token, tópico ou
+chat_id (K2/T-03-01/T-03-02). Estilo de worker/quota.py: funções de módulo,
+leitura fora de transação, escrita só em write_tx do chamador (aqui: write_tx
+própria do resultado do alerta e das flags de episódio).
 """
 
 from __future__ import annotations
@@ -65,7 +88,7 @@ import httpx
 from baixou.core.config import Settings
 from baixou.core.db import write_tx
 from baixou.core.log import log
-from baixou.worker import messages
+from baixou.worker import messages, quota
 from baixou.worker.notifiers.base import CHANNEL_ORDER, NotificationResult, configured_channels
 from baixou.worker.sources.base import b3_market_open
 
@@ -325,3 +348,253 @@ def process_alerts(
         if not channels:
             continue  # avisos desligados: nenhum envio nem escrita (D-08)
         _deliver(conn, row, settings, client, now_utc, channels)
+
+
+# --- Avisos operacionais (D-05/D-06/D-07): episódios de fonte e de cota ---
+
+
+def _episode(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    """Lê a linha do episódio (leitura fora de transação — disciplina WAL)."""
+    return conn.execute("SELECT delivered FROM notify_episode WHERE key = ?", (key,)).fetchone()
+
+
+def _episode_pending(conn: sqlite3.Connection, key: str) -> bool:
+    """Episódio sem entrega (D-06): linha AUSENTE (não iniciado) ou delivered=0."""
+    row = _episode(conn, key)
+    return row is None or not row["delivered"]
+
+
+def _upsert_episode(conn: sqlite3.Connection, key: str, delivered: bool, now_utc: datetime) -> None:
+    """UPSERT da flag de ENTREGA do episódio — chamar DENTRO de write_tx (T-02-01).
+
+    delivered=1 SÓ com aceite de ≥1 canal (HTTP 2xx — D-16); 0 deixa pendente
+    (a rodada seguinte tenta de novo). ``updated_at`` em UTC ISO-8601.
+    """
+    conn.execute(
+        """
+        INSERT INTO notify_episode (key, delivered, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET
+            delivered = excluded.delivered,
+            updated_at = excluded.updated_at
+        """,
+        (key, 1 if delivered else 0, now_utc.strftime(_TS_FORMAT)),
+    )
+
+
+def _record_episode(conn: sqlite3.Connection, key: str, delivered: bool, now_utc: datetime) -> None:
+    """Grava a flag do episódio em write_tx curta própria (T-02-01)."""
+    with write_tx(conn):
+        _upsert_episode(conn, key, delivered, now_utc)
+
+
+def _send_all(
+    channels: list[tuple[str, Callable]],
+    settings: Settings,
+    client: httpx.Client,
+    title: str,
+    body: str,
+) -> bool:
+    """Envia o aviso por TODOS os canais em sequência — rede FORA de transação (T-02-01).
+
+    Devolve True quando ≥1 canal aceita (HTTP 2xx — D-16); cada recusa emite
+    ``alert_delivery_failed`` citando só kind e código HTTP (K2). Sem retry
+    dentro da rodada: a repetição é na rodada seguinte (D-06).
+    """
+    delivered = False
+    for channel, send in channels:
+        result = send(client, settings, title, body)
+        if result.ok:
+            delivered = True
+        else:
+            log(
+                "warning",
+                "alert",
+                "alert_delivery_failed",
+                channel=channel,
+                kind=result.kind,
+                http_status=result.http_status,
+                text=f"falha de entrega no canal {channel}: {result.kind}",
+            )
+    return delivered
+
+
+def _log_operational(event: str, episode: str, delivered: bool, text: str, **fields) -> None:
+    """Evento estável EN + texto PT-BR do aviso operacional — sem URL/token (K2)."""
+    log(
+        "info" if delivered else "warning",
+        "alert",
+        event,
+        episode=episode,
+        delivered=delivered,
+        **fields,
+        text=text,
+    )
+
+
+def _source_failure(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    client: httpx.Client,
+    now_utc: datetime,
+    channels: list[tuple[str, Callable]],
+    source: str,
+    kind: str,
+) -> None:
+    """Episódio de FALHA prolongada da fonte (D-05a, SC-4).
+
+    ``consecutive_failures`` já foi gravado pela write_tx da rodada — aqui é
+    só consumo. O aviso dispara ao alcançar FAIL_NOTIFY_AFTER (borda
+    inclusiva) e é ÚNICO dentro do episódio depois do primeiro aceite;
+    enquanto pendente (delivered=0), a rodada seguinte tenta de novo (D-06).
+    """
+    state = conn.execute(
+        "SELECT consecutive_failures FROM source_state WHERE source = ?", (source,)
+    ).fetchone()
+    consecutive = state["consecutive_failures"] if state is not None else 0
+    key = f"source:{source}:failure"
+    if consecutive < settings.fail_notify_after or not _episode_pending(conn, key):
+        return  # abaixo do limiar, ou episódio já entregue: nada a fazer
+    title, body = messages.source_failure_message(source, kind, consecutive)
+    delivered = _send_all(channels, settings, client, title, body)
+    _record_episode(conn, key, delivered, now_utc)
+    _log_operational(
+        "source_notify_alert",
+        "failure",
+        delivered,
+        f"aviso de fonte com falha: {source} ({consecutive} rodadas seguidas)",
+        source=source,
+    )
+
+
+def _source_recovery(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    client: httpx.Client,
+    now_utc: datetime,
+    channels: list[tuple[str, Callable]],
+    source: str,
+) -> None:
+    """Episódio de RECUPERAÇÃO da fonte (D-05b) — transição ou reenvio pendente.
+
+    TRANSIÇÃO (a chave de falha EXISTE): envia o aviso de volta ao normal e,
+    numa write_tx curta própria, APAGA a chave de falha — encerrando SEM
+    envio o aviso de falha pendente, se houver (reenviar "fonte com falha"
+    depois da normalização seria informação falsa) — e grava por UPSERT a
+    chave de recovery com a flag de entrega (substitui a linha do episódio
+    anterior). O delete É o reset de estado que abre o PRÓXIMO episódio do
+    zero: um segundo ciclo falha→recuperação da mesma fonte emite os dois
+    avisos DE NOVO (ALERT-03 — um aviso por EPISÓDIO, não por lifetime da
+    fonte). REENVIO PENDENTE (chave de falha ausente, recovery com
+    delivered=0): repete a entrega até o primeiro aceite (D-06). Com a chave
+    de falha ausente e a de recovery ausente ou delivered=1: episódio
+    fechado — nada.
+    """
+    failure_key = f"source:{source}:failure"
+    recovery_key = f"source:{source}:recovery"
+    if _episode(conn, failure_key) is not None:  # TRANSIÇÃO: episódio de falha em curso
+        title, body = messages.source_recovery_message(source)
+        delivered = _send_all(channels, settings, client, title, body)
+        with write_tx(conn):
+            conn.execute("DELETE FROM notify_episode WHERE key = ?", (failure_key,))
+            _upsert_episode(conn, recovery_key, delivered, now_utc)
+        _log_operational(
+            "source_notify_alert",
+            "recovery",
+            delivered,
+            f"aviso de volta ao normal: {source}",
+            source=source,
+        )
+        return
+    row = _episode(conn, recovery_key)
+    if row is None or row["delivered"]:
+        return  # episódio fechado (nunca iniciado ou já entregue)
+    title, body = messages.source_recovery_message(source)  # REENVIO PENDENTE
+    delivered = _send_all(channels, settings, client, title, body)
+    _record_episode(conn, recovery_key, delivered, now_utc)
+    _log_operational(
+        "source_notify_alert",
+        "recovery",
+        delivered,
+        f"aviso de volta ao normal: {source}",
+        source=source,
+    )
+
+
+def _quota_episodes(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    client: httpx.Client,
+    now_utc: datetime,
+    channels: list[tuple[str, Callable]],
+) -> None:
+    """Episódios de COTA da brapi como mensagens de canal (D-05c/d, D-06).
+
+    CONSOME a linha gravada pela Fase 2 (``quota.read_quota`` — quota.py NÃO
+    muda; a porta de 100% ``b3_quota_allows`` e os eventos de log
+    quota_warning_80/quota_exhausted ficam INTOCADOS, D-06): ``warned_80``=1
+    e ``calls`` ≥ brapi_monthly_limit no MÊS UTC corrente são as transições
+    já derivadas — a mensagem de canal é derivada da linha persistida,
+    independente da transição de log que não se repete naturalmente (a chave
+    pendente cobre a repetição de entrega que a transição não cobria). A
+    chave carrega o mês — a virada abre episódio naturalmente novo (nenhum
+    reset manual).
+    """
+    row = quota.read_quota(conn)
+    if row is None or row["month"] != quota.current_month():
+        return  # sem linha, ou linha do mês anterior: a virada zera episódio
+    if row["warned_80"]:
+        key = f"quota:warned80:{row['month']}"
+        if _episode_pending(conn, key):
+            title, body = messages.quota_80_message(row["calls"], settings.brapi_monthly_limit)
+            delivered = _send_all(channels, settings, client, title, body)
+            _record_episode(conn, key, delivered, now_utc)
+            _log_operational(
+                "quota_notify_alert",
+                "warned80",
+                delivered,
+                f"aviso de 80% da cota da brapi ({row['month']})",
+                month=row["month"],
+            )
+    if row["calls"] >= settings.brapi_monthly_limit:
+        key = f"quota:exhausted:{row['month']}"
+        if _episode_pending(conn, key):
+            title, body = messages.quota_exhausted_message()
+            delivered = _send_all(channels, settings, client, title, body)
+            _record_episode(conn, key, delivered, now_utc)
+            _log_operational(
+                "quota_notify_alert",
+                "exhausted",
+                delivered,
+                f"aviso de cota da brapi esgotada ({row['month']})",
+                month=row["month"],
+            )
+
+
+def process_operational(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    client: httpx.Client,
+    now_utc: datetime,
+    source_outcomes: dict[str, str],
+) -> None:
+    """Avisos operacionais: episódios de fonte (falha/recuperação) e de cota (D-05/D-06).
+
+    Chamar APÓS ``process_alerts``, ainda com o cliente httpx da rodada.
+    ``source_outcomes`` é fonte → ``"ok"`` | kind das fontes TENTADAS nesta
+    rodada (montado em ``run_round`` a partir de successes/source_errors —
+    nada de reler o banco para descobrir o que aconteceu na própria rodada;
+    o estado ENTRE rodadas continua 100% no banco). Episódios de fonte em
+    ordem determinística, depois os de cota; entrega multi-canal FORA de
+    transação com flags de ENTREGA em ``notify_episode`` (migração 0003) em
+    write_tx curta própria. NUNCA toca quote de item (D-07) nem a linha de
+    quota (Fase 2 intocada).
+    """
+    channels = configured_channels(settings)
+    for source in sorted(source_outcomes):
+        outcome = source_outcomes[source]
+        if outcome == "ok":
+            _source_recovery(conn, settings, client, now_utc, channels, source)
+        else:
+            _source_failure(conn, settings, client, now_utc, channels, source, outcome)
+    _quota_episodes(conn, settings, client, now_utc, channels)
