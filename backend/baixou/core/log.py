@@ -27,7 +27,7 @@ def configure(level: str) -> None:
     _min_level = _LEVELS[normalized]
     try:
         sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, OSError, ValueError):
+    except AttributeError, OSError, ValueError:
         pass
 
 
