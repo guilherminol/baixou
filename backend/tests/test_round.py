@@ -467,3 +467,70 @@ def test_round_error_log_never_leaks_brapi_token(tmp_path, monkeypatch, fake_htt
         assert "auth" in whole_output  # prova de que a falha foi logada (evento com o kind)
     finally:
         conn.close()
+
+
+# --- 02-02 Task 2 (D-02, SC-2): quarentena do símbolo inválido do lote Binance ---
+
+
+def test_round_quarantines_bad_binance_symbol_until_watch_row_is_recreated(
+    db, settings, monkeypatch, fake_http
+):
+    """400 -1121: 1-a-1 identifica o ruim, os válidos são gravados mesmo na rodada do
+    400 (SC-2); o ruim sai do lote das rodadas seguintes e volta ao recriar a watch."""
+    seed_watch(db, "BTCUSDT", "crypto")
+    seed_watch(db, "ETHUSDT", "crypto")
+
+    batches: list[list[str]] = []
+    singles: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "symbols" in request.url.params:
+            symbols = json.loads(request.url.params["symbols"])
+            batches.append(symbols)
+            if "ETHUSDT" in symbols:  # o lote é all-or-nothing com o ruim dentro
+                return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+            return httpx.Response(
+                200, json=[{"symbol": s, "price": "270000.0"} for s in symbols]
+            )
+        symbol = request.url.params["symbol"]
+        singles.append(symbol)
+        if symbol == "ETHUSDT":  # o ruim também falha sozinho (400 -1121)
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+        return httpx.Response(200, json={"symbol": symbol, "price": "270000.0"})
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+
+    # Rodada 1: o 400 dispara o 1-a-1 UMA vez; o ruim é identificado e gravado.
+    worker_main.run_round(db, settings)
+    assert batches == [["BTCUSDT", "ETHUSDT"]]  # 1 lote com os dois
+    assert singles == ["BTCUSDT", "ETHUSDT"]  # 1-a-1: cada símbolo uma vez
+
+    btc = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert btc is not None and btc["price"] == 270000.0  # SC-2: o válido é gravado
+    eth = db.execute("SELECT * FROM quote WHERE symbol = 'ETHUSDT'").fetchone()
+    assert eth is not None and eth["last_fetch_error"] == "not_found"  # erro por item
+
+    binance_state = db.execute("SELECT * FROM source_state WHERE source = 'binance'").fetchone()
+    assert binance_state["last_ok_at"] is not None  # not_found parcial não é falha de fonte
+    assert binance_state["consecutive_failures"] == 0
+
+    # Rodada 2: o símbolo em quarentena NÃO entra no lote (peso 4, não N singles).
+    worker_main.run_round(db, settings)
+    assert batches[1] == ["BTCUSDT"]  # o lote único segue com os válidos
+    assert singles == ["BTCUSDT", "ETHUSDT"]  # nenhuma chamada 1-a-1 nova
+
+    btc = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert btc["price"] == 270000.0  # o válido continua gravado em toda rodada
+
+    # Recriar a linha em watch (remover/re-adicionar): cascata apaga a quote e
+    # o símbolo volta ao lote na rodada seguinte.
+    db.execute("DELETE FROM watch WHERE symbol = 'ETHUSDT' AND market = 'crypto'")
+    db.execute(
+        "INSERT INTO watch (symbol, market, target_below) VALUES ('ETHUSDT', 'crypto', 10.0)"
+    )
+    assert db.execute("SELECT * FROM quote WHERE symbol = 'ETHUSDT'").fetchone() is None
+
+    worker_main.run_round(db, settings)
+    assert batches[2] == ["BTCUSDT", "ETHUSDT"]  # de volta ao lote único
+    assert singles == ["BTCUSDT", "ETHUSDT", "ETHUSDT"]  # 1-a-1 novamente para o ruim
