@@ -12,6 +12,12 @@ entregue, nada se refaz dentro do episódio — inclusive alcançando canais
 configurados depois do início. A normalização encerra o aviso de falha
 pendente SEM envio (informação falsa após a normalização). Avisos
 operacionais NUNCA tocam as colunas de quote do item (D-07).
+
+Episódios de COTA (D-05c/d): warned_80=1 e calls ≥ limite no MÊS UTC
+corrente viram mensagens de canal únicas por mês (a chave do episódio inclui
+o mês — a virada abre episódio novo), consumindo a linha gravada pela Fase 2
+sem tocá-la; os testes de unidade chamam ``process_operational`` direto com
+a linha de quota semeada e o mês congelado (mesmo mecanismo de test_quota.py).
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -26,6 +33,7 @@ import pytest
 from baixou.core.config import Settings, load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect
 from baixou.core.migrations import apply_migrations
+from baixou.worker import alerts
 from baixou.worker import main as worker_main
 
 _Handler = Callable[[httpx.Request], httpx.Response]
@@ -307,3 +315,217 @@ def test_recovery_pending_repeats_until_first_acceptance(ops_env, monkeypatch, f
 
     worker_main.run_round(conn, settings)  # rodada 7: episódio entregue — nada mais
     assert len(_telegram_with_text(fake_http, "normalizada")) == 3
+
+
+# --- Cota da brapi como mensagem de canal (D-05c/d, D-06) — unidade, sem rodada ---
+
+# Mês UTC corrente congelado para os episódios de cota (mesmo mecanismo de
+# test_quota.py: a chave do episódio inclui o mês UTC visto por quota).
+_QUOTA_MONTH = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+
+
+def _freeze_quota_month(monkeypatch, now_utc: datetime) -> None:
+    """Fixa o ``datetime`` do módulo quota (consumido via alerts) num instante arbitrário."""
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now_utc.astimezone(tz)
+            return now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(alerts.quota, "datetime", _Frozen)
+
+
+def _seed_quota(conn: sqlite3.Connection, *, month: str, calls: int, warned_80: int) -> None:
+    """Semeia a linha de cota da brapi como a Fase 2 a gravaria (autocommit)."""
+    conn.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', ?, ?, ?)",
+        (month, calls, warned_80),
+    )
+
+
+def _quota_row(conn: sqlite3.Connection) -> sqlite3.Row:
+    return conn.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+
+
+def _ops_client(requests: list[httpx.Request], *, ok: bool = True) -> httpx.Client:
+    """Cliente httpx com o canal simulado: 2xx quando ``ok``, 500 caso contrário.
+
+    Registra cada requisição na lista do teste (mesmo papel do ``_FakeHttp``).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if ok:
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+        return httpx.Response(500, text="boom")
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _requests_with(requests: list[httpx.Request], needle: str) -> list[httpx.Request]:
+    """Requisições ao canal cujo corpo cita o fragmento (título do aviso)."""
+    return [r for r in requests if needle in json.loads(r.content)["text"]]
+
+
+def test_quota_80_sent_once_per_month_after_delivery(ops_env, monkeypatch):
+    """warned_80=1 no mês corrente (limite 10): UM aviso de 80%; entregue, nunca mais no mês.
+
+    A transição já foi derivada pela Fase 2 — process_operational só a
+    transforma em mensagem de canal (quota.py intocado, D-06).
+    """
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-10", calls=8, warned_80=1)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    sent = _requests_with(requests, "80% da cota")
+    assert len(sent) == 1
+    assert "8 de 10 chamadas" in json.loads(sent[0].content)["text"]  # corpo PT-BR (D-07)
+    assert _episode(conn, "quota:warned80:2026-10")["delivered"] == 1
+
+    with _ops_client(requests) as client:  # segunda chamada: episódio entregue — nada
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "80% da cota")) == 1
+
+
+def test_quota_80_pending_repeats_until_accepted(ops_env, monkeypatch):
+    """Canal recusando: o aviso de 80% re-envia a cada chamada até o primeiro aceite (D-06)."""
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-10", calls=8, warned_80=1)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests, ok=False) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+    with _ops_client(requests, ok=False) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "80% da cota")) == 2  # pendente repete
+    assert _episode(conn, "quota:warned80:2026-10")["delivered"] == 0  # só vira 1 com aceite
+
+    with _ops_client(requests, ok=True) as client:  # canal aceita → entregue
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "80% da cota")) == 3
+    assert _episode(conn, "quota:warned80:2026-10")["delivered"] == 1
+
+    with _ops_client(requests, ok=True) as client:  # entregue: nunca mais no mês
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "80% da cota")) == 3
+
+
+def test_quota_previous_month_sends_nothing(ops_env, monkeypatch):
+    """Linha do mês ANTERIOR: nenhum aviso — a virada do mês UTC abre episódio novo."""
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-09", calls=10, warned_80=1)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert requests == []  # nem 80%, nem 100%: o mês na chave zera o episódio
+    assert conn.execute("SELECT COUNT(*) FROM notify_episode").fetchone()[0] == 0
+
+
+def test_quota_exhausted_sent_once_per_month(ops_env, monkeypatch):
+    """calls ≥ limite (limite 10): UM aviso de 100%; sem repetição após entregue.
+
+    warned_80=0 aqui: prova que o episódio de 100% é independente do de 80%.
+    """
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-10", calls=10, warned_80=0)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "cota da brapi esgotada")) == 1
+    assert _requests_with(requests, "80% da cota") == []  # warned_80=0: nada de 80%
+    assert _episode(conn, "quota:exhausted:2026-10")["delivered"] == 1
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "cota da brapi esgotada")) == 1
+
+
+def test_quota_below_thresholds_sends_nothing(ops_env, monkeypatch):
+    """Chamadas abaixo do limite e warned_80=0: nenhum aviso de cota."""
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-10", calls=7, warned_80=0)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert requests == []
+    assert conn.execute("SELECT COUNT(*) FROM notify_episode").fetchone()[0] == 0
+
+
+def test_quota_both_episodes_fire_in_one_call_when_exhausted_and_warned(ops_env, monkeypatch):
+    """calls=10 com warned_80=1: os DOIS episódios saem na mesma chamada, cada um com sua chave."""
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_quota(conn, month="2026-10", calls=10, warned_80=1)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(_requests_with(requests, "80% da cota")) == 1
+    assert len(_requests_with(requests, "cota da brapi esgotada")) == 1
+    assert _episode(conn, "quota:warned80:2026-10")["delivered"] == 1
+    assert _episode(conn, "quota:exhausted:2026-10")["delivered"] == 1
+
+
+def test_operational_alerts_touch_neither_quote_nor_quota(ops_env, monkeypatch):
+    """D-07/D-06: avisos de cota não alteram coluna de quote nem a linha de quota.
+
+    Asserção direta nas linhas: month/calls/warned_80 intactos (só leitura) e
+    alerted/alerted_at/alerted_target/notify_state do item intactos — os
+    avisos operacionais gravam APENAS em notify_episode.
+    """
+    settings, conn = ops_env
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    _seed_item(conn)  # PETR4 na watch...
+    conn.execute(  # ...e a cotação semeada por SQL direto (sem rodada neste teste)
+        """
+        INSERT INTO quote (symbol, market, price, price_at, change_pct,
+            alerted, alerted_target, alerted_at, notify_state, last_fetch_error)
+        VALUES ('PETR4', 'b3', 9.50, '2026-10-28T15:50:00Z', -1.0, 0, NULL, NULL, NULL, NULL)
+        """
+    )
+    _seed_quota(conn, month="2026-10", calls=8, warned_80=1)
+    _freeze_quota_month(monkeypatch, _QUOTA_MONTH)
+    requests: list[httpx.Request] = []
+
+    with _ops_client(requests) as client:
+        alerts.process_operational(conn, limit10, client, _MARKET_OPEN_NOW, {})
+
+    assert len(requests) == 1  # o aviso de 80% saiu
+    quota_row = _quota_row(conn)
+    assert quota_row["month"] == "2026-10"
+    assert quota_row["calls"] == 8  # intocado por process_operational
+    assert quota_row["warned_80"] == 1
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 0
+    assert quote["alerted_at"] is None
+    assert quote["alerted_target"] is None
+    assert quote["notify_state"] is None
+    assert _episode(conn, "quota:warned80:2026-10")["delivered"] == 1  # única escrita
