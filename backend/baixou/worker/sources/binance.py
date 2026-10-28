@@ -249,7 +249,14 @@ def fetch_batch(
     gravar em ``quote.last_fetch_error``. O espelho ativo é transparente: é
     apenas o base URL escolhido por ``_request`` (D-04).
     """
-    status, payload = _request(client, {"symbols": json.dumps(list(symbols))})
+    # Separadores compactos (G-03-3): a gramática do parâmetro symbols
+    # recusa espaço após a vírgula — json.dumps padrão sai
+    # '["A", "B"]' e a Binance responde 400 code -1100 ("Illegal
+    # characters"), perdendo a cotação da rodada inteira (prova ao vivo no
+    # 03-UAT.md). Compacto: '["A","B"]' → 200 com o lote inteiro.
+    status, payload = _request(
+        client, {"symbols": json.dumps(list(symbols), separators=(",", ":"))}
+    )
     _raise_for_status(status)
     if status == 400:
         if isinstance(payload, dict) and payload.get("code") == _INVALID_SYMBOL_CODE:
