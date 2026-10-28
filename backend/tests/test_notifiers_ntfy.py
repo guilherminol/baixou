@@ -1,8 +1,9 @@
 """Notificador ntfy com servidor simulado — sem rede (NOTIF-01, D-16, T-03-02).
 
 ``httpx.MockTransport`` gravando requisições (padrão do telegram.py e das
-fontes): envio ok grava o POST JSON com topic/title/body no host de
-NTFY_URL; o token opcional vira "Authorization: Bearer" só quando definido;
+fontes): envio ok grava o POST JSON com topic/title/message no host de
+NTFY_URL — "message" é a chave que o esquema "Publish as JSON" do ntfy lê
+como corpo (G-03-2); o token opcional vira "Authorization: Bearer" só quando definido;
 o "click" entra só com NOTIFY_CLICK_URL preenchido (D-14); falhas
 401/500/429 (e os demais 4xx) DEVOLVEM ``NotificationResult`` sem levantar —
 nem a URL nem o tópico aparecem em resultado algum (o tópico é a senha do
@@ -81,10 +82,14 @@ def test_send_happy_path_posts_json_with_topic_title_and_body():
     assert request.url.host == "ntfy.local"  # o host vem de settings.ntfy_url
     assert request.url.path == "/"
     payload = json.loads(request.content)
+    # Igualdade EXATA contra o esquema "Publish as JSON" do ntfy (G-03-2): o
+    # serviço lê o corpo em "message"; "body" é chave desconhecida (ignorada,
+    # corpo vira o literal "triggered"). A igualdade prova que não sobra
+    # "body" nem chave extra qualquer.
     assert payload == {
         "topic": _TOPIC,
         "title": "Baixou: PETR4",  # título obrigatório — nunca o tópico (T-03-02)
-        "body": "Preço atual: R$ 9,50",
+        "message": "Preço atual: R$ 9,50",
     }
     assert "authorization" not in {key.lower() for key in request.headers}
 
@@ -113,7 +118,14 @@ def test_click_enters_payload_only_with_notify_click_url():
 
     assert result.ok is True
     payload = json.loads(requests[0].content)
-    assert payload["click"] == _CLICK_URL  # D-14: vazio omite o botão de abrir
+    # Igualdade exata: o "click" entra SÓ com NOTIFY_CLICK_URL preenchido
+    # (D-14: vazio omite o botão de abrir) e o corpo viaja em "message" (G-03-2).
+    assert payload == {
+        "topic": _TOPIC,
+        "title": "Baixou: PETR4",
+        "message": "corpo",
+        "click": _CLICK_URL,
+    }
 
 
 @pytest.mark.parametrize(

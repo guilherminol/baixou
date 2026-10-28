@@ -563,6 +563,7 @@ def test_suspect_variation_notes_delivery_without_blocking(both_channels):
     bodies = []
     for request in recorder.requests:
         payload = json.loads(request.content)
-        bodies.append(payload.get("text") or payload.get("body") or "")
+        # "text" (telegram) e "message" (ntfy — G-03-2) são as chaves de corpo reais
+        bodies.append(payload.get("text") or payload.get("message") or "")
     assert len(bodies) == 2  # entregue pelos DOIS canais
     assert all("evento corporativo" in b for b in bodies)  # a nota viaja no aviso real
