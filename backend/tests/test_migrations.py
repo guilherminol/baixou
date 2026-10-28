@@ -47,22 +47,34 @@ def test_fresh_database_applies_0001_once_with_event(settings, capsys):
     """Banco vazio: 10 tabelas, exatamente 1 linha de versão 0001, evento emitido."""
     applied_now = apply_migrations(settings.db_path)
 
-    assert applied_now == ["0001"]
+    assert applied_now == ["0001", "0002"]
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001"]
+    assert versions == ["0001", "0002"]
     assert EXPECTED_TABLES <= tables
     assert "migration_applied" in capsys.readouterr().out
 
 
 def test_second_application_is_noop(settings):
-    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 1 linha."""
+    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 2 linhas."""
     apply_migrations(settings.db_path)
     applied_now = apply_migrations(settings.db_path)
 
     assert applied_now == []
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001"]
+    assert versions == ["0001", "0002"]
     assert EXPECTED_TABLES <= tables
+
+
+def test_quote_gains_last_fetch_error_column(settings):
+    """A migração 0002 acrescenta quote.last_fetch_error TEXT (D-03)."""
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        columns = {row["name"]: row["type"] for row in conn.execute("PRAGMA table_info(quote)")}
+    finally:
+        conn.close()
+    assert columns.get("last_fetch_error") == "TEXT"
 
 
 def test_newer_schema_is_refused(settings, capsys):
@@ -104,7 +116,7 @@ def test_concurrent_apply_race_is_exactly_once(settings):
 
     assert failures == []  # ambas retornam sem exceção
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001"]  # exatamente 1 linha, sem duplicar versão
+    assert versions == ["0001", "0002"]  # exatamente 2 linhas, sem duplicar versão
     assert EXPECTED_TABLES <= tables  # todas as 10 tabelas íntegras
 
 

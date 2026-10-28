@@ -335,3 +335,131 @@ def test_round_with_empty_watch_only_records_heartbeat(db, settings, monkeypatch
     assert run_row["last_run"] is not None
     assert run_row["worker_lock_at"] is not None
     assert db.execute("SELECT COUNT(*) AS n FROM source_state").fetchone()["n"] == 0
+
+
+# --- 02-02 Task 1 (D-03, SC-3): falha tipada de fonte nunca derruba a rodada ---
+
+
+def test_round_brapi_failure_survives_and_records_source_failure(
+    db, settings, monkeypatch, fake_http, capsys
+):
+    """brapi 500 × binance ok: crypto gravada, falha em source_state, rodada viva (SC-3)."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "brapi.dev":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "270000.0"}])
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)  # a rodada NUNCA propaga SourceError
+
+    crypto = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert crypto is not None and crypto["price"] == 270000.0  # o outro mercado é gravado
+
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state["last_attempt_at"] is not None
+    assert brapi_state["last_ok_at"] is None  # sem sucesso novo
+    assert brapi_state["last_error"] == "unavailable"  # kind do 500
+    assert brapi_state["consecutive_failures"] == 1
+
+    binance_state = db.execute("SELECT * FROM source_state WHERE source = 'binance'").fetchone()
+    assert binance_state["last_ok_at"] is not None
+    assert binance_state["consecutive_failures"] == 0
+
+    run_row = db.execute("SELECT last_run, last_ok FROM run WHERE id = 1").fetchone()
+    assert run_row["last_run"] is not None  # batimento incondicional
+    assert run_row["last_ok"] is None  # fonte falhou → last_ok não é tocado
+
+    out = capsys.readouterr().out
+    assert "unavailable" in out and "PETR4" in out  # evento cita kind e símbolo
+    assert "brapi.dev" not in out  # a URL nunca entra no log (K2)
+
+    # Segunda rodada ainda falhando: consecutive_failures acumula (insumo do ALERT-03).
+    worker_main.run_round(db, settings)
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state["consecutive_failures"] == 2
+
+
+def test_round_brapi_not_found_marks_item_and_recovers_next_round(
+    db, settings, monkeypatch, fake_http
+):
+    """2 tickers, 1 com 404: o ok é gravado, o falhado recebe last_fetch_error='not_found';
+    na rodada seguinte com sucesso a coluna volta a NULL (D-03)."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "VALE3", "b3")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        symbol = request.url.path.rsplit("/", 1)[-1]
+        if symbol == "VALE3":
+            return httpx.Response(404, json={"message": "not found"})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "symbol": symbol,
+                        "regularMarketPrice": 38.25,
+                        "regularMarketTime": 1793154000,
+                        "regularMarketChangePercent": -1.3,
+                    }
+                ]
+            },
+        )
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    petr4 = db.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert petr4 is not None and petr4["price"] == 38.25  # o ok é gravado
+    assert petr4["last_fetch_error"] is None
+
+    vale3 = db.execute("SELECT * FROM quote WHERE symbol = 'VALE3'").fetchone()
+    assert vale3 is not None and vale3["last_fetch_error"] == "not_found"  # erro por item
+
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state["last_ok_at"] is not None  # not_found parcial não é falha de fonte
+    assert brapi_state["consecutive_failures"] == 0
+
+    # Rodada seguinte com o ticker ok de novo: a coluna dele volta a NULL.
+    worker_main.run_round(db, settings)
+    vale3 = db.execute("SELECT * FROM quote WHERE symbol = 'VALE3'").fetchone()
+    assert vale3["price"] == 38.25
+    assert vale3["last_fetch_error"] is None
+
+
+def test_round_error_log_never_leaks_brapi_token(tmp_path, monkeypatch, fake_http, capsys):
+    """K2/T-02-04: com BRAPI_TOKEN na env, a falha logada não contém o valor nem 'token='."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("TZ_MARKET", "America/Sao_Paulo")
+    monkeypatch.setenv("POLL_MINUTES", "15")
+    monkeypatch.setenv("LOG_LEVEL", "info")
+    monkeypatch.setenv("BRAPI_TOKEN", "tok-secreto-xyz")
+    settings = load_settings()
+    apply_migrations(settings.db_path)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        seed_watch(conn, "PETR4", "b3")
+        seed_watch(conn, "BTCUSDT", "crypto")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "brapi.dev":
+                return httpx.Response(401, json={"message": "invalid token"})
+            return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "270000.0"}])
+
+        fake_http.route(handler)
+        _freeze_clock_inside_market(monkeypatch)
+        worker_main.run_round(conn, settings)
+
+        captured = capsys.readouterr()
+        whole_output = captured.out + captured.err
+        assert "tok-secreto-xyz" not in whole_output  # o valor nunca aparece
+        assert "token=" not in whole_output  # nem o trecho da query (K2)
+        assert "auth" in whole_output  # prova de que a falha foi logada (evento com o kind)
+    finally:
+        conn.close()
