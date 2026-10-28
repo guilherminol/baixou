@@ -48,7 +48,7 @@ def test_migrated_db_without_heartbeat_returns_503_with_empty_body(settings):
 def test_worker_heartbeat_then_healthz_returns_200_with_empty_body(settings):
     apply_migrations(settings.db_path)
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
-    run_round(conn)
+    run_round(conn, settings)  # rodada real (POLL-01) assina (conn, settings)
     conn.close()
     with _client(settings) as client:
         response = client.get("/healthz")
@@ -69,8 +69,8 @@ def test_stale_heartbeat_older_than_3x_interval_returns_503_with_empty_body(sett
     assert response.content == b""
 
 
-def test_worker_records_last_run_as_utc_iso_8601(db):
-    run_round(db)
+def test_worker_records_last_run_as_utc_iso_8601(db, settings):
+    run_round(db, settings)
     row = db.execute("SELECT last_run FROM run WHERE id = 1").fetchone()
     parsed = datetime.fromisoformat(row["last_run"].replace("Z", "+00:00"))
     assert parsed.tzinfo is not None

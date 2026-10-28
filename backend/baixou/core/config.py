@@ -32,6 +32,12 @@ class Settings:
     tz_market: str
     poll_minutes: int
     log_level: str
+    # Fase 2 (POLL-01/POLL-02, D-01): os campos nascem com o contrato final;
+    # a resolução NOME → NOME_FILE → padrão em load_settings é ligada na
+    # Task 2 do plano 02-01 — até lá os defaults abaixo já são os padrões.
+    brapi_token: str = ""
+    brapi_monthly_limit: int = 15000
+    b3_every_n_rounds: int = 1
     # Pares lidos via _FILE, separados dos campos comuns (fases 2–3 consomem
     # TELEGRAM_TOKEN etc. por aqui). Valores aqui NUNCA vão para log/erro (K2).
     secrets: dict[str, str] = field(default_factory=dict)
