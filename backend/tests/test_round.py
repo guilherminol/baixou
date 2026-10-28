@@ -23,6 +23,7 @@ from baixou.core.config import load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect
 from baixou.core.migrations import apply_migrations
 from baixou.worker import main as worker_main
+from baixou.worker import quota
 from baixou.worker.sources.base import b3_market_open
 
 _Handler = Callable[[httpx.Request], httpx.Response]
@@ -49,6 +50,19 @@ def _freeze_clock(monkeypatch, now_utc: datetime) -> None:
 def _freeze_clock_inside_market(monkeypatch) -> None:
     """Congela o relógio dentro do pregão — inerte para a Task 1, define a Task 3."""
     _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+
+def _freeze_quota_month(monkeypatch, now_utc: datetime) -> None:
+    """Congela o mês UTC visto pelo módulo de cota (mesmo mecanismo do worker.main)."""
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now_utc.astimezone(tz)
+            return now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(quota, "datetime", _Frozen)
 
 
 @pytest.fixture(autouse=True)
@@ -617,3 +631,73 @@ def test_round_binance_blocked_on_both_hosts_round_survives(
     out = capsys.readouterr().out
     assert out.count("mirror_fallback") == 1  # UMA troca (principal → espelho), não duas
     assert "unavailable" in out  # a falha do lote é registrada com o kind
+
+
+# --- 02-03 Task 1 (D-05, D-06): contagem persistida da cota brapi ---
+
+
+def test_round_counts_brapi_calls_across_rounds_and_ignores_crypto(
+    db, settings, monkeypatch, fake_http
+):
+    """2 tickers brapi × 2 rodadas → calls=4; cripto (lote Binance) não soma."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "VALE3", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(db, settings)
+    worker_main.run_round(db, settings)
+
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row is not None
+    assert row["calls"] == 4  # só os fetch_one executados da brapi contam
+    assert row["month"] == "2026-10"  # mês UTC do relógio congelado (D-06)
+    assert row["warned_80"] == 0
+
+
+def test_round_outside_market_hours_does_not_count_quota(db, settings, monkeypatch, fake_http):
+    """Rodada com pregão fechado: nenhuma chamada brapi → nada entra no contador."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    fake_http.route(_happy_handlers())
+    _freeze_clock(monkeypatch, _MARKET_CLOSED_NOW)
+    _freeze_quota_month(monkeypatch, _MARKET_CLOSED_NOW)
+
+    worker_main.run_round(db, settings)
+
+    # Sem chamada brapi e sem virada a processar: a linha nem nasce.
+    assert db.execute("SELECT COUNT(*) AS n FROM quota").fetchone()["n"] == 0
+
+    # Chamadas de rodadas anteriores permanecem e a rodada fechada NÃO soma por cima.
+    db.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', '2026-11', 4, 0)"
+    )
+    worker_main.run_round(db, settings)
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["calls"] == 4  # inalterado
+
+
+def test_round_quota_warning_80_fires_once(db, settings, monkeypatch, fake_http, capsys):
+    """limit=10 e 2 tickers brapi: o aviso sai exatamente na rodada que cruza 8, uma vez."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "VALE3", "b3")
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    for _ in range(3):  # rodadas 1–3: calls 2, 4, 6 — nenhuma cruza
+        worker_main.run_round(db, limit10)
+    assert "quota_warning_80" not in capsys.readouterr().out
+
+    worker_main.run_round(db, limit10)  # rodada 4: calls=8 → cruza 0.8×10
+    assert capsys.readouterr().out.count("quota_warning_80") == 1
+
+    worker_main.run_round(db, limit10)  # rodada 5: warned_80=1 impede repetição
+    assert "quota_warning_80" not in capsys.readouterr().out
+
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["calls"] == 10
+    assert row["warned_80"] == 1
