@@ -130,7 +130,20 @@ def apply_migrations(db_path: str | Path, migrations_dir: Path | None = None) ->
                     conn.execute("ROLLBACK")
                 except sqlite3.OperationalError:
                     pass  # falhou antes do BEGIN — nada a desfazer
-                raise
+                # Corrida de subida: o vencedor pode ter aplicado ESTA versão
+                # entre a leitura de `applied` (no início da chamada) e o lock
+                # deste script — DDL não-idempotente (o ALTER da 0002) então
+                # falha no perdedor com "duplicate column name". Benigno: DDL e
+                # versão commitam JUNTOS no vencedor, a migração foi aplicada
+                # exatamente uma vez — o perdedor sai limpo, como o INSERT…
+                # WHERE NOT EXISTS já fazia para DDL idempotente. Versão ainda
+                # ausente é erro de verdade: relança.
+                registered = conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+                ).fetchone()
+                if registered is None:
+                    raise
+                continue
             if conn.total_changes > changes_before:
                 applied_now.append(version)
                 log(
