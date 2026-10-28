@@ -27,7 +27,7 @@ from baixou.core.config import Settings, load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, check_sqlite_version, connect, write_tx
 from baixou.core.log import configure, log
 from baixou.core.migrations import apply_migrations
-from baixou.worker import quota
+from baixou.worker import alerts, quota
 from baixou.worker.scheduler import next_slot, wait_until
 from baixou.worker.sources import binance, brapi
 from baixou.worker.sources.base import QuoteResult, SourceError, b3_market_open
@@ -154,6 +154,11 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     de cada fetch_one da B3 e, a 100%, fecha (a última permitida executa e
     conta; bloqueada não sai, não soma e não loga erro — cripto nunca é
     bloqueada por cota da brapi; 429 do 02-02 é falha de fonte, não cota).
+    Fase 3 (SC-1/D-12/D-15/D-16): DEPOIS da write_tx única,
+    ``alerts.process_alerts`` avalia o cruzamento para baixo (borda inclusiva),
+    envia os avisos FORA de transação com o MESMO cliente da rodada e grava
+    alerted/alerted_at/alerted_target/notify_state em write_tx curta própria
+    (rede de notificação nunca dentro de transação — T-02-01).
     """
     global _cadence_rounds
 
@@ -218,104 +223,114 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
                 failures["binance"] = [exc]
                 successes["binance"] = 0
 
-    source_errors: dict[str, str] = {}
-    for source, errors in failures.items():
-        kind = _source_failure_kind(errors, successes.get(source, 0))
-        if kind is not None:
-            source_errors[source] = kind
+        source_errors: dict[str, str] = {}
+        for source, errors in failures.items():
+            kind = _source_failure_kind(errors, successes.get(source, 0))
+            if kind is not None:
+                source_errors[source] = kind
 
-    with write_tx(conn):  # transação única e curta: só escrita de banco
-        now = _utc_now_iso()
-        for (symbol, market), result in quotes.items():
-            conn.execute(
-                """
-                INSERT INTO quote (symbol, market, price, price_at, change_pct, last_fetch_error)
-                VALUES (?, ?, ?, ?, ?, NULL)
-                ON CONFLICT (symbol, market) DO UPDATE SET
-                    price = excluded.price,
-                    price_at = excluded.price_at,
-                    change_pct = excluded.change_pct,
-                    last_fetch_error = NULL
-                """,
-                (symbol, market, result.price, result.price_at, result.change_pct),
-            )
-        for (symbol, market), exc in item_errors.items():
-            # erro por item (D-03): a linha nasce se ainda não existe (preço
-            # NULL) e o último preço conhecido é preservado quando existe
-            conn.execute(
-                """
-                INSERT INTO quote (symbol, market, price, price_at, change_pct, last_fetch_error)
-                VALUES (?, ?, NULL, NULL, NULL, ?)
-                ON CONFLICT (symbol, market) DO UPDATE SET
-                    last_fetch_error = excluded.last_fetch_error
-                """,
-                (symbol, market, exc.kind),
-            )
-        # Cota da brapi (POLL-03/D-05/D-06): soma as chamadas efetuadas na
-        # MESMA transação única; virada UTC e transições de aviso são do
-        # registro (log é stdout, pode sair aqui dentro). Bloqueadas não chegam.
-        quota.record_round_calls(conn, settings, brapi_calls)
-        for source in attempted:
-            if source in source_errors:
+        # Fase 3: o MESMO cliente da rodada cobre a write_tx única e o envio
+        # de avisos — a rede de notificação fica FORA de transação (T-02-01).
+        with write_tx(conn):  # transação única e curta: só escrita de banco
+            now = _utc_now_iso()
+            for (symbol, market), result in quotes.items():
                 conn.execute(
                     """
-                    INSERT INTO source_state
-                        (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
-                    VALUES (?, ?, NULL, 1, ?)
-                    ON CONFLICT (source) DO UPDATE SET
-                        last_attempt_at = excluded.last_attempt_at,
-                        consecutive_failures = source_state.consecutive_failures + 1,
-                        last_error = excluded.last_error
+                    INSERT INTO quote (symbol, market, price, price_at,
+                        change_pct, last_fetch_error)
+                    VALUES (?, ?, ?, ?, ?, NULL)
+                    ON CONFLICT (symbol, market) DO UPDATE SET
+                        price = excluded.price,
+                        price_at = excluded.price_at,
+                        change_pct = excluded.change_pct,
+                        last_fetch_error = NULL
                     """,
-                    (source, now, source_errors[source]),
+                    (symbol, market, result.price, result.price_at, result.change_pct),
+                )
+            for (symbol, market), exc in item_errors.items():
+                # erro por item (D-03): a linha nasce se ainda não existe (preço
+                # NULL) e o último preço conhecido é preservado quando existe
+                conn.execute(
+                    """
+                    INSERT INTO quote (symbol, market, price, price_at,
+                        change_pct, last_fetch_error)
+                    VALUES (?, ?, NULL, NULL, NULL, ?)
+                    ON CONFLICT (symbol, market) DO UPDATE SET
+                        last_fetch_error = excluded.last_fetch_error
+                    """,
+                    (symbol, market, exc.kind),
+                )
+            # Cota da brapi (POLL-03/D-05/D-06): soma as chamadas efetuadas na
+            # MESMA transação única; virada UTC e transições de aviso são do
+            # registro (log é stdout, pode sair aqui dentro). Bloqueadas não chegam.
+            quota.record_round_calls(conn, settings, brapi_calls)
+            for source in attempted:
+                if source in source_errors:
+                    conn.execute(
+                        """
+                        INSERT INTO source_state
+                            (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
+                        VALUES (?, ?, NULL, 1, ?)
+                        ON CONFLICT (source) DO UPDATE SET
+                            last_attempt_at = excluded.last_attempt_at,
+                            consecutive_failures = source_state.consecutive_failures + 1,
+                            last_error = excluded.last_error
+                        """,
+                        (source, now, source_errors[source]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO source_state
+                            (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
+                        VALUES (?, ?, ?, 0, NULL)
+                        ON CONFLICT (source) DO UPDATE SET
+                            last_attempt_at = excluded.last_attempt_at,
+                            last_ok_at = excluded.last_ok_at,
+                            consecutive_failures = 0,
+                            last_error = NULL
+                        """,
+                        (source, now, now),
+                    )
+            if source_errors:
+                # batimento incondicional; last_ok não é tocado quando uma fonte falhou
+                conn.execute(
+                    "UPDATE run SET last_run = ?, worker_lock_at = ? WHERE id = 1",
+                    (now, now),
                 )
             else:
                 conn.execute(
-                    """
-                    INSERT INTO source_state
-                        (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
-                    VALUES (?, ?, ?, 0, NULL)
-                    ON CONFLICT (source) DO UPDATE SET
-                        last_attempt_at = excluded.last_attempt_at,
-                        last_ok_at = excluded.last_ok_at,
-                        consecutive_failures = 0,
-                        last_error = NULL
-                    """,
-                    (source, now, now),
+                    "UPDATE run SET last_run = ?, worker_lock_at = ?, last_ok = ? WHERE id = 1",
+                    (now, now, now),
                 )
-        if source_errors:
-            # batimento incondicional; last_ok não é tocado quando uma fonte falhou
-            conn.execute(
-                "UPDATE run SET last_run = ?, worker_lock_at = ? WHERE id = 1",
-                (now, now),
-            )
-        else:
-            conn.execute(
-                "UPDATE run SET last_run = ?, worker_lock_at = ?, last_ok = ? WHERE id = 1",
-                (now, now, now),
-            )
 
-    # Eventos de erro FORA da transação: citam kind e símbolo — nunca a URL
-    # nem o token (as mensagens das fontes são construídas sem a requisição).
-    for (symbol, _market), exc in item_errors.items():
-        log(
-            "warning",
-            "source",
-            "source_error",
-            kind=exc.kind,
-            symbol=symbol,
-            text=f"falha ao consultar cotação: {exc.kind}",
-        )
-    for source, errors in failures.items():
-        if source in source_errors and not any(exc.symbol for exc in errors):
+        # Eventos de erro FORA da transação: citam kind e símbolo — nunca a URL
+        # nem o token (as mensagens das fontes são construídas sem a requisição).
+        for (symbol, _market), exc in item_errors.items():
             log(
                 "warning",
                 "source",
                 "source_error",
-                source=source,
-                kind=source_errors[source],
-                text=f"falha na fonte {source}: {source_errors[source]}",
+                kind=exc.kind,
+                symbol=symbol,
+                text=f"falha ao consultar cotação: {exc.kind}",
             )
+        for source, errors in failures.items():
+            if source in source_errors and not any(exc.symbol for exc in errors):
+                log(
+                    "warning",
+                    "source",
+                    "source_error",
+                    source=source,
+                    kind=source_errors[source],
+                    text=f"falha na fonte {source}: {source_errors[source]}",
+                )
+
+        # Fase 3 (SC-1): máquina de estados do alerta — avalia DEPOIS da
+        # write_tx das cotações, envia FORA de transação (o cliente é o mesmo
+        # da rodada) e grava o resultado em write_tx curta própria (T-02-01).
+        alerts.process_alerts(conn, settings, client, datetime.now(UTC))
+
     log("info", "worker", "heartbeat")
     return time.monotonic() - started
 
