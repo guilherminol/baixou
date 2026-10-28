@@ -1,11 +1,13 @@
-"""Rodada com o alerta de ponta a ponta — cruzamento para baixo até o Telegram simulado.
+"""Rodada com o alerta de ponta a ponta — cruzamento para baixo até os canais simulados.
 
 Mesmos padrões de test_round.py (``MockTransport`` roteado por host, relógio
 congelado, banco recém-migrado), com o canal Telegram configurado: brapi
 responde abaixo do alvo, o Telegram simulado aceita e o item fica alertado com
 alerted/alerted_at/alerted_target/notify_state no formato final (SC-1, D-12,
 D-15). Rodada repetida com o preço ainda abaixo não reenvia — um aviso por
-cruzamento; canal recusado não marca o item (a rodada seguinte tenta de novo).
+cruzamento; canal recusado grava a falha por canal e o item segue aguardando
+(SC-3 — a rodada seguinte tenta de novo); um canal aceitando e outro recusando
+alerta com o resultado por canal gravado.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ _MARKET_OPEN_NOW = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
 
 _TELEGRAM_TOKEN = "123456789:bot-tok-secreto-xyz"  # formato <id>:<hash> exigido na subida (D-09)
 _TELEGRAM_CHAT_ID = "42"
+_NTFY_TOPIC = "baixou-e2e"
 
 
 def _freeze_clock(monkeypatch, now_utc: datetime) -> None:
@@ -84,6 +87,23 @@ def alert_env(tmp_path, monkeypatch) -> tuple[Settings, sqlite3.Connection]:
     monkeypatch.setenv("LOG_LEVEL", "info")
     monkeypatch.setenv("TELEGRAM_TOKEN", _TELEGRAM_TOKEN)
     monkeypatch.setenv("TELEGRAM_CHAT_ID", _TELEGRAM_CHAT_ID)
+    settings = load_settings()
+    apply_migrations(settings.db_path)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    yield settings, conn
+    conn.close()
+
+
+@pytest.fixture
+def alert_env_two_channels(tmp_path, monkeypatch) -> tuple[Settings, sqlite3.Connection]:
+    """Settings com Telegram E ntfy configurados + banco recém-migrado (SC-3)."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("TZ_MARKET", "America/Sao_Paulo")
+    monkeypatch.setenv("POLL_MINUTES", "15")
+    monkeypatch.setenv("LOG_LEVEL", "info")
+    monkeypatch.setenv("TELEGRAM_TOKEN", _TELEGRAM_TOKEN)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", _TELEGRAM_CHAT_ID)
+    monkeypatch.setenv("NTFY_TOPIC", _NTFY_TOPIC)
     settings = load_settings()
     apply_migrations(settings.db_path)
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
@@ -173,7 +193,7 @@ def test_round_repeated_below_target_does_not_resend(alert_env, monkeypatch, fak
 
 
 def test_round_channel_refusal_keeps_item_waiting(alert_env, monkeypatch, fake_http, capsys):
-    """Telegram 500: nenhum canal aceitou — NADA é gravado; a rodada seguinte tenta de novo."""
+    """Telegram 500: nenhum canal aceitou — só notify_state é gravado; a rodada seguinte tenta de novo."""
     settings, conn = alert_env
     _seed_petr4(conn, target=10.0)
     telegram_up = {"on": False}
@@ -193,7 +213,9 @@ def test_round_channel_refusal_keeps_item_waiting(alert_env, monkeypatch, fake_h
     quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
     assert quote["alerted"] == 0  # sem canal aceitando, o item não fica alertado
     assert quote["alerted_at"] is None
-    assert quote["notify_state"] is None  # o estado de falha por canal chega no 03-03
+    assert json.loads(quote["notify_state"]) == {
+        "telegram": "erro unavailable (HTTP 500)"
+    }  # a falha por canal fica registrada (SC-3, D-15)
     out = capsys.readouterr().out
     assert "alert_delivery_failed" in out
     assert "500" in out  # o código HTTP é citado
@@ -205,6 +227,37 @@ def test_round_channel_refusal_keeps_item_waiting(alert_env, monkeypatch, fake_h
     quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
     assert quote["alerted"] == 1  # a repetição da entrega é na rodada seguinte (D-16)
     assert json.loads(quote["notify_state"]) == {"telegram": "ok"}
+
+
+def test_round_two_channels_one_accepts_other_fails_records_both(
+    alert_env_two_channels, monkeypatch, fake_http, capsys
+):
+    """e2e (SC-3): Telegram 401 + ntfy 200 — alertado com resultado por canal em notify_state."""
+    settings, conn = alert_env_two_channels
+    _seed_petr4(conn, target=10.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.telegram.org":
+            return httpx.Response(401, json={"ok": False, "error_code": 401})
+        if request.url.host == "ntfy.sh":
+            return httpx.Response(200, json={"id": "abc"})
+        return _brapi_price(9.50)(request)
+
+    fake_http.route(handler)
+    _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(conn, settings)
+
+    assert len(_telegram_requests(fake_http)) == 1
+    assert len([r for r in fake_http.requests if r.url.host == "ntfy.sh"]) == 1
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 1  # um canal aceitou: o item fica alertado
+    state = json.loads(quote["notify_state"])
+    assert state == {"telegram": "erro auth (HTTP 401)", "ntfy": "ok"}
+    assert list(state) == ["telegram", "ntfy"]  # chaves na ordem de CHANNEL_ORDER (D-15)
+    out = capsys.readouterr().out
+    assert out.count("alert_delivery_failed") == 1
+    assert out.count("alert_sent") == 1
 
 
 def test_round_price_above_target_never_notifies(alert_env, monkeypatch, fake_http):
