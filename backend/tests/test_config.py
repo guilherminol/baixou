@@ -44,6 +44,10 @@ def test_defaults_without_env(monkeypatch, tmp_path):
     assert settings.tz_market == "America/Sao_Paulo"
     assert settings.poll_minutes == 15
     assert settings.log_level == "info"
+    # Fase 2 (02-01): padrões das três variáveis novas (D-01; PRD: toda rodada)
+    assert settings.brapi_token == ""
+    assert settings.brapi_monthly_limit == 15000
+    assert settings.b3_every_n_rounds == 1
     assert settings.secrets == {}
 
 
@@ -208,3 +212,89 @@ def test_probe_of_other_process_survives(monkeypatch, tmp_path):
     load_settings()
 
     assert legacy.exists()
+
+
+# --- Fase 2 (plano 02-01, Task 2): BRAPI_TOKEN, BRAPI_MONTHLY_LIMIT, B3_EVERY_N_ROUNDS ---
+
+
+@pytest.mark.parametrize("variable", ["BRAPI_TOKEN", "BRAPI_MONTHLY_LIMIT", "B3_EVERY_N_ROUNDS"])
+def test_phase2_empty_string_exits_naming_variable(monkeypatch, tmp_path, capsys, variable):
+    """String vazia definida é inválida — mesmo contrato WR-01 das vars da Fase 1."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, variable, captured)
+
+
+def test_brapi_token_from_file_is_exposed_and_never_logged(monkeypatch, tmp_path, capsys):
+    """BRAPI_TOKEN_FILE é lido, vira settings.brapi_token, entra em secrets e nunca ecoa (K2)."""
+    secret_file = tmp_path / "brapi_token"
+    secret_file.write_text("brapi-s3cr3t\n", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BRAPI_TOKEN_FILE", str(secret_file))
+
+    settings = load_settings()
+
+    assert settings.brapi_token == "brapi-s3cr3t"
+    assert settings.secrets["BRAPI_TOKEN"] == "brapi-s3cr3t"
+    captured = capsys.readouterr()
+    assert "brapi-s3cr3t" not in captured.out + captured.err
+
+
+def test_brapi_token_env_wins_over_file(monkeypatch, tmp_path, capsys):
+    """Se BRAPI_TOKEN e BRAPI_TOKEN_FILE existem, a variável vence (arquitetura linha 190)."""
+    secret_file = tmp_path / "brapi_token"
+    secret_file.write_text("do-arquivo\n", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BRAPI_TOKEN", "do-ambiente")
+    monkeypatch.setenv("BRAPI_TOKEN_FILE", str(secret_file))
+
+    settings = load_settings()
+
+    assert settings.brapi_token == "do-ambiente"
+    assert "BRAPI_TOKEN" not in settings.secrets  # não foi lido via _FILE
+    captured = capsys.readouterr()
+    assert "do-arquivo" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("invalid", ["abc", "0", "-5"])
+def test_brapi_monthly_limit_invalid_exits_naming_variable(monkeypatch, tmp_path, capsys, invalid):
+    """BRAPI_MONTHLY_LIMIT precisa ser inteiro > 0; a mensagem nomeia a variável."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BRAPI_MONTHLY_LIMIT", invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    _assert_exit_names_variable(excinfo, "BRAPI_MONTHLY_LIMIT", capsys.readouterr())
+
+
+def test_brapi_monthly_limit_valid_value_is_parsed(monkeypatch, tmp_path):
+    """Valor válido vira int (ex.: "20000" → 20000)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BRAPI_MONTHLY_LIMIT", "20000")
+    assert load_settings().brapi_monthly_limit == 20000
+
+
+@pytest.mark.parametrize("invalid", ["0", "-1", "1.5", "abc"])
+def test_b3_every_n_rounds_invalid_exits_naming_variable(monkeypatch, tmp_path, capsys, invalid):
+    """B3_EVERY_N_ROUNDS precisa ser inteiro >= 1, com hint próprio (D-01)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("B3_EVERY_N_ROUNDS", invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, "B3_EVERY_N_ROUNDS", captured)
+    assert "use um inteiro maior ou igual a 1" in captured.out + captured.err
+
+
+def test_b3_every_n_rounds_valid_value_is_parsed_and_keeps_poll_minutes(monkeypatch, tmp_path):
+    """ "3" → 3; o intervalo das rodadas (e o TTL do lock /healthz) não muda (D-01)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("B3_EVERY_N_ROUNDS", "3")
+    settings = load_settings()
+    assert settings.b3_every_n_rounds == 3
+    assert settings.poll_minutes == 15

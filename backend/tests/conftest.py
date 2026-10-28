@@ -8,6 +8,24 @@ import pytest
 from baixou.core.config import Settings, load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect
 from baixou.core.migrations import apply_migrations
+from baixou.worker.sources import binance as binance_source
+
+
+@pytest.fixture(autouse=True)
+def _reset_mirror_state():
+    """Estado do espelho da Binance (D-04, memória de módulo) zerado entre testes.
+
+    Autouse em toda a suíte: qualquer teste observa o worker tentando o
+    endereço principal primeiro, independentemente da ordem de execução.
+    """
+    state = getattr(binance_source, "_mirror_state", None)
+    if state is not None:  # tolerante antes do estado existir (RED da Task 3)
+        state.using_mirror = False
+        state.last_primary_probe_at = None
+    yield
+    if state is not None:
+        state.using_mirror = False
+        state.last_primary_probe_at = None
 
 
 @pytest.fixture
