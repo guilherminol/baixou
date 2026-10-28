@@ -763,9 +763,7 @@ def test_round_last_permitted_call_executes_and_counts(
 
     def brapi_symbols_so_far():
         return [
-            r.url.path.rsplit("/", 1)[-1]
-            for r in fake_http.requests
-            if r.url.host == "brapi.dev"
+            r.url.path.rsplit("/", 1)[-1] for r in fake_http.requests if r.url.host == "brapi.dev"
         ]
 
     worker_main.run_round(db, limit10)

@@ -147,10 +147,13 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo, menos
     os símbolos em quarentena (``last_fetch_error = 'not_found'`` em quote —
     D-02, estado derivado da coluna da 0002, que a cascata limpa ao recriar
-    a linha em watch). POLL-03/D-05/D-06: cada ``fetch_one`` da brapi soma 1
-    na cota mensal persistida (tabela quota, linha source="brapi") e o
+    a linha em watch). POLL-03/D-05/D-06/SC-4: cada ``fetch_one`` da brapi
+    soma 1 na cota mensal persistida (tabela quota, linha source="brapi") e o
     registro entra na MESMA transação única — virada do mês UTC, aviso único
-    de 80% e porta de cota vivem em worker.quota; chamada bloqueada não soma.
+    de 80% e porta de cota vivem em worker.quota; a porta é consultada ANTES
+    de cada fetch_one da B3 e, a 100%, fecha (a última permitida executa e
+    conta; bloqueada não sai, não soma e não loga erro — cripto nunca é
+    bloqueada por cota da brapi; 429 do 02-02 é falha de fonte, não cota).
     """
     global _cadence_rounds
 
@@ -169,10 +172,11 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     brapi_calls = 0  # fetch_one executados da brapi nesta rodada (POLL-03)
     with httpx.Client(timeout=_SOURCE_TIMEOUT_S) as client:
         if b3_symbols and b3_due and b3_market_open(datetime.now(UTC), settings.tz_market):
-            attempted.append("brapi")
             brapi_errors: list[SourceError] = []
             brapi_ok = 0
             for symbol in b3_symbols:  # serializado: um símbolo por chamada
+                if not quota.b3_quota_allows(conn, settings, brapi_calls):
+                    break  # 100% (T-02-09): bloqueada não sai, não soma, não loga erro
                 brapi_calls += 1  # cada fetch_one executado soma 1 na cota (POLL-03)
                 try:
                     quotes[(symbol, "b3")] = brapi.fetch_one(client, symbol, settings.brapi_token)
@@ -180,9 +184,11 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
                 except SourceError as exc:
                     brapi_errors.append(exc)
                     item_errors[(symbol, "b3")] = exc
-            if brapi_errors:
-                failures["brapi"] = brapi_errors
-            successes["brapi"] = brapi_ok
+            if brapi_calls:  # porta fechada desde o início: a brapi nem é "tentada" na rodada
+                attempted.append("brapi")
+                if brapi_errors:
+                    failures["brapi"] = brapi_errors
+                successes["brapi"] = brapi_ok
         if crypto_symbols:
             # Quarentena derivada da coluna da 0002 (D-02/D-03): símbolo com
             # last_fetch_error = 'not_found' fica FORA das rodadas seguintes
