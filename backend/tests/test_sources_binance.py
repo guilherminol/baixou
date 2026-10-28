@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
 from baixou.worker.sources import binance
 from baixou.worker.sources.base import (
     RateLimitError,
+    SourceUnavailableError,
     UnexpectedResponseError,
 )
 
@@ -176,3 +178,134 @@ def test_fetch_batch_rate_limit_status_raises_without_extra_attempts(status):
 
     assert excinfo.value.kind == "rate_limit"
     assert len(requests) == 1  # nenhuma repetição (evita ban de IP)
+
+
+# --- 02-02 Task 3 (D-04, SC-2): espelho 451 com permanência e re-probe horário ---
+
+
+def _hosts(requests: list[httpx.Request]) -> list[str]:
+    return [r.url.host for r in requests]
+
+
+def test_451_on_primary_fails_over_to_mirror_and_stays(capsys):
+    """451 no principal → espelho assume e PERMANECE; mirror_fallback sai UMA vez."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.binance.com":
+            return httpx.Response(451)
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "1.0"}])
+
+    with _mock_client(handler, requests) as client:
+        quotes, errors = binance.fetch_batch(client, ["BTCUSDT"])
+
+    assert quotes["BTCUSDT"].price == 1.0  # a rodada grava as cotações
+    assert errors == {}
+    assert _hosts(requests) == ["api.binance.com", "data-api.binance.vision"]
+    assert binance._mirror_state.using_mirror is True
+
+    with _mock_client(handler, requests) as client:
+        binance.fetch_batch(client, ["BTCUSDT"])  # permanência: nasce no espelho
+
+    assert _hosts(requests)[2:] == ["data-api.binance.vision"]
+    out = capsys.readouterr().out
+    assert out.count("mirror_fallback") == 1  # evento único na troca, não por rodada
+
+
+def test_transport_error_on_primary_also_fails_over_to_mirror(capsys):
+    """Erro de conexão no principal dispara o mesmo caminho do 451 (D-04)."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.binance.com":
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"symbol": "BTCUSDT", "price": "1.0"})
+
+    with _mock_client(handler, requests) as client:
+        quotes, errors = binance.fetch_batch(client, ["BTCUSDT"])
+
+    assert quotes["BTCUSDT"].price == 1.0
+    assert errors == {}
+    assert _hosts(requests) == ["api.binance.com", "data-api.binance.vision"]
+    assert capsys.readouterr().out.count("mirror_fallback") == 1
+
+
+def test_mirror_reprobe_after_one_hour_recovers_primary(monkeypatch, capsys):
+    """Depois de 1 h no espelho, UM re-probe tenta o principal; sucesso → mirror_recovery."""
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+    clock = {"now": t0}
+    monkeypatch.setattr(binance, "_now", lambda: clock["now"])
+    primary_ok = {"flag": False}
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.binance.com":
+            if primary_ok["flag"]:
+                return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "2.0"}])
+            return httpx.Response(451)
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "1.0"}])
+
+    with _mock_client(handler, requests) as client:
+        binance.fetch_batch(client, ["BTCUSDT"])  # troca para o espelho
+        clock["now"] = t0 + timedelta(minutes=30)
+        binance.fetch_batch(client, ["BTCUSDT"])  # antes de 1 h: só espelho, sem probe
+        assert _hosts(requests) == [
+            "api.binance.com",
+            "data-api.binance.vision",
+            "data-api.binance.vision",
+        ]
+
+        primary_ok["flag"] = True
+        clock["now"] = t0 + timedelta(minutes=61)
+        quotes, _ = binance.fetch_batch(client, ["BTCUSDT"])  # re-probe: volta ao principal
+
+    assert quotes["BTCUSDT"].price == 2.0  # a resposta vem do principal
+    assert requests[-1].url.host == "api.binance.com"
+    assert binance._mirror_state.using_mirror is False
+    out = capsys.readouterr().out
+    assert out.count("mirror_fallback") == 1
+    assert out.count("mirror_recovery") == 1
+
+
+def test_mirror_failed_reprobe_stays_on_mirror_for_another_hour(monkeypatch, capsys):
+    """Re-probe falhando: permanece no espelho e o próximo re-probe é 1 h depois."""
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+    clock = {"now": t0}
+    monkeypatch.setattr(binance, "_now", lambda: clock["now"])
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.binance.com":
+            return httpx.Response(451)  # principal segue bloqueado
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "1.0"}])
+
+    with _mock_client(handler, requests) as client:
+        binance.fetch_batch(client, ["BTCUSDT"])  # troca para o espelho
+        clock["now"] = t0 + timedelta(minutes=61)
+        binance.fetch_batch(client, ["BTCUSDT"])  # re-probe falha: espelho responde
+        assert _hosts(requests)[-2:] == ["api.binance.com", "data-api.binance.vision"]
+        assert binance._mirror_state.using_mirror is True
+
+        clock["now"] = t0 + timedelta(minutes=65)  # probe acabou de falhar: sem probe
+        binance.fetch_batch(client, ["BTCUSDT"])
+        assert _hosts(requests)[-1] == "data-api.binance.vision"
+
+        clock["now"] = t0 + timedelta(minutes=121)  # 1 h depois do probe falho: de novo
+        binance.fetch_batch(client, ["BTCUSDT"])
+        assert _hosts(requests)[-2:] == ["api.binance.com", "data-api.binance.vision"]
+
+    assert binance._mirror_state.using_mirror is True
+    out = capsys.readouterr().out
+    assert out.count("mirror_fallback") == 1  # a troca foi UMA só, mesmo com re-probes
+
+
+def test_mirror_state_is_memory_only():
+    """D-04: nenhum schema para o endpoint ativo — migrações não citam espelho."""
+    state = binance._mirror_state
+    assert state.using_mirror is False  # reinício (módulo recarregado) volta ao principal
+    assert state.last_primary_probe_at is None
+
+    migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+    sql = "\n".join(p.read_text(encoding="utf-8") for p in sorted(migrations_dir.glob("*.sql")))
+    assert "mirror" not in sql.lower()
+    assert "binance.vision" not in sql.lower()  # nenhum endpoint ativo persistido

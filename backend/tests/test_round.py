@@ -533,3 +533,87 @@ def test_round_quarantines_bad_binance_symbol_until_watch_row_is_recreated(
     assert batches[2] == ["BTCUSDT", "ETHUSDT"]  # de volta ao lote único
     # 1-a-1 de novo: o lote recusado repete TODOS os símbolos (ordem da watch)
     assert singles == ["BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"]
+
+
+# --- 02-02 Task 3 (D-04, SC-2): espelho 451 na rodada ---
+
+
+def test_round_451_fails_over_to_mirror_and_counts_as_success(
+    db, settings, monkeypatch, fake_http, capsys
+):
+    """451 no principal: o espelho assume, a cotação é gravada e CONTA como sucesso."""
+    seed_watch(db, "BTCUSDT", "crypto")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.binance.com":
+            return httpx.Response(451)
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "270000.0"}])
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    hosts = {r.url.host for r in fake_http.requests}
+    assert hosts == {"api.binance.com", "data-api.binance.vision"}  # a troca aconteceu
+
+    crypto = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert crypto is not None and crypto["price"] == 270000.0
+
+    binance_state = db.execute("SELECT * FROM source_state WHERE source = 'binance'").fetchone()
+    assert binance_state["last_ok_at"] is not None  # espelho conta como sucesso
+    assert binance_state["consecutive_failures"] == 0
+    assert binance_state["last_error"] is None
+
+    run_row = db.execute("SELECT last_run, last_ok FROM run WHERE id = 1").fetchone()
+    assert run_row["last_ok"] is not None  # nenhuma fonte falhou
+
+    out = capsys.readouterr().out
+    assert out.count("mirror_fallback") == 1  # evento único, não por rodada
+
+
+def test_round_binance_blocked_on_both_hosts_round_survives(
+    db, settings, monkeypatch, fake_http, capsys
+):
+    """451 nos dois endereços: SourceUnavailableError na rodada, que sobrevive (SC-3)."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "brapi.dev":
+            symbol = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": symbol,
+                            "regularMarketPrice": 38.25,
+                            "regularMarketTime": 1793154000,
+                            "regularMarketChangePercent": -1.3,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(451)  # principal E espelho bloqueados
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)  # a rodada NUNCA levanta
+
+    petr4 = db.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert petr4 is not None and petr4["price"] == 38.25  # a B3 não é silenciada
+
+    binance_state = db.execute("SELECT * FROM source_state WHERE source = 'binance'").fetchone()
+    assert binance_state["last_ok_at"] is None
+    assert binance_state["last_error"] == "unavailable"
+    assert binance_state["consecutive_failures"] == 1
+
+    run_row = db.execute("SELECT last_run, last_ok FROM run WHERE id = 1").fetchone()
+    assert run_row["last_run"] is not None  # batimento incondicional
+    assert run_row["last_ok"] is None  # uma fonte falhou
+
+    out = capsys.readouterr().out
+    assert out.count("mirror_fallback") == 1  # UMA troca (principal → espelho), não duas
+    assert "unavailable" in out  # a falha do lote é registrada com o kind
