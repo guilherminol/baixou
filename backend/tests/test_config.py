@@ -298,3 +298,131 @@ def test_b3_every_n_rounds_valid_value_is_parsed_and_keeps_poll_minutes(monkeypa
     settings = load_settings()
     assert settings.b3_every_n_rounds == 3
     assert settings.poll_minutes == 15
+
+
+# --- Fase 3 (plano 03-01, Task 1): limiares e canais no Settings (D-14, WR-01) ---
+
+
+def test_phase3_defaults_without_env(monkeypatch, tmp_path):
+    """Sem variáveis de canal/limiar definidas, valem os padrões da Fase 3 (D-14)."""
+    _base_env(monkeypatch, tmp_path)
+    for variable in (
+        "REARM_PCT",
+        "SUSPECT_PCT",
+        "STALE_MINUTES_B3",
+        "STALE_MINUTES_CRYPTO",
+        "FAIL_NOTIFY_AFTER",
+        "TELEGRAM_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "NTFY_URL",
+        "NTFY_TOPIC",
+        "NTFY_TOKEN",
+        "NOTIFY_CLICK_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    settings = load_settings()
+
+    assert settings.rearm_pct == 1
+    assert settings.suspect_pct == 20
+    assert settings.stale_minutes_b3 == 75
+    assert settings.stale_minutes_crypto == 30
+    assert settings.fail_notify_after == 3
+    assert settings.ntfy_url == "https://ntfy.sh"
+    assert settings.notify_click_url == ""
+    assert settings.telegram_token == ""
+    assert settings.telegram_chat_id == ""
+    assert settings.ntfy_topic == ""
+    assert settings.ntfy_token == ""
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "expected"),
+    [
+        ("REARM_PCT", "2", 2),
+        ("SUSPECT_PCT", "15", 15),
+        ("STALE_MINUTES_B3", "90", 90),
+        ("STALE_MINUTES_CRYPTO", "45", 45),
+        ("FAIL_NOTIFY_AFTER", "5", 5),
+    ],
+)
+def test_phase3_int_valid_value_is_parsed(monkeypatch, tmp_path, variable, value, expected):
+    """Valor válido vira int no molde das ints da Fase 2."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, value)
+    settings = load_settings()
+    assert getattr(settings, variable.lower()) == expected
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "REARM_PCT",
+        "SUSPECT_PCT",
+        "STALE_MINUTES_B3",
+        "STALE_MINUTES_CRYPTO",
+        "FAIL_NOTIFY_AFTER",
+    ],
+)
+@pytest.mark.parametrize("invalid", ["abc", "0", "-5", ""])
+def test_phase3_int_invalid_exits_naming_variable(monkeypatch, tmp_path, capsys, variable, invalid):
+    """Int da fase precisa ser inteiro > 0; string vazia definida também falha (WR-01)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    _assert_exit_names_variable(excinfo, variable, capsys.readouterr())
+
+
+def test_telegram_token_from_file_is_exposed_and_never_logged(monkeypatch, tmp_path, capsys):
+    """TELEGRAM_TOKEN_FILE é lido, vira settings.telegram_token, entra em secrets e não ecoa."""
+    secret_file = tmp_path / "telegram_token"
+    secret_file.write_text("bot-s3cr3t\n", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TELEGRAM_TOKEN_FILE", str(secret_file))
+
+    settings = load_settings()
+
+    assert settings.telegram_token == "bot-s3cr3t"
+    assert settings.secrets["TELEGRAM_TOKEN"] == "bot-s3cr3t"
+    captured = capsys.readouterr()
+    assert "bot-s3cr3t" not in captured.out + captured.err
+
+
+def test_telegram_token_env_wins_over_file(monkeypatch, tmp_path, capsys):
+    """Se TELEGRAM_TOKEN e TELEGRAM_TOKEN_FILE existem, a variável vence (molde BRAPI_TOKEN)."""
+    secret_file = tmp_path / "telegram_token"
+    secret_file.write_text("do-arquivo\n", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TELEGRAM_TOKEN", "do-ambiente")
+    monkeypatch.setenv("TELEGRAM_TOKEN_FILE", str(secret_file))
+
+    settings = load_settings()
+
+    assert settings.telegram_token == "do-ambiente"
+    assert "TELEGRAM_TOKEN" not in settings.secrets  # não foi lido via _FILE
+    captured = capsys.readouterr()
+    assert "do-arquivo" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "variable", ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "NTFY_TOPIC", "NTFY_TOKEN", "NTFY_URL"]
+)
+def test_phase3_channel_empty_string_exits_naming_variable(monkeypatch, tmp_path, capsys, variable):
+    """String vazia definida em canal é inválida — mesmo contrato WR-01 (D-14)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, variable, captured)
+
+
+def test_notify_click_url_empty_is_valid(monkeypatch, tmp_path):
+    """NOTIFY_CLICK_URL vazio é VÁLIDO — padrão vazio, sem botão de abrir (D-14)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("NOTIFY_CLICK_URL", "")
+    settings = load_settings()
+    assert settings.notify_click_url == ""
