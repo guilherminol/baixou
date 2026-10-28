@@ -701,3 +701,159 @@ def test_round_quota_warning_80_fires_once(db, settings, monkeypatch, fake_http,
     row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
     assert row["calls"] == 10
     assert row["warned_80"] == 1
+
+
+# --- 02-03 Task 2 (D-05, SC-4): parada da B3 a 100% com cripto seguindo ---
+
+
+def test_round_quota_exhausted_blocks_b3_but_crypto_continues(
+    db, settings, monkeypatch, fake_http, capsys
+):
+    """Porta fechada (calls >= limite): ZERO requisições brapi; cripto e batimento seguem."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    # Cota já esgotada em rodadas anteriores (a transição já foi emitida e contada):
+    db.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', '2026-10', 10, 1)"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(db, limit10)
+    worker_main.run_round(db, limit10)  # rodada seguinte com a porta fechada
+
+    assert [r for r in fake_http.requests if r.url.host == "brapi.dev"] == []  # T-02-09
+    assert [r for r in fake_http.requests if r.url.host == "api.binance.com"]  # cripto segue
+
+    crypto = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
+    assert crypto is not None and crypto["price"] == 270000.0  # cripto gravada
+
+    assert (
+        db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone() is None
+    )  # bloqueada não é tentativa: nada em source_state
+
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["calls"] == 10  # chamada bloqueada não soma
+    assert row["warned_80"] == 1
+
+    run_row = db.execute(
+        "SELECT last_run, last_ok, worker_lock_at FROM run WHERE id = 1"
+    ).fetchone()
+    assert run_row["last_run"] is not None  # batimento incondicional
+    assert run_row["worker_lock_at"] is not None
+    assert run_row["last_ok"] is not None  # nenhuma fonte consultada falhou
+    assert capsys.readouterr().out.count("quota_exhausted") == 0  # transição não repete
+
+
+def test_round_last_permitted_call_executes_and_counts(
+    db, settings, monkeypatch, fake_http, capsys
+):
+    """Gravado 9 de 10: a ÚLTIMA chamada permitida executa e conta; a seguinte é bloqueada."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "VALE3", "b3")
+    db.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', '2026-10', 9, 1)"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    def brapi_symbols_so_far():
+        return [
+            r.url.path.rsplit("/", 1)[-1]
+            for r in fake_http.requests
+            if r.url.host == "brapi.dev"
+        ]
+
+    worker_main.run_round(db, limit10)
+
+    assert brapi_symbols_so_far() == ["PETR4"]  # a última permitida saiu; VALE3 é bloqueada
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["calls"] == 10  # a chamada que cruzou executou E contou
+    assert capsys.readouterr().out.count("quota_exhausted") == 1  # transição única
+
+    vale3 = db.execute("SELECT * FROM quote WHERE symbol = 'VALE3'").fetchone()
+    assert vale3 is None  # bloqueada: sem requisição, sem linha, sem erro por item
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state is not None and brapi_state["last_ok_at"] is not None  # a saída foi ok
+
+    # Rodada seguinte: porta fechada, nenhuma chamada nova, nenhum evento repetido.
+    worker_main.run_round(db, limit10)
+    assert brapi_symbols_so_far() == ["PETR4"]
+    assert capsys.readouterr().out.count("quota_exhausted") == 0
+
+
+def test_round_brapi_429_does_not_close_quota_door(db, settings, monkeypatch, fake_http, capsys):
+    """429 com calls < limite é RateLimitError em source_state (02-02) e NÃO fecha a porta."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    rate_limited = {"on": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "brapi.dev":
+            if rate_limited["on"]:
+                return httpx.Response(429)
+            symbol = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": symbol,
+                            "regularMarketPrice": 38.25,
+                            "regularMarketTime": 1793154000,
+                            "regularMarketChangePercent": -1.3,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "270000.0"}])
+
+    fake_http.route(handler)
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(db, limit10)  # rodada 1: 429 — a chamada executou e CONTA
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state["last_error"] == "rate_limit"  # falha tipada do 02-02
+    assert brapi_state["consecutive_failures"] == 1
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["calls"] == 1  # chamada executada soma mesmo com 429
+    assert "quota_exhausted" not in capsys.readouterr().out  # 429 não é esgotamento de cota
+
+    rate_limited["on"] = False
+    worker_main.run_round(db, limit10)  # rodada 2: porta aberta (1 < 10) → nova chamada sai
+    brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
+    assert len(brapi_requests) == 2  # a porta NÃO fechou com o 429 (fonte ≠ cota)
+    brapi_state = db.execute("SELECT * FROM source_state WHERE source = 'brapi'").fetchone()
+    assert brapi_state["consecutive_failures"] == 0  # sucesso zera (02-02)
+
+
+def test_round_quota_door_reopens_after_utc_rollover(db, settings, monkeypatch, fake_http):
+    """Porta fechada em outubro; na primeira rodada do mês novo UTC a B3 volta a ser consultada."""
+    limit10 = replace(settings, brapi_monthly_limit=10)
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    db.execute(
+        "INSERT INTO quota (source, month, calls, warned_80) VALUES ('brapi', '2026-10', 10, 1)"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+    _freeze_quota_month(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(db, limit10)
+    assert [r for r in fake_http.requests if r.url.host == "brapi.dev"] == []  # fechada
+
+    _freeze_quota_month(monkeypatch, datetime(2026, 11, 1, 13, 0, tzinfo=UTC))  # mês novo UTC
+    worker_main.run_round(db, limit10)
+
+    brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
+    assert len(brapi_requests) == 1  # a virada destrava já na primeira rodada do mês novo
+    row = db.execute("SELECT * FROM quota WHERE source = 'brapi'").fetchone()
+    assert row["month"] == "2026-11"  # reset da virada (D-06)
+    assert row["calls"] == 1  # e a chamada da rodada nova conta a partir do zero
+    assert row["warned_80"] == 0
