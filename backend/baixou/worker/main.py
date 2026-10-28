@@ -143,7 +143,10 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     nem o token (K2/T-02-04). Duração via time.monotonic (nunca time.time).
     SC-1/D-01: a B3 só é consultada dentro do pregão (seg–sex 10h–18h no fuso
     TZ_MARKET, via ``b3_market_open``) e quando a fase do divisor
-    ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo.
+    ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo, menos
+    os símbolos em quarentena (``last_fetch_error = 'not_found'`` em quote —
+    D-02, estado derivado da coluna da 0002, que a cascata limpa ao recriar
+    a linha em watch).
     """
     global _cadence_rounds
 
@@ -166,9 +169,7 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
             brapi_ok = 0
             for symbol in b3_symbols:  # serializado: um símbolo por chamada
                 try:
-                    quotes[(symbol, "b3")] = brapi.fetch_one(
-                        client, symbol, settings.brapi_token
-                    )
+                    quotes[(symbol, "b3")] = brapi.fetch_one(client, symbol, settings.brapi_token)
                     brapi_ok += 1
                 except SourceError as exc:
                     brapi_errors.append(exc)
@@ -177,12 +178,30 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
                 failures["brapi"] = brapi_errors
             successes["brapi"] = brapi_ok
         if crypto_symbols:
+            # Quarentena derivada da coluna da 0002 (D-02/D-03): símbolo com
+            # last_fetch_error = 'not_found' fica FORA das rodadas seguintes
+            # — sem chamada 1-a-1 recorrente (peso 4 do lote único preservado).
+            # Volta só quando a linha em watch for recriada (cascata limpa a
+            # coluna). Vale só para Binance: a brapi falha 1-a-1 naturalmente.
+            quarantined = {
+                row["symbol"]
+                for row in conn.execute(
+                    "SELECT symbol FROM quote "
+                    "WHERE market = 'crypto' AND last_fetch_error = 'not_found'"
+                )
+            }
+            crypto_symbols = [s for s in crypto_symbols if s not in quarantined]
+        if crypto_symbols:  # a quarentena pode esvaziar a lista: nada a consultar
             attempted.append("binance")
             try:
-                batch = binance.fetch_batch(client, crypto_symbols)
+                batch, batch_errors = binance.fetch_batch(client, crypto_symbols)
                 for symbol, result in batch.items():
                     quotes[(symbol, "crypto")] = result
                 successes["binance"] = len(batch)
+                if batch_errors:
+                    failures["binance"] = list(batch_errors.values())
+                    for symbol, exc in batch_errors.items():
+                        item_errors[(symbol, "crypto")] = exc
             except SourceError as exc:
                 failures["binance"] = [exc]
                 successes["binance"] = 0
