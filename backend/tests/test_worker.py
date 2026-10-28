@@ -151,10 +151,10 @@ def test_release_instance_lock_clears_only_owner_columns(db):
     assert row["worker_lock_at"] is None
 
 
-def test_round_heartbeat_refreshes_lock_timestamp(db):
+def test_round_heartbeat_refreshes_lock_timestamp(db, settings):
     assert worker_main.acquire_instance_lock(db, "host-a:111", _TTL_S) is True
     before = db.execute("SELECT worker_lock_at FROM run WHERE id = 1").fetchone()["worker_lock_at"]
-    worker_main.run_round(db)
+    worker_main.run_round(db, settings)  # rodada real (POLL-01) assina (conn, settings)
     row = db.execute("SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1").fetchone()
     assert row["worker_id"] == "host-a:111"
     assert row["worker_lock_at"] >= before  # lock fresco é efeito do batimento
