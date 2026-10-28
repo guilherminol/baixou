@@ -27,7 +27,7 @@ _Handler = Callable[[httpx.Request], httpx.Response]
 # Quarta-feira 16:00 UTC = 13:00 em Brasília: dentro do pregão (SC-1).
 _MARKET_OPEN_NOW = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
 
-_TELEGRAM_TOKEN = "bot-tok-secreto-xyz"
+_TELEGRAM_TOKEN = "123456789:bot-tok-secreto-xyz"  # formato <id>:<hash> exigido na subida (D-09)
 _TELEGRAM_CHAT_ID = "42"
 
 

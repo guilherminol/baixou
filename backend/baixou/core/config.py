@@ -236,6 +236,31 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     raw_click_url = environ.get("NOTIFY_CLICK_URL")
     notify_click_url = "" if raw_click_url is None else raw_click_url
 
+    # Pares de canal (D-08): configuração pela metade é config inválida —
+    # fail-fast nomeando a variável que FALTA. NTFY_TOPIC sozinho é VÁLIDO
+    # (o token é opcional). Sem NENHUM canal configurado o worker sobe normal
+    # (avisos desligados). Erros só detectáveis em rede (token revogado,
+    # tópico inexistente, 4xx/5xx) NUNCA falham a subida — aparecem como
+    # falha de canal no primeiro envio (D-09).
+    if telegram_token and not telegram_chat_id:
+        _fail("TELEGRAM_CHAT_ID", "TELEGRAM_TOKEN definido exige o chat_id do canal")
+    if telegram_chat_id and not telegram_token:
+        _fail("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID definido exige o token do bot")
+    if ntfy_token and not ntfy_topic:
+        _fail("NTFY_TOPIC", "NTFY_TOKEN definido exige o tópico do canal")
+
+    # Formato leve, sem chamar API (D-09): só checagens de string sobre o
+    # próprio valor — a mensagem nomeia a variável, nunca o valor (K2).
+    if telegram_chat_id:
+        try:
+            int(telegram_chat_id.strip())  # negativo de grupo é permitido
+        except ValueError:
+            _fail("TELEGRAM_CHAT_ID", "use o chat_id numérico do bot (negativo para grupos)")
+    if telegram_token and ":" not in telegram_token:
+        _fail("TELEGRAM_TOKEN", "token do bot no formato <id>:<hash> (falta o ':')")
+    if not (ntfy_url.startswith("http://") or ntfy_url.startswith("https://")):
+        _fail("NTFY_URL", "use um endereço http:// ou https://")
+
     # Qualquer NOME_FILE no ambiente é resolvido — mesmo sem campo próprio em
     # Settings (fases futuras adicionam nomes; variáveis desconhecidas são
     # toleradas). NOME presente vence: o arquivo nem é lido.
