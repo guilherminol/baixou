@@ -67,7 +67,7 @@ def _read_secret_file(environ: Mapping[str, str], name: str) -> str:
     file_variable = name + _FILE_SUFFIX
     try:
         value = Path(environ[file_variable]).read_text(encoding="utf-8")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         _fail(file_variable, "o arquivo do segredo não pôde ser lido")
     return value[:-1] if value.endswith("\n") else value
 
@@ -110,7 +110,7 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         tz_market = "America/Sao_Paulo"
     try:
         ZoneInfo(tz_market)  # nome de zona IANA, nunca offset (Pitfall 5)
-    except (ZoneInfoNotFoundError, ValueError, KeyError):
+    except ZoneInfoNotFoundError, ValueError, KeyError:
         _fail(
             "TZ_MARKET",
             "use o nome de uma zona IANA (ex.: America/Sao_Paulo), nunca um offset",
