@@ -274,3 +274,43 @@ def test_round_price_above_target_never_notifies(alert_env, monkeypatch, fake_ht
     assert quote["alerted"] == 0
     assert quote["alerted_at"] is None
     assert quote["notify_state"] is None
+
+
+def test_round_rearm_full_cycle(alert_env, monkeypatch, fake_http):
+    """SC-2 e2e: 9.0 alerta → 15.15 rearma sem enviar → 9.0 dispara NOVO aviso.
+
+    Duas primeiras rodadas cobrem o caso do plano (preços 9.0 → 15.15, rearme
+    na margem exata do alvo 15.0 com REARM_PCT 1); a terceira prova o arco
+    inteiro do valor central — o aviso repete SOMENTE depois do rearme.
+    """
+    settings, conn = alert_env
+    _seed_petr4(conn, target=15.0)
+    fake_http.route(_brapi_price(9.0))
+    _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(conn, settings)  # rodada 1: cruzamento → aviso
+
+    assert len(_telegram_requests(fake_http)) == 1
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 1
+    assert quote["alerted_target"] == 15.0
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+
+    fake_http.route(_brapi_price(15.15))  # margem exata do rearme (D-12)
+    worker_main.run_round(conn, settings)  # rodada 2: rearme — mudança de estado, sem envio
+
+    assert len(_telegram_requests(fake_http)) == 1  # rearme não gera requisição a canal
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 0
+    assert quote["alerted_target"] is None
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"  # histórico sobrevive (ALERT-04)
+
+    fake_http.route(_brapi_price(9.0))
+    _freeze_clock(monkeypatch, datetime(2026, 10, 28, 16, 15, 0, tzinfo=UTC))
+    worker_main.run_round(conn, settings)  # rodada 3: novo cruzamento → novo aviso
+
+    assert len(_telegram_requests(fake_http)) == 2  # o aviso repete só depois do rearme
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 1
+    assert quote["alerted_at"] == "2026-10-28T16:15:00Z"  # novo disparo atualiza o histórico
+    assert quote["alerted_target"] == 15.0

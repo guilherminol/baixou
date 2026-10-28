@@ -77,6 +77,8 @@ def _seed_item(
     change_pct: float | None = -6.0,
     alerted: int = 0,
     alerted_target: float | None = None,
+    alerted_at: str | None = None,
+    notify_state: str | None = None,
     last_fetch_error: str | None = None,
 ) -> None:
     """Semeia watch + quote por SQL direto (isolation_level=None: autocommit)."""
@@ -87,10 +89,21 @@ def _seed_item(
     conn.execute(
         """
         INSERT INTO quote (symbol, market, price, price_at, change_pct,
-            alerted, alerted_target, last_fetch_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            alerted, alerted_target, alerted_at, notify_state, last_fetch_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (symbol, market, price, price_at, change_pct, alerted, alerted_target, last_fetch_error),
+        (
+            symbol,
+            market,
+            price,
+            price_at,
+            change_pct,
+            alerted,
+            alerted_target,
+            alerted_at,
+            notify_state,
+            last_fetch_error,
+        ),
     )
 
 
@@ -210,3 +223,144 @@ def test_empty_channels_list_sends_and_writes_nothing(tmp_path, monkeypatch):
         assert quote["notify_state"] is None  # nenhuma escrita no item
     finally:
         conn.close()
+
+
+# --- Task 2 (SC-2, D-12/D-13, ALERT-04): rearme pela margem e troca de alvo ---
+
+# alerted_at histórico semeado (ALERT-04): uma hora antes do relógio congelado.
+_SEEDED_ALERTED_AT = "2026-10-28T15:00:00Z"
+
+
+def test_rearm_at_exact_inclusive_margin(both_channels):
+    """Margem exata rearma (borda inclusiva — D-12); um centavo abaixo não rearma."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        symbol="PETR4",
+        target=15.0,
+        price=15.15,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    _seed_item(
+        conn,
+        symbol="VALE3",
+        target=15.0,
+        price=15.149,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("rearme é mudança de estado: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    petr = _quote_row(conn, "PETR4")
+    vale = _quote_row(conn, "VALE3")
+    assert petr["alerted"] == 0  # price == alvo × (1 + 1/100): rearma na borda exata
+    assert petr["alerted_target"] is None
+    assert petr["alerted_at"] == _SEEDED_ALERTED_AT  # histórico preservado (ALERT-04)
+    assert vale["alerted"] == 1  # 15.149 < 15.15: um centavo abaixo da margem, não rearma
+    assert vale["alerted_target"] == 15.0
+    assert vale["alerted_at"] == _SEEDED_ALERTED_AT
+    assert recorder.requests == []  # rearme não é envio
+
+
+def test_crossing_after_rearm_sends_new_alert(both_channels, capsys):
+    """Pós-rearme, novo cruzamento para baixo dispara NOVO aviso (SC-2) com novo alerted_at."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=15.0,
+        price=15.15,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+        notify_state='{"telegram": "ok"}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # rodada 1: rearme
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0
+    assert quote["alerted_at"] == _SEEDED_ALERTED_AT  # rearme preserva o histórico
+    assert quote["notify_state"] == '{"telegram": "ok"}'  # rearme não é entrega: intacto
+
+    conn.execute("UPDATE quote SET price = 14.0 WHERE symbol = 'PETR4'")  # cruza de novo
+    later = datetime(2026, 10, 28, 16, 15, 0, tzinfo=UTC)
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, later)  # rodada 2: novo disparo
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1
+    assert quote["alerted_at"] == "2026-10-28T16:15:00Z"  # novo disparo, novo alerted_at
+    assert quote["alerted_target"] == 15.0
+    out = capsys.readouterr().out
+    assert out.count("alert_sent") == 1  # o aviso repetiu só depois do rearme
+
+
+def test_target_change_resets_without_sending(both_channels):
+    """Alvo trocado com o item alertado: zera SEM enviar nesta rodada (D-13)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=12.0,
+        price=11.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+        notify_state='{"telegram": "ok"}',
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("troca de alvo não envia na mesma rodada")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0  # volta a aguardando
+    assert quote["alerted_target"] is None  # zerado; a reavaliação é na rodada seguinte
+    assert quote["alerted_at"] == _SEEDED_ALERTED_AT  # histórico sobrevive (ALERT-04)
+    assert quote["notify_state"] == '{"telegram": "ok"}'  # troca não é entrega: intacto
+    assert recorder.requests == []
+
+
+def test_target_change_reevaluates_next_round(both_channels):
+    """Rodada seguinte à troca: avalia com o alvo NOVO e grava alerted_target novo (D-13)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=12.0,
+        price=11.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # troca de alvo
+    assert _quote_row(conn)["alerted"] == 0
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # rodada seguinte
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # 11.0 ≤ NOVO alvo 12.0: cruza e dispara
+    assert quote["alerted_target"] == 12.0  # alvo novo gravado no disparo
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
