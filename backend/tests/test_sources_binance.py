@@ -19,7 +19,6 @@ import pytest
 from baixou.worker.sources import binance
 from baixou.worker.sources.base import (
     RateLimitError,
-    SourceUnavailableError,
     UnexpectedResponseError,
 )
 
