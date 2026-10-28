@@ -489,9 +489,7 @@ def test_round_quarantines_bad_binance_symbol_until_watch_row_is_recreated(
             batches.append(symbols)
             if "ETHUSDT" in symbols:  # o lote é all-or-nothing com o ruim dentro
                 return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
-            return httpx.Response(
-                200, json=[{"symbol": s, "price": "270000.0"} for s in symbols]
-            )
+            return httpx.Response(200, json=[{"symbol": s, "price": "270000.0"} for s in symbols])
         symbol = request.url.params["symbol"]
         singles.append(symbol)
         if symbol == "ETHUSDT":  # o ruim também falha sozinho (400 -1121)
@@ -533,4 +531,5 @@ def test_round_quarantines_bad_binance_symbol_until_watch_row_is_recreated(
 
     worker_main.run_round(db, settings)
     assert batches[2] == ["BTCUSDT", "ETHUSDT"]  # de volta ao lote único
-    assert singles == ["BTCUSDT", "ETHUSDT", "ETHUSDT"]  # 1-a-1 novamente para o ruim
+    # 1-a-1 de novo: o lote recusado repete TODOS os símbolos (ordem da watch)
+    assert singles == ["BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"]

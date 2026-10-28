@@ -172,7 +172,10 @@ def test_fetch_one_server_error_is_unavailable(status):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, text="boom")
 
-    with _mock_client(handler, requests) as client, pytest.raises(SourceUnavailableError) as excinfo:
+    with (
+        _mock_client(handler, requests) as client,
+        pytest.raises(SourceUnavailableError) as excinfo,
+    ):
         brapi.fetch_one(client, "PETR4", "")
 
     assert excinfo.value.kind == "unavailable"
@@ -186,7 +189,10 @@ def test_fetch_one_transport_error_is_unavailable_without_url():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    with _mock_client(handler, requests) as client, pytest.raises(SourceUnavailableError) as excinfo:
+    with (
+        _mock_client(handler, requests) as client,
+        pytest.raises(SourceUnavailableError) as excinfo,
+    ):
         brapi.fetch_one(client, "PETR4", "tok-123")
 
     assert excinfo.value.kind == "unavailable"
