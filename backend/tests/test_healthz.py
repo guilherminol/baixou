@@ -90,7 +90,7 @@ def test_migration_0001_applies_exactly_once(settings):
         }
     finally:
         conn.close()
-    assert versions == ["0001"]
+    assert versions == ["0001", "0002"]  # 0002 (D-03) aplicada uma vez junto
     assert EXPECTED_TABLES <= tables
 
 

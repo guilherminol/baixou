@@ -37,6 +37,11 @@ _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # do research: um só cliente por rodada, conexão reaproveitada entre chamadas).
 _SOURCE_TIMEOUT_S = 10.0
 
+# Kinds de nível de FONTE: qualquer ocorrência falha a fonte na rodada.
+# ``not_found`` é falha por ITEM (vai para quote.last_fetch_error) e só
+# falha a fonte quando TODAS as chamadas tentadas falharam (SC-3/D-03).
+_SOURCE_LEVEL_KINDS = frozenset({"auth", "rate_limit", "unavailable", "unexpected"})
+
 # Fase do divisor de cadência da B3 (D-01): contador interno ao processo — a
 # rodada de subida conta (fase 0) e um reinício zera (consequência aceita de
 # D-01; a válvula de escape é a própria env, manual). Nunca altera o intervalo
@@ -46,6 +51,21 @@ _cadence_rounds = 0
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).strftime(_TS_FORMAT)
+
+
+def _source_failure_kind(errors: list[SourceError], success_count: int) -> str | None:
+    """Kind a gravar em ``source_state``, ou None se a falha foi só por item.
+
+    A fonte conta como FALHA se alguma chamada falhou com kind de nível de
+    fonte (auth, rate_limit, unavailable, unexpected) OU se TODAS as chamadas
+    tentadas falharam — mesmo que só ``not_found`` (semântica do plano 02-02).
+    """
+    for exc in errors:
+        if exc.kind in _SOURCE_LEVEL_KINDS:
+            return exc.kind
+    if errors and success_count == 0:
+        return errors[0].kind
+    return None
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -113,15 +133,17 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     em sequência (concorrência 1 da brapi; token vem de ``settings.brapi_token``,
     nunca de literal) e Binance em lote único; (3) grava ``quote``,
     ``source_state`` e o batimento (``last_run`` + ``worker_lock_at`` +
-    ``last_ok`` quando nenhuma fonte falhou) numa ÚNICA transação curta —
-    I/O de rede nunca dentro de transação de escrita (disciplina WAL,
-    T-02-01). Falha tipada de uma fonte não derruba a rodada nem a outra
-    fonte; a semântica completa de falha (``last_error``,
-    ``consecutive_failures``, quarentena) é o plano 02-02 — aqui a fonte que
-    falhou só não recebe linha "ok". Duração via time.monotonic (nunca
-    time.time). SC-1/D-01: a B3 só é consultada dentro do pregão (seg–sex
-    10h–18h no fuso TZ_MARKET, via ``b3_market_open``) e quando a fase do
-    divisor ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo.
+    ``last_ok`` quando nenhuma fonte consultada falhou) numa ÚNICA transação
+    curta — I/O de rede nunca dentro de transação de escrita (disciplina WAL,
+    T-02-01). Falha tipada de uma fonte NUNCA derruba a rodada nem a outra
+    fonte (SC-3): a falha fica gravada por fonte em ``source_state``
+    (``last_error`` = kind, ``consecutive_failures`` acumula; qualquer sucesso
+    zera e limpa) e por item em ``quote.last_fetch_error`` (D-03, migração
+    0002). O evento ``source_error`` cita o kind e o símbolo — nunca a URL
+    nem o token (K2/T-02-04). Duração via time.monotonic (nunca time.time).
+    SC-1/D-01: a B3 só é consultada dentro do pregão (seg–sex 10h–18h no fuso
+    TZ_MARKET, via ``b3_market_open``) e quando a fase do divisor
+    ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo.
     """
     global _cadence_rounds
 
@@ -133,55 +155,99 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     crypto_symbols = [row["symbol"] for row in watch_rows if row["market"] == "crypto"]
 
     quotes: dict[tuple[str, str], QuoteResult] = {}
-    source_errors: dict[str, SourceError] = {}
+    item_errors: dict[tuple[str, str], SourceError] = {}
+    failures: dict[str, list[SourceError]] = {}
+    successes: dict[str, int] = {}
     attempted: list[str] = []
     with httpx.Client(timeout=_SOURCE_TIMEOUT_S) as client:
         if b3_symbols and b3_due and b3_market_open(datetime.now(UTC), settings.tz_market):
             attempted.append("brapi")
-            try:
-                for symbol in b3_symbols:  # serializado: um símbolo por chamada
-                    quotes[(symbol, "b3")] = brapi.fetch_one(client, symbol, settings.brapi_token)
-            except SourceError as exc:
-                source_errors["brapi"] = exc
+            brapi_errors: list[SourceError] = []
+            brapi_ok = 0
+            for symbol in b3_symbols:  # serializado: um símbolo por chamada
+                try:
+                    quotes[(symbol, "b3")] = brapi.fetch_one(
+                        client, symbol, settings.brapi_token
+                    )
+                    brapi_ok += 1
+                except SourceError as exc:
+                    brapi_errors.append(exc)
+                    item_errors[(symbol, "b3")] = exc
+            if brapi_errors:
+                failures["brapi"] = brapi_errors
+            successes["brapi"] = brapi_ok
         if crypto_symbols:
             attempted.append("binance")
             try:
                 batch = binance.fetch_batch(client, crypto_symbols)
                 for symbol, result in batch.items():
                     quotes[(symbol, "crypto")] = result
+                successes["binance"] = len(batch)
             except SourceError as exc:
-                source_errors["binance"] = exc
+                failures["binance"] = [exc]
+                successes["binance"] = 0
+
+    source_errors: dict[str, str] = {}
+    for source, errors in failures.items():
+        kind = _source_failure_kind(errors, successes.get(source, 0))
+        if kind is not None:
+            source_errors[source] = kind
 
     with write_tx(conn):  # transação única e curta: só escrita de banco
         now = _utc_now_iso()
         for (symbol, market), result in quotes.items():
             conn.execute(
                 """
-                INSERT INTO quote (symbol, market, price, price_at, change_pct)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO quote (symbol, market, price, price_at, change_pct, last_fetch_error)
+                VALUES (?, ?, ?, ?, ?, NULL)
                 ON CONFLICT (symbol, market) DO UPDATE SET
                     price = excluded.price,
                     price_at = excluded.price_at,
-                    change_pct = excluded.change_pct
+                    change_pct = excluded.change_pct,
+                    last_fetch_error = NULL
                 """,
                 (symbol, market, result.price, result.price_at, result.change_pct),
             )
-        for source in attempted:
-            if source in source_errors:
-                continue  # fonte que falhou não recebe linha "ok" (02-02 grava a falha)
+        for (symbol, market), exc in item_errors.items():
+            # erro por item (D-03): a linha nasce se ainda não existe (preço
+            # NULL) e o último preço conhecido é preservado quando existe
             conn.execute(
                 """
-                INSERT INTO source_state
-                    (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
-                VALUES (?, ?, ?, 0, NULL)
-                ON CONFLICT (source) DO UPDATE SET
-                    last_attempt_at = excluded.last_attempt_at,
-                    last_ok_at = excluded.last_ok_at,
-                    consecutive_failures = 0,
-                    last_error = NULL
+                INSERT INTO quote (symbol, market, price, price_at, change_pct, last_fetch_error)
+                VALUES (?, ?, NULL, NULL, NULL, ?)
+                ON CONFLICT (symbol, market) DO UPDATE SET
+                    last_fetch_error = excluded.last_fetch_error
                 """,
-                (source, now, now),
+                (symbol, market, exc.kind),
             )
+        for source in attempted:
+            if source in source_errors:
+                conn.execute(
+                    """
+                    INSERT INTO source_state
+                        (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
+                    VALUES (?, ?, NULL, 1, ?)
+                    ON CONFLICT (source) DO UPDATE SET
+                        last_attempt_at = excluded.last_attempt_at,
+                        consecutive_failures = source_state.consecutive_failures + 1,
+                        last_error = excluded.last_error
+                    """,
+                    (source, now, source_errors[source]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO source_state
+                        (source, last_attempt_at, last_ok_at, consecutive_failures, last_error)
+                    VALUES (?, ?, ?, 0, NULL)
+                    ON CONFLICT (source) DO UPDATE SET
+                        last_attempt_at = excluded.last_attempt_at,
+                        last_ok_at = excluded.last_ok_at,
+                        consecutive_failures = 0,
+                        last_error = NULL
+                    """,
+                    (source, now, now),
+                )
         if source_errors:
             # batimento incondicional; last_ok não é tocado quando uma fonte falhou
             conn.execute(
@@ -192,6 +258,28 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
             conn.execute(
                 "UPDATE run SET last_run = ?, worker_lock_at = ?, last_ok = ? WHERE id = 1",
                 (now, now, now),
+            )
+
+    # Eventos de erro FORA da transação: citam kind e símbolo — nunca a URL
+    # nem o token (as mensagens das fontes são construídas sem a requisição).
+    for (symbol, _market), exc in item_errors.items():
+        log(
+            "warning",
+            "source",
+            "source_error",
+            kind=exc.kind,
+            symbol=symbol,
+            text=f"falha ao consultar cotação: {exc.kind}",
+        )
+    for source, errors in failures.items():
+        if source in source_errors and not any(exc.symbol for exc in errors):
+            log(
+                "warning",
+                "source",
+                "source_error",
+                source=source,
+                kind=source_errors[source],
+                text=f"falha na fonte {source}: {source_errors[source]}",
             )
     log("info", "worker", "heartbeat")
     return time.monotonic() - started

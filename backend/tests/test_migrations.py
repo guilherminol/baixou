@@ -91,9 +91,9 @@ def test_newer_schema_is_refused(settings, capsys):
     with pytest.raises(SystemExit):
         apply_migrations(settings.db_path)
     assert "newer_schema_refused" in capsys.readouterr().out
-    # Nada foi aplicado além da recusa: as versões continuam 0001 e 9999.
+    # Nada foi aplicado além da recusa: as versões continuam 0001, 0002 e 9999.
     versions, _ = _schema_state(settings.db_path)
-    assert sorted(versions) == ["0001", "9999"]
+    assert sorted(versions) == ["0001", "0002", "9999"]
 
 
 def test_concurrent_apply_race_is_exactly_once(settings):
