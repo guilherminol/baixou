@@ -146,14 +146,21 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     TZ_MARKET, via ``b3_market_open``) e quando a fase do divisor
     ``_cadence_rounds % b3_every_n_rounds`` bate; cripto é o dia todo, menos
     os símbolos em quarentena (``last_fetch_error = 'not_found'`` em quote —
-    D-02, estado derivado da coluna da 0002, que a cascata limpa ao recriar
-    a linha em watch). POLL-03/D-05/D-06/SC-4: cada ``fetch_one`` da brapi
+    D-02, estado derivado da coluna da 0002, que o reset da recriação pelo
+    web limpa). POLL-03/D-05/D-06/SC-4: cada ``fetch_one`` da brapi
     soma 1 na cota mensal persistida (tabela quota, linha source="brapi") e o
     registro entra na MESMA transação única — virada do mês UTC, aviso único
     de 80% e porta de cota vivem em worker.quota; a porta é consultada ANTES
     de cada fetch_one da B3 e, a 100%, fecha (a última permitida executa e
     conta; bloqueada não sai, não soma e não loga erro — cripto nunca é
     bloqueada por cota da brapi; 429 do 02-02 é falha de fonte, não cota).
+    Fase 4 (D-09/WATCH-03, migração 0004): itens com ``paused = 1`` saem do
+    lote ANTES de qualquer chamada de fonte — nada é consultado, avaliado nem
+    notificado; a cotação do pausado fica congelada/visível e a retomada
+    reconsulta na rodada seguinte (o frescor se resolve sozinho, D-11 da
+    Fase 3). D-01 (mesma migração): a write_tx única abre com o PRUNING das
+    cotações órfãs deixadas pela remoção pela web — ``DELETE FROM quote WHERE
+    NOT EXISTS (pai em watch)``, incondicional a cada rodada.
     Fase 3 (SC-1/D-12/D-15/D-16): DEPOIS da write_tx única,
     ``alerts.process_alerts`` avalia o cruzamento para baixo (borda inclusiva),
     envia os avisos FORA de transação com o MESMO cliente da rodada e grava
@@ -170,7 +177,12 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
     started = time.monotonic()
     b3_due = _cadence_rounds % settings.b3_every_n_rounds == 0
     _cadence_rounds += 1  # a rodada de subida conta (fase 0); reinício zera (D-01)
-    watch_rows = conn.execute("SELECT symbol, market FROM watch ORDER BY symbol, market").fetchall()
+    # A pausa (D-09, migração 0004) sai do lote ANTES de qualquer chamada de
+    # fonte: cota da brapi poupada e cotação do pausado congelada/visível —
+    # retomado, a rodada seguinte reconsulta e o frescor se resolve sozinho.
+    watch_rows = conn.execute(
+        "SELECT symbol, market FROM watch WHERE paused = 0 ORDER BY symbol, market"
+    ).fetchall()
     b3_symbols = [row["symbol"] for row in watch_rows if row["market"] == "b3"]
     crypto_symbols = [row["symbol"] for row in watch_rows if row["market"] == "crypto"]
 
@@ -238,6 +250,17 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
         # de avisos — a rede de notificação fica FORA de transação (T-02-01).
         with write_tx(conn):  # transação única e curta: só escrita de banco
             now = _utc_now_iso()
+            # Pruning de cotações órfãs (D-01, mesma write_tx — um único lock,
+            # transação curta): a remoção pela web apaga SÓ watch (migração 0004
+            # retirou a cascata) e a quote sem pai some AQUI — incondicional a
+            # cada rodada (mesmo com watch vazia), inclusive com
+            # last_fetch_error preenchido: o pai dela não existe mais, e a
+            # quarentena derivada da coluna é irrelevante sem dono.
+            conn.execute(
+                "DELETE FROM quote WHERE NOT EXISTS ("
+                "SELECT 1 FROM watch w "
+                "WHERE w.symbol = quote.symbol AND w.market = quote.market)"
+            )
             for (symbol, market), result in quotes.items():
                 conn.execute(
                     """

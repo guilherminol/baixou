@@ -946,13 +946,9 @@ def test_round_keeps_paused_quote_frozen(db, settings, monkeypatch, fake_http):
     _freeze_clock_inside_market(monkeypatch)
 
     _SELECAO = "SELECT price, price_at, change_pct, alerted, last_fetch_error FROM quote"
-    antes = tuple(
-        db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone()
-    )
+    antes = tuple(db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone())
     worker_main.run_round(db, settings)
-    depois = tuple(
-        db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone()
-    )
+    depois = tuple(db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone())
 
     assert antes == depois  # congelada: nenhum campo mudou
     assert (
@@ -995,14 +991,10 @@ def test_round_prunes_orphan_quotes_even_with_fetch_error(db, settings, monkeypa
 
     worker_main.run_round(db, settings)
 
-    orfas = db.execute(
-        "SELECT COUNT(*) AS n FROM quote WHERE symbol = 'VALE3'"
-    ).fetchone()["n"]
+    orfas = db.execute("SELECT COUNT(*) AS n FROM quote WHERE symbol = 'VALE3'").fetchone()["n"]
     assert orfas == 0  # a órfã some, inclusive com o last_fetch_error preenchido
     assert db.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 2  # watch intacta
-    assert (
-        db.execute("SELECT price FROM quote WHERE symbol = 'PETR4'").fetchone()["price"] == 38.25
-    )
+    assert db.execute("SELECT price FROM quote WHERE symbol = 'PETR4'").fetchone()["price"] == 38.25
     assert (
         db.execute("SELECT price FROM quote WHERE symbol = 'BTCUSDT'").fetchone()["price"]
         == 270000.0
