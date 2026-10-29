@@ -46,7 +46,9 @@ class WatchItem(BaseModel):
 
     symbol: str
     market: Literal["b3", "crypto"]
-    target_below: float = Field(gt=0)
+    # allow_inf_nan=False (WR-04): JSON 1e999 vira +Infinity e pydantic aceitava
+    # — item com alvo inf que o GET devolvia como null e o worker nunca alertava.
+    target_below: float = Field(gt=0, allow_inf_nan=False)
     paused: bool = False
     currency: str = ""
     price: float | None = None
@@ -72,7 +74,8 @@ class PatchWatch(BaseModel):
     ``target_below`` mantém o gt=0 (SC-4). ``paused`` aceita só booleano.
     """
 
-    target_below: float | None = Field(default=None, gt=0)
+    # Mesma finitude do WatchItem (WR-04): PATCH também recusa +Infinity.
+    target_below: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     paused: bool | None = None
 
     @model_validator(mode="after")
