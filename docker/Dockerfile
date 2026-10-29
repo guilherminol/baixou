@@ -1,5 +1,17 @@
 # Imagem única do Baixou: os serviços web e worker diferem só no command do compose.
-# Sem estágio Node — o frontend é placeholder até a Fase 5 (D-06); sem Node em produção.
+# O Node existe SÓ no estágio de build do frontend (o build nunca roda no servidor
+# e o runtime de produção segue sem Node — decisão de arquitetura da Fase 5).
+
+# Estágio 1 — build do frontend. A major do node casa com frontend/.nvmrc;
+# npm ci instala EXATAMENTE o package-lock.json commitado (T-05-05/T-05-SC).
+FROM node:22-slim AS frontend
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run build
+
+# Estágio 2 — final (Python, sem Node): recebe o dist compilado do frontend.
 FROM python:3.14-slim
 
 # uv na imagem só para instalar dependências do lock (nunca re-resolve — T-01-SC).
@@ -15,6 +27,9 @@ WORKDIR /app
 # `--frozen` garante que as versões são exatamente as auditadas (T-01-SC).
 COPY pyproject.toml uv.lock ./
 COPY backend ./backend
+# O dist do build Vite entra no estágio final — é o web (FastAPI) quem o serve,
+# com fallback SPA (05-02); ANTES do chown, para o usuário dedicado o possuir.
+COPY --from=frontend /app/frontend/dist /app/frontend/dist
 RUN uv sync --frozen --no-dev
 
 # Usuário dedicado não-root; /data é o volume compartilhado por web e worker.

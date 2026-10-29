@@ -3,7 +3,10 @@
 .planning
 .claude
 data
+# O dist só nasce do build DENTRO da imagem (estágio node do Dockerfile):
+# um dist velho do host nunca é a fonte do que o web serve.
 frontend/node_modules
+frontend/dist
 **/__pycache__
 .venv
 .pytest_cache

@@ -10,14 +10,17 @@ impresso UMA vez no log quando não há usuário (SC-1).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from baixou.core.config import Settings, load_settings
 from baixou.core.db import WEB_TIMEOUT_S, check_sqlite_version, connect
@@ -27,6 +30,21 @@ from baixou.web import auth, notifier_test, status, watch
 from baixou.web.schemas import erro_item
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _dist_frontend() -> Path:
+    """Diretório do build Vite a servir (05-02).
+
+    A env opcional ``FRONTEND_DIST`` vence; ausente ou VAZIA (molde WR-01:
+    string vazia definida não conta como valor) resolve o padrão
+    ``<repo>/frontend/dist`` — que aponta para o lugar certo no dev (raiz do
+    repositório) e na imagem (``/app/frontend/dist``, copiado do estágio node
+    do docker/Dockerfile).
+    """
+    env = os.environ.get("FRONTEND_DIST")
+    if env is not None and env.strip():
+        return Path(env)
+    return Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 
 def _problema_ptbr(erro: dict) -> str:
@@ -196,6 +214,44 @@ def create_app(settings: Settings) -> FastAPI:
         if timedelta(0) <= age < deadline:
             return Response(status_code=200)
         return Response(status_code=503)
+
+    # --- 05-02: cabeçalhos de segurança em TODAS as respostas ---
+    # Registrado POR ÚLTIMO = camada MAIS EXTERNA da cebola de middlewares:
+    # os cabeçalhos saem também nas recusas 415/403 do guard acima.
+    # CSP 'self' SEM unsafe-inline é possível porque o build Vite só emite
+    # arquivos externos (arquitetura §Requisições forjadas); frame-ancestors
+    # 'none' fecha o clickjacking da UI de administração (T-05-07) e o
+    # nosniff/remove-referrer completam a tríade do contrato.
+    @app.middleware("http")
+    async def cabecalhos_de_seguranca(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    # --- 05-02: estáticos do build + fallback SPA ---
+    # NO FIM de create_app porque no roteador do Starlette a ordem de
+    # registro É a precedência: um catch-all '/{caminho:path}' registrado
+    # antes sombrearia o /healthz e os routers de /api. Sem dist no disco,
+    # nada é montado e o web segue só-API (tolerância para testes e dev sem
+    # build — nunca depende de Node aqui).
+    dist = _dist_frontend()
+    if (dist / "index.html").is_file() and (dist / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
+
+        @app.get("/{caminho:path}", include_in_schema=False)
+        def spa_fallback(caminho: str) -> Response:
+            """Arquivo pedido dentro do dist; inexistente → index.html (SPA)."""
+            pedido = (dist / caminho).resolve()
+            # T-05-09 (path traversal): só sai arquivo que continua DENTRO do
+            # dist; todo o resto cai no index.html, que o Router resolve.
+            if pedido.is_file() and pedido.is_relative_to(dist.resolve()):
+                return FileResponse(pedido)
+            return FileResponse(dist / "index.html")
 
     return app
 

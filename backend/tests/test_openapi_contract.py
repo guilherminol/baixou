@@ -113,8 +113,16 @@ def test_schema_expoe_os_modelos_de_contrato():
     assert ausentes == [], f"modelos de contrato ausentes do schema: {ausentes}"
 
 
-def test_documentacao_automatica_permanece_desligada(tmp_path):
-    """Contrato da arquitetura: docs/redoc/openapi_url None — /docs responde 404."""
+def test_documentacao_automatica_permanece_desligada(tmp_path, monkeypatch):
+    """Contrato da arquitetura: docs/redoc/openapi_url None — /docs responde 404.
+
+    A env FRONTEND_DIST é afastada para o cheque ficar determinístico: desde o
+    05-02 o catch-all SPA devolve o index para caminho desconhecido QUANDO há
+    dist no disco (comportamento desenhado, coberto por test_static_serving.py).
+    Este teste prova a camada FastAPI: sem dist, /docs e /openapi.json não
+    existem — a documentação não é servida por ninguém.
+    """
+    monkeypatch.setenv("FRONTEND_DIST", str(tmp_path / "sem-dist"))
     app = create_app(_settings_de_teste(tmp_path))
     assert app.docs_url is None
     assert app.redoc_url is None
