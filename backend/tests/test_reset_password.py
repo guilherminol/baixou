@@ -65,9 +65,8 @@ def _roda_reset(monkeypatch, respostas: list[str], *args: str) -> None:
     """
     fila = iter(respostas)
     monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(fila))
-    monkeypatch.setattr(
-        sys, "argv", ["python", "-m", "baixou.web.reset_password", *args]
-    )
+    # argv[0] é o programa; parse_args() lê sys.argv[1:] — só as flags aqui.
+    monkeypatch.setattr(sys, "argv", ["baixou.web.reset_password", *args])
     reset_password.main()
 
 
@@ -82,18 +81,14 @@ def _contagem(settings, tabela: str) -> int:
 def _hash_do_admin(settings) -> str:
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     try:
-        row = conn.execute(
-            "SELECT password_hash FROM users WHERE username = 'admin'"
-        ).fetchone()
+        row = conn.execute("SELECT password_hash FROM users WHERE username = 'admin'").fetchone()
     finally:
         conn.close()
     assert row is not None, "usuário admin desapareceu do banco de teste"
     return row["password_hash"]
 
 
-def test_reset_troca_a_senha_e_mata_todas_as_sessoes_na_mesma_write_tx(
-    settings, monkeypatch
-):
+def test_reset_troca_a_senha_e_mata_todas_as_sessoes_na_mesma_write_tx(settings, monkeypatch):
     """Duas sessões vivas → reset apaga as DUAS linhas e troca o hash (T-04-12)."""
     tokens = _cria_admin_e_sessoes(settings, SENHA_ANTIGA, sessoes=2)
     assert _contagem(settings, "sessions") == 2
@@ -110,18 +105,14 @@ def test_reset_troca_a_senha_e_mata_todas_as_sessoes_na_mesma_write_tx(
             assert resposta.status_code == 401
 
 
-def test_apos_o_reset_login_com_a_senha_nova_passa_e_a_antiga_falha(
-    settings, monkeypatch
-):
+def test_apos_o_reset_login_com_a_senha_nova_passa_e_a_antiga_falha(settings, monkeypatch):
     _cria_admin_e_sessoes(settings, SENHA_ANTIGA, sessoes=1)
     _roda_reset(monkeypatch, [SENHA_NOVA, SENHA_NOVA])
     with TestClient(create_app(settings)) as client:
         antigo = client.post(
             "/api/auth/login", json={"username": "admin", "password": SENHA_ANTIGA}
         )
-        novo = client.post(
-            "/api/auth/login", json={"username": "admin", "password": SENHA_NOVA}
-        )
+        novo = client.post("/api/auth/login", json={"username": "admin", "password": SENHA_NOVA})
         assert antigo.status_code == 401
         assert novo.status_code == 200
         # a sessão aberta com a senha nova acessa a rota protegida

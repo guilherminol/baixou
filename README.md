@@ -65,6 +65,27 @@ Sem login, sem dados no corpo, sem cabeçalhos de versão — serve ao healthche
 do Docker e a monitores externos (Uptime Kuma, healthchecks.io, etc.). A
 degradação de fontes/canais aparece na página, nunca derruba o `/healthz`.
 
+## Redefinição de senha
+
+Perdeu a senha (ou a sessão) do administrador? O comando abaixo roda **dentro
+do container** e não precisa de acesso à API:
+
+```bash
+docker compose exec web python -m baixou.web.reset_password
+# para um usuário diferente do padrão `admin`:
+docker compose exec web python -m baixou.web.reset_password --username outro
+```
+
+O comando pede a senha nova duas vezes (sem eco no terminal — a senha nunca
+passa por argumentos do shell, então não fica no histórico) e, num único
+passo:
+
+- troca a senha do usuário; e
+- **encerra todas as sessões dele** — nenhum login antigo sobrevive ao reset;
+  entre com a senha nova na página de login.
+
+A senha nova precisa ter pelo menos 12 caracteres.
+
 ## Variáveis de ambiente (Fase 1)
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a
