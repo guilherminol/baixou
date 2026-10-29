@@ -1,6 +1,9 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router";
-import { ApiError, request } from "../api/client";
+import { ApiError } from "../api/client";
+// D-10: a LoginPage consome a MESMA função de login do app que o ReloginModal
+// — nenhuma tela fala direto com o client para autenticar.
+import { entrar } from "../api/auth";
 
 // Contagem no formato mm:ss do bloqueio (D-11).
 function mmss(total: number): string {
@@ -35,10 +38,7 @@ export default function LoginPage() {
     if (bloqueado) return;
     setErro(null);
     try {
-      await request("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ username, password, remember }),
-      });
+      await entrar(username, password, remember);
       navigate("/");
     } catch (e) {
       if (e instanceof ApiError) {

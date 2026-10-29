@@ -60,6 +60,41 @@
   border: 0;
 }
 
+/* Modal de re-login no lugar (D-10): véu sobre a página, o .add-block como
+   molde — a edição continua em memória por trás, inacessível até reentrar. */
+.modal-fundo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 20;
+}
+
+.modal-relogin {
+  width: 100%;
+  max-width: 360px;
+  margin-top: 0;
+}
+
+.modal-relogin h2 {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.modal-relogin .meta-line {
+  margin-bottom: 12px;
+}
+
+.modal-relogin .btn-primario {
+  width: 100%;
+}
+
 /* D-06 (SC-5): em telas estreitas as 3 colunas dobráveis (Distância,
    Atualização, Disparo) saem e a sub-linha entra — as 4 colunas (Ticker ·
    Preço · Alvo · Estado) + ações permanecem visíveis em 360px, sem rolagem

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import AppHeader from "../components/AppHeader";
+import ReloginModal from "../components/ReloginModal";
 import {
   listarItens,
   patchPause,
@@ -9,7 +10,7 @@ import {
   type WatchItem,
 } from "../api/watch";
 import { buscarStatus, type StatusResponse } from "../api/status";
-import { ApiError, parseErrosEnvelope } from "../api/client";
+import { ApiError, onUnauthorized, parseErrosEnvelope } from "../api/client";
 import { formatCurrency, formatPercent, formatTime, timeAgoMinutes } from "../lib/format";
 import "../styles/alerts.css";
 
@@ -118,6 +119,7 @@ export function problemasDoStatus(status: StatusResponse): string[] {
 
 const COLUNAS = 8; // Ticker · Preço · Alvo · Distância · Estado · Atualização · Disparo · ações
 const JANELA_UNDO_MS = 5000; // WATCH-01: "Desfazer" por 5 s, timer POR item
+const INTERVALO_POLLING_MS = 60_000; // arquitetura §Frontend: consulta a cada minuto
 
 function CabecalhoTabela() {
   return (
@@ -155,6 +157,8 @@ function LinhaItem({
   valorAlvo,
   erroSalva,
   aoEditarAlvo,
+  aoFocarAlvo,
+  aoDesfocarAlvo,
   aoAlternarPausa,
   aoRemover,
 }: {
@@ -163,6 +167,8 @@ function LinhaItem({
   valorAlvo: string;
   erroSalva: string | null;
   aoEditarAlvo: (item: WatchItem, valor: string) => void;
+  aoFocarAlvo: (item: WatchItem) => void;
+  aoDesfocarAlvo: (item: WatchItem) => void;
   aoAlternarPausa: (item: WatchItem) => void;
   aoRemover: (item: WatchItem) => void;
 }) {
@@ -186,6 +192,8 @@ function LinhaItem({
             aria-label={`Alvo de ${visual.symbol}`}
             value={valorAlvo}
             onChange={(evento) => aoEditarAlvo(item, evento.target.value)}
+            onFocus={() => aoFocarAlvo(item)}
+            onBlur={() => aoDesfocarAlvo(item)}
           />
         </td>
         <td className={dist.classe + " col-dobra"}>{dist.texto}</td>
@@ -251,6 +259,8 @@ function SecaoMercado({
   valorAlvoDe,
   erroDe,
   aoEditarAlvo,
+  aoFocarAlvo,
+  aoDesfocarAlvo,
   aoAlternarPausa,
   aoRemover,
   aoDesfazer,
@@ -264,6 +274,8 @@ function SecaoMercado({
   valorAlvoDe: (item: WatchItem) => string;
   erroDe: (item: WatchItem) => string | null;
   aoEditarAlvo: (item: WatchItem, valor: string) => void;
+  aoFocarAlvo: (item: WatchItem) => void;
+  aoDesfocarAlvo: (item: WatchItem) => void;
   aoAlternarPausa: (item: WatchItem) => void;
   aoRemover: (item: WatchItem) => void;
   aoDesfazer: (item: WatchItem) => void;
@@ -297,6 +309,8 @@ function SecaoMercado({
                     valorAlvo={valorAlvoDe(item)}
                     erroSalva={erroDe(item)}
                     aoEditarAlvo={aoEditarAlvo}
+                    aoFocarAlvo={aoFocarAlvo}
+                    aoDesfocarAlvo={aoDesfocarAlvo}
                     aoAlternarPausa={aoAlternarPausa}
                     aoRemover={aoRemover}
                   />
@@ -334,7 +348,25 @@ export default function AlertsPage() {
     alvo: "",
   });
   const [erroNovo, setErroNovo] = useState<string | null>(null);
+  const [sessaoExpirada, setSessaoExpirada] = useState(false);
   const timersUndo = useRef<Map<string, number>>(new Map());
+  // Instantâneo do estado de edição lido pelo tick do polling (padrão
+  // latest-ref: o foco vive SÓ aqui — focar não re-renderiza).
+  const estadoRef = useRef({
+    itens: null as WatchItem[] | null,
+    edicoes: new Map<string, number>(),
+    rascunhos: new Map<string, string>(),
+    emUndo: new Set<string>(),
+    pendencias: new Set<string>(),
+    novos: new Set<string>(),
+    foco: null as string | null,
+  });
+  estadoRef.current.itens = itens;
+  estadoRef.current.edicoes = edicoes;
+  estadoRef.current.rascunhos = rascunhosAlvo;
+  estadoRef.current.emUndo = emUndo;
+  estadoRef.current.pendencias = pendenciasRemocao;
+  estadoRef.current.novos = novos;
 
   useEffect(() => {
     let vivo = true;
@@ -356,6 +388,93 @@ export default function AlertsPage() {
       vivo = false;
     };
   }, []);
+
+  // 401 → modal de re-login NO LUGAR (D-10): enquanto a página de alertas
+  // está montada, ELA dona do handler global (o App registra o default
+  // durante o bootstrap, antes desta página existir na árvore); ao desmontar
+  // devolve null — sem vazamento.
+  useEffect(() => {
+    onUnauthorized(() => setSessaoExpirada(true));
+    return () => onUnauthorized(null);
+  }, []);
+
+  // Polling de 60 s (arquitetura §Frontend): refaz /api/watch + /api/status e
+  // NUNCA sobrescreve edição em curso nem alteração não salva — o merge é
+  // determinístico (T-05-10). Com o modal de re-login aberto, o tick não executa.
+  useEffect(() => {
+    if (sessaoExpirada) return; // guard: polling pausado enquanto o modal está aberto
+    const id = window.setInterval(() => {
+      void recarregar();
+    }, INTERVALO_POLLING_MS);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessaoExpirada]);
+
+  /** Carga de watch+status com merge determinístico: itens com alvo editado
+   * não salvo, rascunho em edição, input focado ou pendência local preservam
+   * o estado local (alvo/existência) e atualizam SÓ os campos somente-leitura;
+   * itens sem pendência substituem integralmente; itens novos entram;
+   * remoções pendentes não ressuscitam. */
+  async function recarregar() {
+    const atual = estadoRef.current;
+    try {
+      const [respostaWatch, respostaStatus] = await Promise.all([
+        listarItens(),
+        buscarStatus(),
+      ]);
+      setItens((anteriorLista) => {
+        const locais = new Map(
+          (anteriorLista ?? []).map((i) => [chave(i), i] as const),
+        );
+        const mesclados: WatchItem[] = [];
+        for (const itemServidor of respostaWatch.itens) {
+          const chaveItem = chave(itemServidor);
+          if (atual.pendencias.has(chaveItem) || atual.emUndo.has(chaveItem)) {
+            continue; // remoção local não ressuscita
+          }
+          const itemLocal = locais.get(chaveItem);
+          const protegido =
+            itemLocal !== undefined &&
+            (atual.novos.has(chaveItem) ||
+              atual.edicoes.has(chaveItem) ||
+              atual.rascunhos.has(chaveItem) ||
+              atual.foco === chaveItem);
+          if (itemLocal !== undefined && protegido) {
+            // alvo editado/focado fica LOCAL; os campos somente-leitura da
+            // resposta atualizam (preço, estados, horas).
+            mesclados.push({
+              ...itemServidor,
+              target_below:
+                atual.edicoes.get(chaveItem) ?? itemLocal.target_below,
+            });
+          } else {
+            mesclados.push(itemServidor);
+          }
+        }
+        // Itens só-locais (adicionados e ainda não salvos) permanecem na lista.
+        const noServidor = new Set(respostaWatch.itens.map(chave));
+        for (const itemLocal of anteriorLista ?? []) {
+          const chaveItem = chave(itemLocal);
+          if (noServidor.has(chaveItem)) continue;
+          if (atual.pendencias.has(chaveItem) || atual.emUndo.has(chaveItem)) {
+            continue;
+          }
+          mesclados.push(itemLocal);
+        }
+        return mesclados;
+      });
+      setStatus(respostaStatus);
+    } catch {
+      // 401 vai pelo handler global (modal); erro de rede preserva o estado.
+    }
+  }
+
+  /** Fechou o modal por SUCESSO no re-login: recarrega na hora e o efeito do
+   * intervalo retoma o ciclo de 60 s (a mudança de sessaoExpirada religa). */
+  function aposRelogar() {
+    setSessaoExpirada(false);
+    void recarregar();
+  }
 
   // Timers de undo são cancelados no unmount (sem vazamento, sem setState pós-morte).
   useEffect(() => {
@@ -574,6 +693,14 @@ export default function AlertsPage() {
     valorAlvoDe,
     erroDe: (itemDaLinha: WatchItem) => errosSalvar.get(itemDaLinha.symbol) ?? null,
     aoEditarAlvo: editarAlvo,
+    aoFocarAlvo: (itemDaLinha: WatchItem) => {
+      estadoRef.current.foco = chave(itemDaLinha);
+    },
+    aoDesfocarAlvo: (itemDaLinha: WatchItem) => {
+      if (estadoRef.current.foco === chave(itemDaLinha)) {
+        estadoRef.current.foco = null;
+      }
+    },
     aoAlternarPausa: (itemDaLinha: WatchItem) => void alternarPausa(itemDaLinha),
     aoRemover: remover,
     aoDesfazer: desfazer,
@@ -694,6 +821,10 @@ export default function AlertsPage() {
           </button>
         </div>
       </div>
+
+      {/* D-10: sessão expirada no meio da edição — o modal reautentica NO
+          LUGAR; as alterações seguem em memória e o polling retoma depois. */}
+      {sessaoExpirada ? <ReloginModal aoRelogar={aposRelogar} /> : null}
     </main>
   );
 }
