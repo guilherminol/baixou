@@ -302,3 +302,153 @@ def test_cookie_secure_auto_em_http_nao_inclui_secure(settings, capsys):
     client, resposta = _admin_logado(settings, capsys, remember=False)  # padrão: auto
     assert "; secure" not in resposta.headers["set-cookie"].lower()
     client.close()
+
+
+# --- Fase 4 (plano 04-01, Task 3): limite de tentativas de login (AUTH-02, SC-2) ---
+
+
+def test_duas_falhas_nao_bloqueiam_a_terceira_tentativa_valida(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        for _ in range(2):
+            assert (
+                client.post(
+                    "/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA}
+                ).status_code
+                == 401
+            )
+        valido = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
+    assert valido.status_code == 200  # abaixo do limiar não há bloqueio
+
+
+def test_terceira_falha_bloqueia_e_responde_429_com_retry_after(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        for _ in range(3):
+            assert (
+                client.post(
+                    "/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA}
+                ).status_code
+                == 401
+            )
+        # 4ª tentativa MESMO com a senha correta: o bloqueio responde antes
+        bloqueado = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
+    assert bloqueado.status_code == 429
+    retry_after = int(bloqueado.headers["retry-after"])
+    assert 1 <= retry_after <= 30  # segundos restantes, inteiro, dentro da 1ª espera
+    assert bloqueado.json() == {"detail": "muitas tentativas — aguarde e tente novamente"}
+    # o bloqueio foi gravado nos DOIS keys (usuário E IP) com espera de ~30 s
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        linhas = {
+            row["key"]: row
+            for row in conn.execute("SELECT key, failures, blocked_until FROM login_attempt")
+        }
+    finally:
+        conn.close()
+    agora = datetime.now(UTC)
+    for key in ("user:admin", "ip:testclient"):
+        assert key in linhas
+        assert linhas[key]["failures"] == 3
+        restante = datetime.fromisoformat(linhas[key]["blocked_until"]) - agora
+        assert timedelta(seconds=25) < restante <= timedelta(seconds=30)
+
+
+def test_escada_da_espera_e_pura_dobra_e_teta_em_15_minutos():
+    from baixou.web.auth import _wait_seconds  # sonda direta da função pura de módulo
+
+    assert _wait_seconds(0) == 0
+    assert _wait_seconds(2) == 0
+    assert _wait_seconds(3) == 30
+    assert _wait_seconds(4) == 60
+    assert _wait_seconds(5) == 120
+    assert _wait_seconds(8) == 480
+    assert _wait_seconds(9) == 900
+    assert _wait_seconds(15) == 900  # teto de 15 min
+
+
+def test_tentativa_bloqueada_nao_incrementa_o_contador(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        for _ in range(3):
+            client.post("/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA})
+        assert (
+            client.post(
+                "/api/auth/login", json={"username": "admin", "password": SENHA}
+            ).status_code
+            == 429
+        )
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        falhas = {
+            row["key"]: row["failures"]
+            for row in conn.execute("SELECT key, failures FROM login_attempt")
+        }
+    finally:
+        conn.close()
+    assert falhas == {"user:admin": 3, "ip:testclient": 3}  # o 429 não conta
+
+
+def test_login_bem_sucedido_apaga_os_dois_keys_e_recomeca_a_escada(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        for _ in range(2):
+            client.post("/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA})
+        assert client.post("/api/auth/login", json={"username": "admin", "password": SENHA}).status_code == 200
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        chaves = [row["key"] for row in conn.execute("SELECT key FROM login_attempt")]
+    finally:
+        conn.close()
+    assert chaves == []  # sucesso apaga user:<x> e ip:<ip> de uma vez
+    with _client(settings) as client:
+        client.post("/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA})
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        falhas = {
+            row["key"]: row["failures"]
+            for row in conn.execute("SELECT key, failures FROM login_attempt")
+        }
+    finally:
+        conn.close()
+    assert falhas == {"user:admin": 1, "ip:testclient": 1}  # escada recomeça em 1
+
+
+def test_bloqueio_de_outro_usuario_ou_outro_ip_nao_afeta_o_login(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+    futuro = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        with write_tx(conn):
+            conn.executemany(
+                "INSERT INTO login_attempt (key, failures, blocked_until) VALUES (?, ?, ?)",
+                [("user:outro", 9, futuro), ("ip:203.0.113.99", 9, futuro)],
+            )
+    finally:
+        conn.close()
+    with _client(settings) as client:
+        resposta = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
+    assert resposta.status_code == 200  # nenhum dos SEUS dois keys está bloqueado
+
+
+def test_log_de_falha_nunca_contem_username_nem_senha_tentada(settings, capsys):
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token, username="admin-silencioso").status_code == 201
+        assert (
+            client.post(
+                "/api/auth/login", json={"username": "admin-silencioso", "password": SENHA_ERRADA}
+            ).status_code
+            == 401
+        )
+    saida = capsys.readouterr().out
+    assert "login_failed" in saida
+    # K2/T-04-01: entrada de atacante não vira log — nem username nem senha
+    assert "admin-silencioso" not in saida
+    assert SENHA_ERRADA not in saida
