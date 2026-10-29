@@ -586,3 +586,211 @@ def test_recriar_apos_delete_comeca_ciclo_novo(settings, capsys, monkeypatch):
     assert linha["alerted_target"] is None
     assert linha["notify_state"] is None
     assert linha["last_fetch_error"] is None  # quarentena da Fase 2 limpa
+
+
+# --- Task 3: PUT /api/watch em lote — tudo-ou-nada (D-06), PUT nunca remove
+# --- (D-07), envelope completo com todos os erros acumulados
+
+
+def test_put_cria_e_edita_e_preserva_ausentes(settings, capsys, monkeypatch):
+    """D-06/D-07: lote cria o novo, edita o existente e NUNCA remove ausentes."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_watch(conn, "VALE3", "b3", 60.0)
+        _seed_watch(conn, "BTCUSDT", "crypto", 350000.0)
+    finally:
+        conn.close()
+    _congela_relogio(monkeypatch, _DOMINGO)  # novo b3: fora do pregão, sem rede
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)
+    resposta = client.put(
+        "/api/watch",
+        json={
+            "itens": [
+                {"symbol": "itub4", "market": "b3", "target_below": 33.0},
+                {"symbol": "petr4", "market": "b3", "target_below": 30.0},
+            ]
+        },
+    )
+    assert resposta.status_code == 200
+    assert requests == []  # novo B3 fora do pregão: validação D-03 sem rede
+    apos = client.get("/api/watch").json()
+    assert resposta.json() == apos  # MESMA forma do GET (a Fase 5 re-renderiza)
+    por_simbolo = {i["symbol"]: i for i in apos["itens"]}
+    assert set(por_simbolo) == {"PETR4", "VALE3", "BTCUSDT", "ITUB4"}  # D-07
+    assert por_simbolo["PETR4"]["target_below"] == 30.0  # editado no lote
+    assert por_simbolo["ITUB4"]["currency"] == "R$"
+
+
+def test_put_item_invalido_422_e_nada_muda(settings, capsys):
+    """D-06/SC-4: 1 item falho → 422 com o envelope e NADA muda (contagem igual)."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_watch(conn, "VALE3", "b3", 60.0)
+    finally:
+        conn.close()
+    resposta = client.put(
+        "/api/watch",
+        json={
+            "itens": [
+                {"symbol": "PETR4", "market": "b3", "target_below": 30.0},
+                {"symbol": "VALE3", "market": "b3", "target_below": 0},
+            ]
+        },
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {
+                "symbol": "VALE3",
+                "campo": "target_below",
+                "problema": "o alvo deve ser maior que zero",
+            }
+        ]
+    }
+    conn = _conn(settings)
+    try:
+        # Prova de atomicidade por CONTAGEM de linhas, não só por status:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 2
+        assert conn.execute("SELECT COUNT(*) AS n FROM quote").fetchone()["n"] == 0
+        alvo = conn.execute("SELECT target_below FROM watch WHERE symbol = 'PETR4'").fetchone()
+        assert alvo["target_below"] == 38.5  # a edição válida do corpo NÃO vazou
+    finally:
+        conn.close()
+
+
+def test_put_duplicado_dentro_do_corpo_422(settings, capsys, monkeypatch):
+    """'PETR4' e 'petr4' no MESMO corpo → 422 nomeando os dois, nada gravado."""
+    client = _admin_logado(settings, capsys)
+    _congela_relogio(monkeypatch, _DOMINGO)
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)
+    resposta = client.put(
+        "/api/watch",
+        json={
+            "itens": [
+                {"symbol": "PETR4", "market": "b3", "target_below": 10.0},
+                {"symbol": "petr4", "market": "b3", "target_below": 20.0},
+            ]
+        },
+    )
+    assert resposta.status_code == 422
+    corpo = resposta.json()
+    assert [e["symbol"] for e in corpo["erros"]] == ["PETR4", "PETR4"]  # os DOIS
+    assert all(e["problema"] == "símbolo repetido no lote" for e in corpo["erros"])
+    assert requests == []  # recusa local: nenhuma rede
+    conn = _conn(settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_put_novo_inexistente_422_e_existentes_nao_revalidam(settings, capsys, monkeypatch):
+    """Novo inexistente → 422 e nada gravado; EXISTENTES do corpo não vão à rede."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _simbolo_inexistente_binance, requests)
+    resposta = client.put(
+        "/api/watch",
+        json={
+            "itens": [
+                {"symbol": "petr4", "market": "b3", "target_below": 35.0},
+                {"symbol": "BOGUS", "market": "crypto", "target_below": 1.0},
+            ]
+        },
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {"symbol": "BOGUS", "campo": "symbol", "problema": "símbolo não encontrado na fonte"}
+        ]
+    }
+    for requisicao in requests:  # a rede só viu o NOVO — nunca o existente
+        assert "PETR4" not in (requisicao.url.params.get("symbols") or "")
+    conn = _conn(settings)
+    try:
+        alvo = conn.execute("SELECT target_below FROM watch WHERE symbol = 'PETR4'").fetchone()
+        assert alvo["target_below"] == 38.5  # all-or-nothing: o válido não vazou
+    finally:
+        conn.close()
+
+
+def test_put_repetido_idempotente(settings, capsys, monkeypatch):
+    """PUT repetido com o MESMO corpo deixa a lista idêntica — zero rede na 2ª."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    _congela_relogio(monkeypatch, _DOMINGO)
+    requests: list[httpx.Request] = []
+
+    def binance_ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"symbol": "BTCUSDT", "price": "300000.0"}])
+
+    _injeta_transporte(monkeypatch, binance_ok, requests)
+    corpo = {
+        "itens": [
+            {"symbol": "petr4", "market": "b3", "target_below": 30.0},
+            {"symbol": "BTCUSDT", "market": "crypto", "target_below": 300000.0},
+        ]
+    }
+    primeira = client.put("/api/watch", json=corpo)
+    assert primeira.status_code == 200
+    apos_primeira = client.get("/api/watch").json()
+    rede_na_primeira = len(requests)
+    segunda = client.put("/api/watch", json=corpo)
+    assert segunda.status_code == 200
+    assert client.get("/api/watch").json() == apos_primeira  # efeito idempotente
+    assert len(requests) == rede_na_primeira  # 2ª passada: tudo existente, sem rede
+
+
+def test_put_item_removido_renasce_ciclo_novo(settings, capsys, monkeypatch):
+    """Item removido via DELETE e re-enviado no PUT nasce com ciclo NOVO (D-02)."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.0,
+            alerted=1,
+            alerted_at="2026-10-28T16:05:00Z",
+            alerted_target=38.5,
+            notify_state='{"telegram": "ok"}',
+        )
+    finally:
+        conn.close()
+    assert client.request("DELETE", "/api/watch/PETR4/b3", json={}).status_code == 204
+    _congela_relogio(monkeypatch, _DOMINGO)
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)
+    resposta = client.put(
+        "/api/watch",
+        json={"itens": [{"symbol": "petr4", "market": "b3", "target_below": 38.5}]},
+    )
+    assert resposta.status_code == 200
+    conn = _conn(settings)
+    try:
+        linha = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    finally:
+        conn.close()
+    assert linha is not None
+    assert linha["alerted"] == 0  # mesmo reset da D-02 do POST
+    assert linha["alerted_at"] is None
+    assert linha["alerted_target"] is None
+    assert linha["notify_state"] is None
+    assert linha["last_fetch_error"] is None
