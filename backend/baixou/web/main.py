@@ -54,10 +54,16 @@ def _problema_ptbr(erro: dict) -> str:
         return "o valor deve ser texto"
     if tipo in {"float_type", "float_parsing", "int_type", "int_parsing", "decimal_type"}:
         return "o valor deve ser numérico"
-    if tipo == "bool_type":
+    if tipo in {"bool_type", "bool_parsing"}:
         return "o valor deve ser verdadeiro ou falso"
     if tipo == "string_too_short":
         return "texto curto demais"
+    if tipo == "value_error":
+        # Validador de modelo (ex.: PATCH sem nenhum campo, 04-03): a mensagem
+        # PT-BR do validador vira o problema do envelope — o pydantic a embala
+        # como "Value error, <mensagem>".
+        msg = str(erro.get("msg", ""))
+        return msg.removeprefix("Value error, ") or "valor inválido"
     return "valor inválido"
 
 

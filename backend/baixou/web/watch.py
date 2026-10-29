@@ -39,7 +39,7 @@ router = APIRouter()
 # A base sai SEM ordenação: o GET acrescenta ORDER BY e o item único, WHERE.
 _SELECT_ITENS_BASE = """
     SELECT watch.symbol AS symbol, watch.market AS market,
-           watch.target_below AS target_below,
+           watch.target_below AS target_below, watch.paused AS paused,
            quote.price AS price, quote.price_at AS price_at,
            quote.change_pct AS change_pct, quote.alerted AS alerted,
            quote.alerted_at AS alerted_at, quote.notify_state AS notify_state
@@ -118,6 +118,7 @@ def _item_de_linha(row: sqlite3.Row) -> WatchItem:
         symbol=row["symbol"],
         market=row["market"],
         target_below=row["target_below"],
+        paused=bool(row["paused"]),
         currency=currency_for(row["symbol"], row["market"]),
         price=row["price"],
         price_at=row["price_at"],
@@ -203,7 +204,15 @@ def cadastrar(request: Request, corpo: WatchItem, usuario: Sessao) -> WatchItem 
 def editar(
     request: Request, symbol: str, market: str, corpo: PatchWatch, usuario: Sessao
 ) -> WatchItem | JSONResponse:
-    """Muda SÓ o alvo do item — sem revalidar na fonte (o item já existe)."""
+    """Muda alvo e/ou pausa do item (WATCH-03) — sem revalidar na fonte (o item já existe).
+
+    ``COALESCE`` aplica SÓ os campos presentes no corpo (None = campo ausente
+    mantém o valor atual), numa ÚNICA write_tx — alvo e pausa mudam juntos ou
+    nada muda. Pausar/retomar é IDEMPOTENTE e NUNCA toca em quote nem no
+    estado de alerta (alerted/alerted_at/notify_state ficam intactos): o item
+    pausado segue visível na lista com a cotação congelada e a retomada
+    resolve o frescor sozinha na rodada seguinte (D-09, D-11 da Fase 3).
+    """
     del usuario
     symbol = _normalizar(symbol)
     conn = _abrir(request)
@@ -212,8 +221,14 @@ def editar(
             return JSONResponse(status_code=404, content={"detail": _MSG_ITEM_NAO_ENCONTRADO})
         with write_tx(conn):
             conn.execute(
-                "UPDATE watch SET target_below = ? WHERE symbol = ? AND market = ?",
-                (corpo.target_below, symbol, market),
+                "UPDATE watch SET target_below = COALESCE(?, target_below), "
+                "paused = COALESCE(?, paused) WHERE symbol = ? AND market = ?",
+                (
+                    corpo.target_below,
+                    None if corpo.paused is None else int(corpo.paused),
+                    symbol,
+                    market,
+                ),
             )
         return _buscar_item(conn, symbol, market)
     finally:

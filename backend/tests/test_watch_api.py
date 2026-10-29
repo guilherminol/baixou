@@ -571,9 +571,7 @@ def test_patch_muda_alvo_e_pausa_na_mesma_write_tx(settings, capsys):
         _seed_watch(conn, "PETR4", "b3", 38.5)
     finally:
         conn.close()
-    resposta = client.patch(
-        "/api/watch/PETR4/b3", json={"target_below": 30, "paused": True}
-    )
+    resposta = client.patch("/api/watch/PETR4/b3", json={"target_below": 30, "paused": True})
     assert resposta.status_code == 200
     assert resposta.json()["target_below"] == 30.0
     assert resposta.json()["paused"] is True

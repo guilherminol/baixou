@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SetupRequest(BaseModel):
@@ -40,11 +40,14 @@ class WatchItem(BaseModel):
     campos vêm preenchidos — ``currency`` via ``currency_for``, campos de
     quote NULL quando não há cotação e ``notify_state`` como objeto JSON
     parseado ou null (nunca string crua). ``target_below`` exige > 0 (SC-4).
+    ``paused`` é exposto desde o 04-03 (WATCH-03): o cadastro nasce ATIVO —
+    a pausa é exclusivo do PATCH e o item pausado segue VISÍVEL na lista.
     """
 
     symbol: str
     market: Literal["b3", "crypto"]
     target_below: float = Field(gt=0)
+    paused: bool = False
     currency: str = ""
     price: float | None = None
     price_at: str | None = None
@@ -61,9 +64,22 @@ class WatchListResponse(BaseModel):
 
 
 class PatchWatch(BaseModel):
-    """Corpo do PATCH /api/watch/{symbol}/{market}: só o alvo muda (SC-4)."""
+    """Corpo do PATCH /api/watch/{symbol}/{market}: alvo e/ou pausa (WATCH-03).
 
-    target_below: float = Field(gt=0)
+    Campos INDEPENDENTES e opcionais: SÓ os presentes no corpo mudam (o
+    handler aplica por ``COALESCE``). Ao menos um campo é OBRIGATÓRIO — o
+    modelo vazio é recusado pelo validador (422 no envelope D-08) e
+    ``target_below`` mantém o gt=0 (SC-4). ``paused`` aceita só booleano.
+    """
+
+    target_below: float | None = Field(default=None, gt=0)
+    paused: bool | None = None
+
+    @model_validator(mode="after")
+    def _exige_ao_menos_um_campo(self) -> PatchWatch:
+        if self.target_below is None and self.paused is None:
+            raise ValueError("informe ao menos um campo para atualizar")
+        return self
 
 
 class PutWatch(BaseModel):
