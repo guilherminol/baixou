@@ -110,6 +110,146 @@
         "title": "SetupRequest",
         "type": "object"
       },
+      "StatusCanal": {
+        "description": "Canal de aviso (telegram/ntfy) para a tela /status — contrato CONGELADO (D-03/D-15).\n\n``configurado`` deriva do Settings do web (is_configured de cada módulo de\ncanal); ``ultimo_resultado`` é DERIVADO do notify_state do item mais\nrecentemente alertado (formato congelado D-15 da Fase 3, sem migração) —\nvalores \"ok\" ou \"erro <kind> (HTTP <n>)\". Só {nome, configurado} toca\nconfiguração: NENHUM valor de TELEGRAM_TOKEN/NTFY_TOPIC/chat_id aparece\nno corpo (K2/T-05-01).",
+        "properties": {
+          "configurado": {
+            "title": "Configurado",
+            "type": "boolean"
+          },
+          "nome": {
+            "title": "Nome",
+            "type": "string"
+          },
+          "ultimo_resultado": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ultimo Resultado"
+          }
+        },
+        "required": [
+          "nome",
+          "configurado"
+        ],
+        "title": "StatusCanal",
+        "type": "object"
+      },
+      "StatusCota": {
+        "description": "Cota mensal da brapi exposta ao admin — contrato CONGELADO (D-03, Fase 5).\n\n``usadas`` é derivado da leitura: chamadas do MÊS UTC corrente (linha de\nmês anterior → usadas 0, molde b3_quota_allows — a virada é derivada na\nleitura, sem migração); ``limite`` vem de Settings. Nenhum limiar de aviso\natravessa o corpo (proibição D-02).",
+        "properties": {
+          "limite": {
+            "title": "Limite",
+            "type": "integer"
+          },
+          "usadas": {
+            "title": "Usadas",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "usadas",
+          "limite"
+        ],
+        "title": "StatusCota",
+        "type": "object"
+      },
+      "StatusFonte": {
+        "description": "Estado de UMA fonte (brapi/binance) derivado NO SERVIDOR — contrato CONGELADO (D-03).\n\n``estado`` usa o vocabulário PT fechado da tela /status: \"operacional\"\n(consecutive_failures == 0), \"erro\" (0 < n < FAIL_NOTIFY_AFTER) e\n\"falha_prolongada\" (n >= FAIL_NOTIFY_AFTER, borda INCLUSIVA) — o limiar\nfica no servidor, o navegador recebe só o estado pronto (proibição D-02).\nErro aparece com o nome da fonte (literal UI-02). Campo novo não pode\nnascer aqui sem re-freeze do openapi.json.",
+        "properties": {
+          "estado": {
+            "title": "Estado",
+            "type": "string"
+          },
+          "falhas_seguidas": {
+            "title": "Falhas Seguidas",
+            "type": "integer"
+          },
+          "nome": {
+            "title": "Nome",
+            "type": "string"
+          },
+          "ultimo_erro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ultimo Erro"
+          },
+          "ultimo_sucesso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ultimo Sucesso"
+          }
+        },
+        "required": [
+          "nome",
+          "estado",
+          "falhas_seguidas"
+        ],
+        "title": "StatusFonte",
+        "type": "object"
+      },
+      "StatusResponse": {
+        "description": "Envelope do GET /api/status — contrato CONGELADO (D-03, reversibility costly).\n\nUM endpoint alimenta o cabeçalho da página de alertas E a tela /status\ninteira (UI-02); itens NÃO entram (já vêm do /api/watch). ``ultima_rodada``\né a string ISO de run.last_run (parse tolerante, null quando ausente ou\nilegível); ``proxima_rodada`` é DERIVADA no servidor com ``next_slot`` do\nnúcleo comum (D-04) — nunca lida de tabela que pode defasar. Os nomes PT\nsem acento são DEFINITIVOS: geram os tipos TypeScript da Fase 5.",
+        "properties": {
+          "canais": {
+            "items": {
+              "$ref": "#/components/schemas/StatusCanal"
+            },
+            "title": "Canais",
+            "type": "array"
+          },
+          "cota": {
+            "$ref": "#/components/schemas/StatusCota"
+          },
+          "fontes": {
+            "items": {
+              "$ref": "#/components/schemas/StatusFonte"
+            },
+            "title": "Fontes",
+            "type": "array"
+          },
+          "proxima_rodada": {
+            "title": "Proxima Rodada",
+            "type": "string"
+          },
+          "ultima_rodada": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ultima Rodada"
+          }
+        },
+        "required": [
+          "proxima_rodada",
+          "cota",
+          "fontes",
+          "canais"
+        ],
+        "title": "StatusResponse",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -399,6 +539,25 @@
           }
         },
         "summary": "Setup"
+      }
+    },
+    "/api/status": {
+      "get": {
+        "description": "Estado operacional do serviço — exige sessão (del usuario: só autentica).\n\n``ultima_rodada``: run.last_run com parse tolerante (None quando ausente ou\nilegível). ``proxima_rodada``: next_slot derivada AGORA no servidor com\nPOLL_MINUTES/TZ_MARKET (D-04). ``cota``: chamadas do MÊS UTC corrente\n(linha de mês anterior → usadas 0 — virada derivada na leitura, molde\nb3_quota_allows) contra o limite de Settings. Fontes e canais derivados\ncomo acima. ZERO escrita: conexão fechada no finally.",
+        "operationId": "status_geral_api_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status Geral"
       }
     },
     "/api/watch": {

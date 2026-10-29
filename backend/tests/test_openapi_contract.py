@@ -30,6 +30,7 @@ _PATHS_ESPERADOS = {
     "/api/auth/logout": {"post"},
     "/api/watch": {"get", "post", "put"},
     "/api/watch/{symbol}/{market}": {"patch", "delete"},
+    "/api/status": {"get"},
 }
 
 # Os modelos de contrato (response_model e corpos) dos quais a Fase 5 deriva
@@ -41,6 +42,10 @@ _MODELOS_ESPERADOS = (
     "WatchListResponse",
     "PatchWatch",
     "PutWatch",
+    "StatusResponse",
+    "StatusCota",
+    "StatusFonte",
+    "StatusCanal",
 )
 
 _METHOD_KEYS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})

@@ -108,6 +108,71 @@ class PutWatch(BaseModel):
     itens: list[WatchItem] = Field(min_length=1)
 
 
+class StatusCota(BaseModel):
+    """Cota mensal da brapi exposta ao admin — contrato CONGELADO (D-03, Fase 5).
+
+    ``usadas`` é derivado da leitura: chamadas do MÊS UTC corrente (linha de
+    mês anterior → usadas 0, molde b3_quota_allows — a virada é derivada na
+    leitura, sem migração); ``limite`` vem de Settings. Nenhum limiar de aviso
+    atravessa o corpo (proibição D-02).
+    """
+
+    usadas: int
+    limite: int
+
+
+class StatusFonte(BaseModel):
+    """Estado de UMA fonte (brapi/binance) derivado NO SERVIDOR — contrato CONGELADO (D-03).
+
+    ``estado`` usa o vocabulário PT fechado da tela /status: "operacional"
+    (consecutive_failures == 0), "erro" (0 < n < FAIL_NOTIFY_AFTER) e
+    "falha_prolongada" (n >= FAIL_NOTIFY_AFTER, borda INCLUSIVA) — o limiar
+    fica no servidor, o navegador recebe só o estado pronto (proibição D-02).
+    Erro aparece com o nome da fonte (literal UI-02). Campo novo não pode
+    nascer aqui sem re-freeze do openapi.json.
+    """
+
+    nome: str
+    estado: str
+    falhas_seguidas: int
+    ultimo_sucesso: str | None = None
+    ultimo_erro: str | None = None
+
+
+class StatusCanal(BaseModel):
+    """Canal de aviso (telegram/ntfy) para a tela /status — contrato CONGELADO (D-03/D-15).
+
+    ``configurado`` deriva do Settings do web (is_configured de cada módulo de
+    canal); ``ultimo_resultado`` é DERIVADO do notify_state do item mais
+    recentemente alertado (formato congelado D-15 da Fase 3, sem migração) —
+    valores "ok" ou "erro <kind> (HTTP <n>)". Só {nome, configurado} toca
+    configuração: NENHUM valor de TELEGRAM_TOKEN/NTFY_TOPIC/chat_id aparece
+    no corpo (K2/T-05-01).
+    """
+
+    nome: str
+    configurado: bool
+    ultimo_resultado: str | None = None
+
+
+class StatusResponse(BaseModel):
+    """Envelope do GET /api/status — contrato CONGELADO (D-03, reversibility costly).
+
+    UM endpoint alimenta o cabeçalho da página de alertas E a tela /status
+    inteira (UI-02); itens NÃO entram (já vêm do /api/watch). ``ultima_rodada``
+    é a string ISO de run.last_run (parse tolerante, null quando ausente ou
+    ilegível); ``proxima_rodada`` é DERIVADA no servidor com ``next_slot`` do
+    núcleo comum (D-04) — nunca lida de tabela que pode defasar. Os nomes PT
+    sem acento são DEFINITIVOS: geram os tipos TypeScript da Fase 5.
+    """
+
+    ultima_rodada: str | None = None
+    proxima_rodada: str
+    cota: StatusCota
+    fontes: list[StatusFonte]
+    canais: list[StatusCanal]
+
+
 def erro_item(symbol: str | None, campo: str, problema: str) -> dict:
     """Monta UMA entrada do envelope D-08 (PT-BR em ``problema``)."""
     return {"symbol": symbol, "campo": campo, "problema": problema}
