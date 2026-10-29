@@ -14,14 +14,17 @@ from datetime import UTC, datetime, timedelta
 from baixou.core.config import load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect, write_tx
 from baixou.core.migrations import apply_migrations
-from baixou.web.auth import ensure_setup_token
+from baixou.web.auth import _DUMMY_HASH, ensure_setup_token
 from baixou.web.main import create_app
-from baixou.web.passwords import token_digest
+from baixou.web.passwords import token_digest, verify_password
 from fastapi.testclient import TestClient
 
 SENHA = "senha-super-segura-123"
 SENHA_CURTA = "curta-senha"  # 11 caracteres — abaixo do mínimo de 12
 SENHA_ERRADA = "senha-incorreta"
+# A MESMA literal de auth.py (_DUMMY_HASH): a senha que "acerta" o hash
+# fictício do caminho de usuário inexistente (borda do CR-01).
+SENHA_DUMMY = "hash-ficticio-para-igualar-o-tempo-de-resposta"
 
 
 def _client(settings) -> TestClient:
@@ -125,6 +128,44 @@ def test_401_identico_para_usuario_inexistente_e_senha_errada(settings, capsys):
         )
     assert inexistente.status_code == errada.status_code == 401
     assert inexistente.content == errada.content  # byte a byte (T-04-04)
+
+
+def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_identico_e_registra_falha(
+    settings, capsys
+):
+    """Borda do hash fictício (CR-01): a senha que "acerta" o _DUMMY_HASH num
+    usuário inexistente tem de dar o MESMO 401 byte a byte do caminho de senha
+    errada — sem abrir sessão e COM a falha contada no bloqueio (AUTH-02/SC-2).
+    """
+    # Ligação teste↔código: o literal do teste exerce a borda REAL do módulo
+    # (se a senha do hash fictício mudar um dia, o teste avisa aqui).
+    assert verify_password(SENHA_DUMMY, _DUMMY_HASH)
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        # referência: caminho de senha errada (usuário EXISTENTE)
+        errada = client.post(
+            "/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA}
+        )
+        # borda: usuário inexistente + a senha literal do hash fictício
+        dummy = client.post(
+            "/api/auth/login", json={"username": "fantasma", "password": SENHA_DUMMY}
+        )
+    assert dummy.status_code == errada.status_code == 401
+    assert dummy.content == errada.content  # byte a byte — indistinguível (T-04-04)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        # nenhuma sessão aberta para usuário inexistente
+        assert conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+        falhas = {
+            row["key"]: row["failures"]
+            for row in conn.execute("SELECT key, failures FROM login_attempt")
+        }
+    finally:
+        conn.close()
+    # a borda CONTA como falha (o contador do bloqueio volta a cobri-la):
+    # user:fantasma estreia com 1; ip:testclient soma a referência + a borda
+    assert falhas == {"user:fantasma": 1, "ip:testclient": 2}
 
 
 def test_username_so_espacos_recusado(settings, capsys):
