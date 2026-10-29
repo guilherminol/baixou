@@ -224,8 +224,9 @@ def editar(
 def remover(request: Request, symbol: str, market: str, usuario: Sessao):  # noqa: ANN201 — 204 sem corpo
     """Remove SÓ a linha de watch (D-01): a cotação fica para o pruning do worker.
 
-    Nesta task o esquema 0001 ainda apaga a quote junto (ON DELETE CASCADE) —
-    a preservação da cotação órfã é prova do plano 04-03, após a migração 0004.
+    A migração 0004 (04-03) retirou a FK ON DELETE CASCADE: a cotação órfã —
+    com o histórico de alerta — sobrevive à remoção até o pruning da write_tx
+    única da rodada seguinte (worker/main.py, D-01).
     """
     del usuario
     symbol = _normalizar(symbol)

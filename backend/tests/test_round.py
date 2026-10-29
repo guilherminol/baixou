@@ -535,16 +535,26 @@ def test_round_quarantines_bad_binance_symbol_until_watch_row_is_recreated(
     btc = db.execute("SELECT * FROM quote WHERE symbol = 'BTCUSDT'").fetchone()
     assert btc["price"] == 270000.0  # o válido continua gravado em toda rodada
 
-    # Recriar a linha em watch (remover/re-adicionar): cascata apaga a quote e
-    # o símbolo volta ao lote na rodada seguinte.
+    # Após a migração 0004 (D-01): remover a linha em watch NÃO apaga mais a
+    # quote — a órfã sobrevive COM o last_fetch_error (o pruning do worker,
+    # Task 3 deste plano, é quem a apaga na rodada seguinte).
     db.execute("DELETE FROM watch WHERE symbol = 'ETHUSDT' AND market = 'crypto'")
+    orfa = db.execute("SELECT * FROM quote WHERE symbol = 'ETHUSDT'").fetchone()
+    assert orfa is not None and orfa["last_fetch_error"] == "not_found"  # órfã sobrevive (D-01)
+
+    # Recriada a watch com a órfã ainda no banco (o pruning não rodou), a
+    # quarentena DERIVADA da coluna continua valendo: o símbolo não vai ao lote.
     db.execute(
         "INSERT INTO watch (symbol, market, target_below) VALUES ('ETHUSDT', 'crypto', 10.0)"
     )
-    assert db.execute("SELECT * FROM quote WHERE symbol = 'ETHUSDT'").fetchone() is None
-
     worker_main.run_round(db, settings)
-    assert batches[2] == ["BTCUSDT", "ETHUSDT"]  # de volta ao lote único
+    assert batches[2] == ["BTCUSDT"]  # a órfã existe → quarentena mantida
+
+    # O reset da recriação pela API (D-02, _RESET_QUOTE do POST/PUT do 04-02)
+    # é quem limpa a coluna — simulado aqui pela mesma escrita:
+    db.execute("UPDATE quote SET last_fetch_error = NULL WHERE symbol = 'ETHUSDT'")
+    worker_main.run_round(db, settings)
+    assert batches[3] == ["BTCUSDT", "ETHUSDT"]  # sem quarentena: de volta ao lote único
     # 1-a-1 de novo: o lote recusado repete TODOS os símbolos (ordem da watch)
     assert singles == ["BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"]
 

@@ -230,8 +230,9 @@ def test_quote_orphan_survives_watch_delete_with_alert_state(settings):
             "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', 10.0)"
         )
         conn.execute(
-            "INSERT INTO quote (symbol, market, price, alerted, alerted_target, notify_state, "
-            "last_fetch_error) VALUES ('PETR4', 'b3', 35.2, 1, 10.0, '{\"telegram\": \"ok\"}', NULL)"
+            "INSERT INTO quote (symbol, market, price, alerted, alerted_target, "
+            "notify_state, last_fetch_error) "
+            "VALUES ('PETR4', 'b3', 35.2, 1, 10.0, '{\"telegram\": \"ok\"}', NULL)"
         )
         conn.execute("DELETE FROM watch WHERE symbol = 'PETR4'")
         orfa = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
