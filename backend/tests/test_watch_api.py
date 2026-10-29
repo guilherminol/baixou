@@ -425,6 +425,51 @@ def test_post_alvo_invalido_recusa_422(alvo, settings, capsys):
     }
 
 
+def test_alvo_infinito_via_1e999_recusado_422_no_post_put_e_patch(settings, capsys, monkeypatch):
+    """WR-04: JSON 1e999 vira +Infinity no float e o pydantic ACEITAVA (default
+    allow_inf_nan=True) — o 201 criava item com alvo inf que o GET devolvia como
+    null (número obrigatório do contrato congelado) e o worker nunca alertava.
+    POST, PUT e PATCH recusam com 422 no envelope D-08 nomeando target_below.
+    B3 fora do pregão + transporte violento: a recusa é de FORMA no pydantic,
+    antes de qualquer fonte — zero rede nas duas fases do ciclo.
+    """
+    client = _admin_logado(settings, capsys)
+    _congela_relogio(monkeypatch, _DOMINGO)  # fora do pregão: b3 sem rede
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)  # levantaria se chamado
+    cabecalho = {"Content-Type": "application/json"}
+    post = client.post(
+        "/api/watch",
+        content=b'{"symbol": "petr4", "market": "b3", "target_below": 1e999}',
+        headers=cabecalho,
+    )
+    assert post.status_code == 422
+    erro_post = post.json()["erros"][0]
+    assert erro_post["symbol"] == "PETR4"
+    assert erro_post["campo"] == "target_below"
+    conn = _conn(settings)
+    try:
+        # recusa não grava: o alvo inf nunca chega ao banco
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+    put = client.put(
+        "/api/watch",
+        content=b'{"itens": [{"symbol": "petr4", "market": "b3", "target_below": 1e999}]}',
+        headers=cabecalho,
+    )
+    assert put.status_code == 422
+    assert put.json()["erros"][0]["campo"] == "target_below"
+    patch = client.patch(
+        "/api/watch/PETR4/b3",
+        content=b'{"target_below": 1e999}',
+        headers=cabecalho,
+    )
+    assert patch.status_code == 422
+    assert patch.json()["erros"][0]["campo"] == "target_below"
+    assert requests == []  # prova: nenhuma fonte foi chamada nas três pernas
+
+
 def test_post_market_invalido_fala_o_dialeto_do_envelope(settings, capsys):
     """Erro de FORMA do pydantic sai no MESMO envelope D-08 (handler em main.py)."""
     client = _admin_logado(settings, capsys)
