@@ -224,8 +224,9 @@ def test_watch_protegida_lista_itens_ordenados(settings, capsys):
         resposta = client.get("/api/watch")
     assert resposta.status_code == 200
     # Forma completa desde o 04-02 (quote via LEFT JOIN + moeda de currency_for),
-    # com paused exposto desde o 04-03 (WATCH-03) — o mínimo do tracer 04-01
-    # foi substituído pelo contrato congelado do plano.
+    # com paused exposto desde o 04-03 (WATCH-03) e fresh/suspect desde o 05-01
+    # (D-02, estado derivado no servidor) — o mínimo do tracer 04-01 foi
+    # substituído pelo contrato congelado do plano.
     assert resposta.json() == {
         "itens": [
             {
@@ -240,6 +241,8 @@ def test_watch_protegida_lista_itens_ordenados(settings, capsys):
                 "alerted": False,
                 "alerted_at": None,
                 "notify_state": None,
+                "fresh": "none",  # sem cotação: estado "none" no servidor (D-02)
+                "suspect": False,
             },
             {
                 "symbol": "BTCUSDT",
@@ -253,6 +256,8 @@ def test_watch_protegida_lista_itens_ordenados(settings, capsys):
                 "alerted": False,
                 "alerted_at": None,
                 "notify_state": None,
+                "fresh": "none",
+                "suspect": False,
             },
         ]
     }  # ORDER BY market, symbol: b3 antes de crypto

@@ -58,6 +58,17 @@ def _conn(settings) -> sqlite3.Connection:
     return connect(settings.db_path, timeout_s=WEB_TIMEOUT_S)
 
 
+def _injeta_relogio_watch(monkeypatch, now_utc: datetime) -> None:
+    """Congela o relógio da derivação de estado (D-02) em ``baixou.web.watch``.
+
+    ``watch._agora`` é o ponto de injeção declarado no plano 05-01 — os
+    handlers resolvem a função no escopo do módulo a cada request.
+    """
+    from baixou.web import watch
+
+    monkeypatch.setattr(watch, "_agora", lambda: now_utc)
+
+
 def _seed_watch(
     conn: sqlite3.Connection, symbol: str, market: str, target_below: float = 10.0
 ) -> None:
@@ -105,7 +116,7 @@ def _seed_quote(
 # --- Task 1: GET /api/watch completo — quote via LEFT JOIN e moeda (WATCH-02) ---
 
 
-def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
+def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys, monkeypatch):
     """Item completo com moeda da fonte única de verdade e notify_state PARSEADO."""
     client = _admin_logado(settings, capsys)
     conn = _conn(settings)
@@ -126,6 +137,7 @@ def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
         _seed_watch(conn, "BTCUSDT", "crypto", 350000.0)  # sem cotação: campos NULL
     finally:
         conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)  # 13:00 BRT: pregão aberto
     resposta = client.get("/api/watch")
     assert resposta.status_code == 200
     # Igualdade EXATA: a forma é contrato congelado para a Fase 5 (tipos gerados).
@@ -143,6 +155,8 @@ def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
                 "alerted": True,
                 "alerted_at": "2026-10-28T16:05:00Z",
                 "notify_state": {"telegram": "ok"},  # objeto, NUNCA string crua
+                "fresh": "ok",  # D-02 (05-01): estado derivado NO SERVIDOR
+                "suspect": False,
             },
             {
                 "symbol": "BTCUSDT",
@@ -156,6 +170,8 @@ def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
                 "alerted": False,
                 "alerted_at": None,
                 "notify_state": None,
+                "fresh": "none",
+                "suspect": False,
             },
         ]
     }
@@ -300,6 +316,8 @@ def test_post_cripto_valido_cadastra_201_e_normaliza(settings, capsys, monkeypat
         "alerted": False,
         "alerted_at": None,
         "notify_state": None,
+        "fresh": "none",  # D-02 (05-01): ciclo novo sem cotação é "none" no servidor
+        "suspect": False,
     }
     assert json.loads(requests[0].url.params["symbols"]) == ["SOLUSDT"]  # normalizado
     conn = _conn(settings)
@@ -994,3 +1012,151 @@ def test_put_item_removido_renasce_ciclo_novo(settings, capsys, monkeypatch):
     assert linha["alerted_target"] is None
     assert linha["notify_state"] is None
     assert linha["last_fetch_error"] is None
+
+
+# --- 05-01 Task 1: fresh/suspect derivados NO SERVIDOR no GET /api/watch (D-02)
+# --- os MESMOS quatro estados de freshness_state e a borda inclusiva da
+# --- suspeita — o navegador recebe o estado pronto, nunca os limiares
+
+
+def test_get_quote_fresca_em_pregao_fresh_ok(settings, capsys, monkeypatch):
+    """Idade dentro do limite e B3 em pregão → fresh "ok" (molde freshness_state)."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T15:45:00Z",  # 15 min antes do relógio congelado
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)
+    item = client.get("/api/watch").json()["itens"][0]
+    assert item["fresh"] == "ok"
+    assert item["suspect"] is False
+
+
+def test_get_quote_velha_em_pregao_fresh_stale(settings, capsys, monkeypatch):
+    """Idade além de STALE_MINUTES_B3 (75) DENTRO do pregão → fresh "stale"."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T14:30:00Z",  # 90 min antes: acima do limite
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)
+    assert client.get("/api/watch").json()["itens"][0]["fresh"] == "stale"
+
+
+def test_get_b3_fora_do_pregao_fresh_closed_prevalece_sobre_stale(settings, capsys, monkeypatch):
+    """Precedência de freshness_state: B3 fechada (domingo) → "closed", não "stale"."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T14:30:00Z",  # velha E fora do pregão
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _DOMINGO)  # SC-1: pregão fechado
+    assert client.get("/api/watch").json()["itens"][0]["fresh"] == "closed"
+
+
+def test_get_cripto_velha_fora_do_pregao_fresh_stale_nunca_closed(settings, capsys, monkeypatch):
+    """Cripto nunca é closed (mercado 24/7): velha no domingo segue "stale"."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "BTCUSDT", "crypto", 350000.0)
+        _seed_quote(
+            conn,
+            "BTCUSDT",
+            "crypto",
+            price=300000.0,
+            price_at="2026-10-28T14:30:00Z",  # > STALE_MINUTES_CRYPTO (30)
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _DOMINGO)
+    assert client.get("/api/watch").json()["itens"][0]["fresh"] == "stale"
+
+
+def test_get_item_sem_cotacao_fresh_none(settings, capsys, monkeypatch):
+    """Sem linha de quote (price/price_at NULL) → fresh "none", nunca erro."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "VALE3", "b3", 60.0)
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)
+    item = client.get("/api/watch").json()["itens"][0]
+    assert item["fresh"] == "none"
+    assert item["suspect"] is False
+
+
+@pytest.mark.parametrize(
+    ("change_pct", "suspeito"),
+    [
+        (20.0, True),  # borda INCLUSIVA: abs(change_pct) == SUSPECT_PCT (padrão 20)
+        (-20.0, True),  # queda brusca também suspeita (módulo da variação)
+        (19.9, False),  # abaixo do limiar: normal
+        (-1.2, False),
+    ],
+)
+def test_get_suspect_borda_inclusiva_no_limiar(change_pct, suspeito, settings, capsys, monkeypatch):
+    """Mesmo limiar e borda INCLUSIVA de messages.suspect_note (D-10): abs ≥ SUSPECT_PCT."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T15:45:00Z",
+            change_pct=change_pct,
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)
+    assert client.get("/api/watch").json()["itens"][0]["suspect"] is suspeito
+
+
+def test_get_change_pct_nulo_suspect_false(settings, capsys, monkeypatch):
+    """change_pct NULL (fonte não fornece) → suspect False, sem TypeError."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T15:45:00Z",
+            change_pct=None,
+        )
+    finally:
+        conn.close()
+    _injeta_relogio_watch(monkeypatch, _QUARTA_16H)
+    item = client.get("/api/watch").json()["itens"][0]
+    assert item["suspect"] is False
+    assert item["fresh"] == "ok"  # o frescor NÃO depende da variação

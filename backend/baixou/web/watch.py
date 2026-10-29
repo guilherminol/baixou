@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Request, Response
@@ -29,6 +30,7 @@ from baixou.core.db import WEB_TIMEOUT_S, connect, write_tx
 from baixou.web import symbol_validation
 from baixou.web.auth import Sessao
 from baixou.web.schemas import PatchWatch, PutWatch, WatchItem, WatchListResponse, erro_item
+from baixou.worker.alerts import freshness_state
 from baixou.worker.sources.base import SourceError, SymbolNotFoundError
 
 router = APIRouter()
@@ -73,6 +75,11 @@ def _abrir(request: Request) -> sqlite3.Connection:
     return connect(settings.db_path, timeout_s=WEB_TIMEOUT_S)
 
 
+def _agora() -> datetime:
+    """Relógio do módulo (D-02) — ponto de injeção dos testes (molde _now de auth.py)."""
+    return datetime.now(UTC)
+
+
 def _normalizar(symbol: str) -> str:
     """D-05: 'petr4' e 'PETR4' são o MESMO item — maiúsculas, sem espaços."""
     return symbol.strip().upper()
@@ -112,8 +119,15 @@ def _notify_state_parseado(cru: object) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _item_de_linha(row: sqlite3.Row) -> WatchItem:
-    """Linha watch⋈quote → WatchItem com a moeda da fonte única de verdade."""
+def _item_de_linha(row: sqlite3.Row, settings, now_utc: datetime) -> WatchItem:
+    """Linha watch⋈quote → WatchItem com moeda e estado derivados NO SERVIDOR (D-02).
+
+    ``fresh`` vem de ``freshness_state`` (a MESMA derivação que trava o aviso
+    no worker: none → closed → stale → ok) e ``suspect`` replica a borda
+    INCLUSIVA da nota de suspeita (abs(change_pct) ≥ SUSPECT_PCT — mesmo
+    limiar de messages.suspect_note): os limiares NUNCA atravessam o contrato
+    — o navegador recebe só o estado pronto da coluna "Estado".
+    """
     return WatchItem(
         symbol=row["symbol"],
         market=row["market"],
@@ -126,21 +140,27 @@ def _item_de_linha(row: sqlite3.Row) -> WatchItem:
         alerted=bool(row["alerted"]),
         alerted_at=row["alerted_at"],
         notify_state=_notify_state_parseado(row["notify_state"]),
+        fresh=freshness_state(row, settings, now_utc),
+        suspect=(row["change_pct"] is not None and abs(row["change_pct"]) >= settings.suspect_pct),
     )
 
 
-def _listar_itens(conn: sqlite3.Connection) -> list[WatchItem]:
+def _listar_itens(conn: sqlite3.Connection, settings, now_utc: datetime) -> list[WatchItem]:
     """Itens completos e ordenados — a MESMA leitura serve ao GET e ao PUT."""
-    return [_item_de_linha(row) for row in conn.execute(_SELECT_ITENS).fetchall()]
+    return [
+        _item_de_linha(row, settings, now_utc) for row in conn.execute(_SELECT_ITENS).fetchall()
+    ]
 
 
-def _buscar_item(conn: sqlite3.Connection, symbol: str, market: str) -> WatchItem | JSONResponse:
+def _buscar_item(
+    conn: sqlite3.Connection, settings, symbol: str, market: str
+) -> WatchItem | JSONResponse:
     """UM item completo pela MESMA leitura do GET; sumiu → 404 (nada a devolver)."""
     sql = _SELECT_ITENS_BASE + " WHERE watch.symbol = ? AND watch.market = ?"
     row = conn.execute(sql, (symbol, market)).fetchone()
     if row is None:
         return JSONResponse(status_code=404, content={"detail": _MSG_ITEM_NAO_ENCONTRADO})
-    return _item_de_linha(row)
+    return _item_de_linha(row, settings, _agora())
 
 
 def _existe(conn: sqlite3.Connection, symbol: str, market: str) -> bool:
@@ -159,7 +179,7 @@ def listar(request: Request, usuario: Sessao) -> WatchListResponse:
     del usuario
     conn = _abrir(request)
     try:
-        return WatchListResponse(itens=_listar_itens(conn))
+        return WatchListResponse(itens=_listar_itens(conn, request.app.state.settings, _agora()))
     finally:
         conn.close()
 
@@ -195,7 +215,7 @@ def cadastrar(request: Request, corpo: WatchItem, usuario: Sessao) -> WatchItem 
                 (symbol, corpo.market, corpo.target_below),
             )
             conn.execute(_RESET_QUOTE, (symbol, corpo.market))  # ciclo NOVO (D-02)
-        return _buscar_item(conn, symbol, corpo.market)
+        return _buscar_item(conn, request.app.state.settings, symbol, corpo.market)
     finally:
         conn.close()
 
@@ -230,7 +250,7 @@ def editar(
                     market,
                 ),
             )
-        return _buscar_item(conn, symbol, market)
+        return _buscar_item(conn, request.app.state.settings, symbol, market)
     finally:
         conn.close()
 
@@ -330,6 +350,6 @@ def salvar_lote(
                         (symbol, market, alvo),
                     )
                     conn.execute(_RESET_QUOTE, (symbol, market))  # ciclo NOVO (D-02)
-        return WatchListResponse(itens=_listar_itens(conn))
+        return WatchListResponse(itens=_listar_itens(conn, settings, _agora()))
     finally:
         conn.close()

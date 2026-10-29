@@ -42,6 +42,16 @@ class WatchItem(BaseModel):
     parseado ou null (nunca string crua). ``target_below`` exige > 0 (SC-4).
     ``paused`` é exposto desde o 04-03 (WATCH-03): o cadastro nasce ATIVO —
     a pausa é exclusivo do PATCH e o item pausado segue VISÍVEL na lista.
+
+    ``fresh``/``suspect`` são contrato CONGELADO da Fase 5 (D-02, reversibility
+    costly): estado derivado NO SERVIDOR — o SERVIDOR conhece os limiares
+    (STALE_MINUTES_*, TZ_MARKET/pregão, SUSPECT_PCT), nunca o navegador, que
+    recebe só o estado pronto para a coluna "Estado" da página de alertas.
+    Campos de SAÍDA com default (mesmo padrão do ``paused`` do 04-03):
+    ignorados na entrada. ``fresh`` usa os MESMOS quatro estados de
+    ``freshness_state`` (worker/alerts: none → closed → stale → ok) e
+    ``suspect`` a MESMA borda inclusiva da nota de suspeita do aviso
+    (abs(change_pct) ≥ SUSPECT_PCT) — a página mostra o que o worker avalia.
     """
 
     symbol: str
@@ -57,6 +67,8 @@ class WatchItem(BaseModel):
     alerted: bool = False
     alerted_at: str | None = None
     notify_state: dict[str, Any] | None = None
+    fresh: Literal["ok", "stale", "closed", "none"] = "none"
+    suspect: bool = False
 
 
 class WatchListResponse(BaseModel):
