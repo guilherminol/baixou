@@ -457,7 +457,7 @@ describe("StatusPage — botão de teste por canal (NOTIF-02, D-05)", () => {
       }),
     );
     requestMock.mockRejectedValueOnce(
-      new ApiError(409, { detail: "canal não configurado" }),
+      new ApiError(409, { detail: "canal não configurado" }, "canal não configurado"),
     );
     fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
     const resultado = await screen.findByTestId("resultado-telegram");
@@ -470,7 +470,7 @@ describe("StatusPage — botão de teste por canal (NOTIF-02, D-05)", () => {
         canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
       }),
     );
-    requestMock.mockRejectedValueOnce(new ApiError(500, { detail: "boom" }));
+    requestMock.mockRejectedValueOnce(new ApiError(500, { detail: "boom" }, "boom"));
     fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
     const resultado = await screen.findByTestId("resultado-telegram");
     expect(resultado.textContent).toBe("não foi possível concluir o teste (erro 500)");

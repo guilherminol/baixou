@@ -121,6 +121,45 @@
   color: var(--muted);
 }
 
+/* Botão de teste por canal (NOTIF-02, D-05): a linguagem .btn-action do
+   mockup com alvo de 44px e borda própria (é o único botão de ação da tela). */
+.btn-testar {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-testar:hover,
+.btn-testar:focus {
+  color: var(--text);
+}
+
+.btn-testar:disabled {
+  cursor: not-allowed;
+  color: var(--muted);
+}
+
+/* Resultado do teste na linha do canal (D-05): cor normal quando o canal
+   aceitou (ok) e --error-text na falha — a falha de entrega é RESULTADO
+   visível, nunca erro de rede; aria-live anuncia a troca. */
+.resultado-teste {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.resultado-teste.falha {
+  color: var(--error-text);
+}
+
 /* Faixa fixa "nenhum canal configurado" (literal UI-02, D-15): a linguagem do
    banner do mockup (1px, raio 2px, 12px), mas INFORMATIVA — não é erro de
    sistema, então as cores neutras em vez de --error-*. */
