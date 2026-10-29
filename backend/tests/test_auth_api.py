@@ -130,7 +130,7 @@ def test_401_identico_para_usuario_inexistente_e_senha_errada(settings, capsys):
     assert inexistente.content == errada.content  # byte a byte (T-04-04)
 
 
-def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_identico_e_registra_falha(
+def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_identico_e_registra_falha(  # noqa: E501 — nome exigido pelo plano 04-05 (borda do CR-01)
     settings, capsys
 ):
     """Borda do hash fictício (CR-01): a senha que "acerta" o _DUMMY_HASH num
@@ -164,8 +164,11 @@ def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_iden
     finally:
         conn.close()
     # a borda CONTA como falha (o contador do bloqueio volta a cobri-la):
-    # user:fantasma estreia com 1; ip:testclient soma a referência + a borda
-    assert falhas == {"user:fantasma": 1, "ip:testclient": 2}
+    # user:fantasma estreia com 1; ip:testclient soma a referência + a borda.
+    # (user:admin também está lá, com 1 — da tentativa de referência.)
+    assert falhas["user:fantasma"] == 1
+    assert falhas["ip:testclient"] == 2
+    assert falhas["user:admin"] == 1
 
 
 def test_username_so_espacos_recusado(settings, capsys):

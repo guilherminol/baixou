@@ -14,7 +14,8 @@ Contratos (arquitetura §Segurança e login, AUTH-01/AUTH-02):
   código (D-10). Validade sliding (D-11): cada uso renova o prazo.
 - 401 com corpo idêntico para usuário inexistente e senha errada; o caminho
   de usuário inexistente roda scrypt contra um hash fictício para igualar o
-  tempo de resposta (T-04-04).
+  tempo de resposta (T-04-04) e a falha é registrada MESMO quando a senha
+  "acerta" o hash fictício — re-checagem pós-verify (CR-01).
 - Segurança barata primeiro: a checagem de bloqueio (Task 3) não roda scrypt.
 """
 
@@ -330,7 +331,13 @@ def login(request: Request, corpo: LoginRequest) -> Response:
             "SELECT id, password_hash FROM users WHERE username = ?", (corpo.username,)
         ).fetchone()
         stored = user["password_hash"] if user is not None else _DUMMY_HASH
-        if not verify_password(corpo.password, stored):
+        senha_ok = verify_password(corpo.password, stored)
+        if user is None or not senha_ok:
+            # Re-checagem pós-verify (borda do dummy hash, CR-01): com usuário
+            # inexistente a senha pode "acertar" o hash fictício — a tentativa
+            # SEGURA sendo falha de login (o contador do bloqueio AUTH-02 volta
+            # a cobrir a borda) e o ramo roda para OS DOIS motivos, nunca só
+            # para `not senha_ok`.
             _record_login_failure(conn, (user_key, ip_key))
             # MESMA resposta para usuário inexistente e senha errada (T-04-04):
             # mesmo status, mesmo corpo, mesmo tempo (scrypt dummy acima).
