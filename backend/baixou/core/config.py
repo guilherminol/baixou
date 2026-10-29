@@ -54,6 +54,12 @@ class Settings:
     ntfy_topic: str = ""
     ntfy_token: str = ""
     notify_click_url: str = ""  # única env da fase onde vazio é válido (D-14)
+    # Fase 4 (AUTH-01): Secure do cookie de sessão — "sim" sempre; "auto" só
+    # quando a requisição é https (padrão); "nao" nunca. Em http://IP:porta um
+    # cookie Secure é descartado e o login falha sem explicação. A resolução da
+    # env COOKIE_SECURE pelo molde WR-01 (vazio definido = inválido) é ligada
+    # na Task 2 do plano 04-01.
+    cookie_secure: str = "auto"
     # Pares lidos via _FILE, separados dos campos comuns (fases 2–3 consomem
     # TELEGRAM_TOKEN etc. por aqui). Valores aqui NUNCA vão para log/erro (K2).
     secrets: dict[str, str] = field(default_factory=dict)
