@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -11,5 +12,13 @@ export default defineConfig({
       "/api": "http://127.0.0.1:8000",
       "/healthz": "http://127.0.0.1:8000",
     },
+  },
+  // Vitest + Testing Library (arquitetura §Ferramentas): jsdom é o ambiente
+  // do Testing Library; globals liga describe/it/expect; setup carrega o
+  // jest-dom. Os testes mockam o módulo client — zero rede.
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
   },
 });
