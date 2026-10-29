@@ -20,6 +20,7 @@ Contratos (arquitetura §Segurança e login, AUTH-01/AUTH-02):
 
 from __future__ import annotations
 
+import math
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -41,6 +42,9 @@ _SESSION_TTL_SHORT = timedelta(hours=12)  # sem "lembrar" (D-10)
 _SESSION_TTL_REMEMBER = timedelta(days=30)  # com "lembrar" (D-10)
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _MIN_PASSWORD_CHARS = 12
+_LOCK_THRESHOLD = 3  # falhas seguidas que abrem o bloqueio (AUTH-02)
+_WAIT_BASE_S = 30  # 1ª espera: 30 s, dobrando a cada nova falha
+_WAIT_CEILING_S = 900  # teto da espera: 15 min
 
 # Hash fictício: iguala o TEMPO do caminho de usuário inexistente ao de senha
 # errada (T-04-04) — computado uma única vez na importação do módulo.
@@ -222,9 +226,49 @@ def setup(request: Request, corpo: SetupRequest) -> Response:
     return JSONResponse(status_code=201, content={"detail": "administrador criado"})
 
 
+def _wait_seconds(failures: int) -> int:
+    """Escada da espera (AUTH-02): 0 abaixo de 3 falhas; 30 s dobrando até 15 min.
+
+    Aritmética em inteiros — mesmo precedente do 80% da cota (calls*5 >=
+    4*limit): 0.8*15000 em float dava 12000.000000000002. Falhas 3→30 s,
+    4→60 s, 5→120 s … 9→900 s (teto).
+    """
+    if failures < _LOCK_THRESHOLD:
+        return 0
+    return min(_WAIT_BASE_S * 2 ** (failures - _LOCK_THRESHOLD), _WAIT_CEILING_S)
+
+
+def _blocked_retry_after(conn: sqlite3.Connection, keys: tuple[str, str]) -> tuple[str, int] | None:
+    """Consulta BARATA do bloqueio: sem scrypt, sem escrita (T-04-01).
+
+    Devolve (key_kind, segundos restantes arredondados para cima) do primeiro
+    key com blocked_until no futuro, ou None — o bloqueio não pode custar
+    memória nem dar oracle de tempo ao atacante. blocked_until ilegível não
+    bloqueia (a linha é morta como sessão expirada).
+    """
+    agora = _now()
+    for key_kind, key in (("user", keys[0]), ("ip", keys[1])):
+        row = conn.execute(
+            "SELECT blocked_until FROM login_attempt WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            continue
+        bloqueado_ate = _parse_ts(row["blocked_until"])
+        if bloqueado_ate is None or bloqueado_ate <= agora:
+            continue
+        restante = (bloqueado_ate - agora).total_seconds()
+        return key_kind, max(1, math.ceil(restante))
+    return None
+
+
 def _record_login_failure(conn: sqlite3.Connection, keys: tuple[str, str]) -> None:
-    """Estrutura do upsert de falha por key (AUTH-02); a escada de bloqueio
-    completa — blocked_until e o 429 — é ligada na Task 3 deste plano."""
+    """Upsert de falha por key numa write_tx única (AUTH-02).
+
+    failures só cresce em falha VERIFICADA; do 3º erro em diante o key nasce
+    bloqueado por agora + espera da escada (NULL abaixo do limiar). O log
+    carrega só o KIND do key — nunca o username digitado nem a senha tentada
+    (entrada de atacante não vira log; K2).
+    """
     with write_tx(conn):
         for key in keys:
             conn.execute(
@@ -235,21 +279,59 @@ def _record_login_failure(conn: sqlite3.Connection, keys: tuple[str, str]) -> No
                 """,
                 (key,),
             )
+            failures = conn.execute(
+                "SELECT failures FROM login_attempt WHERE key = ?", (key,)
+            ).fetchone()["failures"]
+            espera = _wait_seconds(failures)
+            bloqueado_ate = None if espera == 0 else _ts(_now() + timedelta(seconds=espera))
+            conn.execute(
+                "UPDATE login_attempt SET blocked_until = ? WHERE key = ?",
+                (bloqueado_ate, key),
+            )
+            log(
+                "warning",
+                "web",
+                "login_failed",
+                key_kind=key.split(":", 1)[0],
+                reason="invalid_credentials",
+                text="falha de login — credenciais inválidas",
+            )
 
 
 @router.post("/api/auth/login")
 def login(request: Request, corpo: LoginRequest) -> Response:
-    """Abre a sessão no servidor e devolve o cookie (limite de tentativas: Task 3)."""
+    """Abre a sessão no servidor e devolve o cookie; resistente a força bruta.
+
+    Ordem barata-primeiro (T-04-01): o bloqueio é consultado ANTES de qualquer
+    scrypt — tentativa bloqueada não disputa slot do semáforo (16 MiB por
+    hashing) e não incrementa contador.
+    """
     settings: Settings = request.app.state.settings
     ip = request.client.host if request.client is not None else ""
+    user_key = f"user:{corpo.username}"
+    ip_key = f"ip:{ip}"
     conn = _open_db(request)
     try:
+        bloqueio = _blocked_retry_after(conn, (user_key, ip_key))
+        if bloqueio is not None:
+            log(
+                "warning",
+                "web",
+                "login_blocked",
+                key_kind=bloqueio[0],
+                text="muitas tentativas — login temporariamente bloqueado",
+            )
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(bloqueio[1])},
+                content={"detail": "muitas tentativas — aguarde e tente novamente"},
+            )
         user = conn.execute(
             "SELECT id, password_hash FROM users WHERE username = ?", (corpo.username,)
         ).fetchone()
         stored = user["password_hash"] if user is not None else _DUMMY_HASH
         if not verify_password(corpo.password, stored):
-            _record_login_failure(conn, (f"user:{corpo.username}", f"ip:{ip}"))
+            _record_login_failure(conn, (user_key, ip_key))
             # MESMA resposta para usuário inexistente e senha errada (T-04-04):
             # mesmo status, mesmo corpo, mesmo tempo (scrypt dummy acima).
             raise HTTPException(status_code=401, detail="usuário ou senha inválidos")
@@ -276,8 +358,11 @@ def login(request: Request, corpo: LoginRequest) -> Response:
                     1 if corpo.remember else 0,
                 ),
             )
+            # Sucesso zera a escada dos DOIS keys na MESMA transação (SC-2).
+            conn.execute("DELETE FROM login_attempt WHERE key IN (?, ?)", (user_key, ip_key))
     finally:
         conn.close()
+    log("info", "web", "login_ok", text="login autorizado — sessão aberta no servidor")
     response = JSONResponse(status_code=200, content={"detail": "sessão aberta"})
     response.set_cookie(
         _COOKIE_NAME,

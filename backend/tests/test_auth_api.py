@@ -364,7 +364,8 @@ def test_escada_da_espera_e_pura_dobra_e_teta_em_15_minutos():
     assert _wait_seconds(3) == 30
     assert _wait_seconds(4) == 60
     assert _wait_seconds(5) == 120
-    assert _wait_seconds(8) == 480
+    assert _wait_seconds(7) == 480
+    assert _wait_seconds(8) == 900  # 960 estoura o teto: min(30*2**5, 900)
     assert _wait_seconds(9) == 900
     assert _wait_seconds(15) == 900  # teto de 15 min
 
@@ -398,7 +399,8 @@ def test_login_bem_sucedido_apaga_os_dois_keys_e_recomeca_a_escada(settings, cap
         assert _cria_admin(client, token).status_code == 201
         for _ in range(2):
             client.post("/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA})
-        assert client.post("/api/auth/login", json={"username": "admin", "password": SENHA}).status_code == 200
+        revalidado = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
+        assert revalidado.status_code == 200
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     try:
         chaves = [row["key"] for row in conn.execute("SELECT key FROM login_attempt")]
