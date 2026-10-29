@@ -9,10 +9,14 @@ senha errada (T-04-04), guard de mutação (415/403) e GET /api/watch mínimo.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
+from baixou.core.config import load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, connect, write_tx
 from baixou.core.migrations import apply_migrations
 from baixou.web.auth import ensure_setup_token
 from baixou.web.main import create_app
+from baixou.web.passwords import token_digest
 from fastapi.testclient import TestClient
 
 SENHA = "senha-super-segura-123"
@@ -204,3 +208,97 @@ def test_origin_divergente_403_e_origem_propria_aceita(settings, capsys):
         )
     assert divergente.status_code == 403
     assert propria.status_code == 401  # passou o guard: só as credenciais falham
+
+
+# --- Fase 4 (plano 04-01, Task 2): "lembrar de mim" (D-10), validade sliding
+# --- (D-11) e Secure do cookie pelo env COOKIE_SECURE (molde WR-01)
+
+
+def _linha_sessao(settings, token_sessao: str):
+    """Linha de sessions pelo digest do token (o banco não guarda o token cru)."""
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE token_hash = ?", (token_digest(token_sessao),)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _admin_logado(settings, capsys, remember: bool = False):
+    """Admin criado e logado; devolve o client (cookie na jarra) e a resposta."""
+    token_setup = _migra_e_pega_token(settings, capsys)
+    client = _client(settings)
+    assert _cria_admin(client, token_setup).status_code == 201
+    resposta = client.post(
+        "/api/auth/login", json={"username": "admin", "password": SENHA, "remember": remember}
+    )
+    assert resposta.status_code == 200
+    return client, resposta
+
+
+def test_lembrar_de_mim_cookie_de_30_dias_e_remember_na_linha(settings, capsys):
+    client, resposta = _admin_logado(settings, capsys, remember=True)
+    assert "max-age=2592000" in resposta.headers["set-cookie"].lower()
+    linha = _linha_sessao(settings, client.cookies.get("baixou_session"))
+    assert linha["remember"] == 1
+    restante = datetime.fromisoformat(linha["expires_at"]) - datetime.now(UTC)
+    assert timedelta(days=29, hours=23) < restante <= timedelta(days=30)
+    client.close()
+
+
+def test_sem_lembrar_cookie_de_sessao_e_validade_de_12_horas(settings, capsys):
+    client, resposta = _admin_logado(settings, capsys, remember=False)
+    assert "max-age=" not in resposta.headers["set-cookie"].lower()
+    linha = _linha_sessao(settings, client.cookies.get("baixou_session"))
+    assert linha["remember"] == 0
+    restante = datetime.fromisoformat(linha["expires_at"]) - datetime.now(UTC)
+    assert timedelta(hours=11) < restante <= timedelta(hours=12)
+    client.close()
+
+
+def test_validade_sliding_reescreve_o_prazo_a_cada_uso(settings, capsys):
+    client, _resposta = _admin_logado(settings, capsys, remember=True)
+    antes = _linha_sessao(settings, client.cookies.get("baixou_session"))["expires_at"]
+    assert client.get("/api/watch").status_code == 200  # uso autenticado renova
+    linha = _linha_sessao(settings, client.cookies.get("baixou_session"))
+    assert linha["expires_at"] > antes  # estritamente maior: TTL cheio de novo (D-11)
+    assert linha["last_used_at"] is not None
+    client.close()
+
+
+def test_sessao_expirada_responde_401_e_apaga_a_linha(settings, capsys):
+    client, _resposta = _admin_logado(settings, capsys, remember=False)
+    token_sessao = client.cookies.get("baixou_session")
+    passado = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        with write_tx(conn):
+            conn.execute(
+                "UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+                (passado, token_digest(token_sessao)),
+            )
+    finally:
+        conn.close()
+    with _client(settings) as fresco:
+        negado = fresco.get("/api/watch", cookies={"baixou_session": token_sessao})
+    assert negado.status_code == 401
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+    finally:
+        conn.close()
+    client.close()
+
+
+def test_cookie_secure_sim_inclui_secure_mesmo_em_http(settings, monkeypatch, capsys):
+    monkeypatch.setenv("COOKIE_SECURE", "sim")
+    client, resposta = _admin_logado(load_settings(), capsys, remember=False)
+    assert "; secure" in resposta.headers["set-cookie"].lower()
+    client.close()
+
+
+def test_cookie_secure_auto_em_http_nao_inclui_secure(settings, capsys):
+    client, resposta = _admin_logado(settings, capsys, remember=False)  # padrão: auto
+    assert "; secure" not in resposta.headers["set-cookie"].lower()
+    client.close()
