@@ -362,6 +362,57 @@ input:focus, select:focus, button:focus {
   font-size: 13px;
 }
 
+/* Formulários de acesso (D-13/D-11) — o .add-block do mockup como molde,
+   com alvos de 44px e os erros inline na cor de erro do design system. */
+.form-acesso {
+  max-width: 480px;
+}
+
+.campo {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.campo input {
+  min-height: 44px;
+}
+
+.erro-campo {
+  color: var(--error-text);
+  font-size: 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  accent-color: var(--accent);
+}
+
+.btn-primario {
+  background: var(--surface);
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 16px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-primario:disabled {
+  cursor: not-allowed;
+  color: var(--muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;

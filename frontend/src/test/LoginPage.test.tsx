@@ -3,7 +3,7 @@
 // rede; a ApiError é construída com status/corpo/retryAfterSeconds por
 // cenário e a contagem usa fake timers. Proibição do plano asserida no fim:
 // localStorage/sessionStorage permanecem vazios.
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,16 +13,30 @@ import LoginPage from "../pages/LoginPage";
 const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }));
 
 vi.mock("../api/client", () => {
-  // Espelho do contrato do client real: status + corpo + Retry-After opcional.
+  // Espelho FIEL do contrato do client real: mesmos argumentos do construtor,
+  // `.message` carregando o detail PT-BR do corpo (o que a página renderiza
+  // no inline) e o Retry-After opcional do 429.
   class ApiError extends Error {
     status: number;
     body: unknown;
     retryAfterSeconds?: number;
-    constructor(status: number, body: unknown, mensagem?: string) {
-      super(mensagem ?? `erro ${status}`);
+    constructor(
+      status: number,
+      body: unknown,
+      mensagem?: string,
+      retryAfterSeconds?: number,
+    ) {
+      const detail =
+        typeof body === "object" && body !== null && "detail" in body
+          ? (body as { detail: unknown }).detail
+          : undefined;
+      super(mensagem ?? (typeof detail === "string" ? detail : `erro ${status}`));
       this.name = "ApiError";
       this.status = status;
       this.body = body;
+      if (retryAfterSeconds !== undefined) {
+        this.retryAfterSeconds = retryAfterSeconds;
+      }
     }
   }
   return {
@@ -39,10 +53,8 @@ vi.mock("../api/client", () => {
   };
 });
 
-function erroDeApi(status: number, body: unknown, retryAfterSeconds?: number): ApiError {
-  const erro = new ApiError(status, body);
-  if (retryAfterSeconds !== undefined) erro.retryAfterSeconds = retryAfterSeconds;
-  return erro;
+function erroDeApi(status: number, detail: string, retryAfterSeconds?: number): ApiError {
+  return new ApiError(status, { detail }, detail, retryAfterSeconds);
 }
 
 function renderLogin() {
@@ -61,11 +73,14 @@ async function submeterCom(
   senha: string,
   lembrar = false,
 ): Promise<void> {
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  const user = userEvent.setup();
   await user.type(screen.getByLabelText("Usuário"), usuario);
   await user.type(screen.getByLabelText("Senha"), senha);
   if (lembrar) await user.click(screen.getByLabelText("lembrar de mim"));
   await user.click(screen.getByRole("button", { name: "Entrar" }));
+  // A rejeição mockada vira estado por microtask — um flush de act basta
+  // (com fake timers o findBy* polla num timer parado e pendura).
+  await act(async () => {});
 }
 
 beforeEach(() => {
@@ -80,7 +95,7 @@ afterEach(() => {
 describe("LoginPage (D-11)", () => {
   it("401 → 'usuário ou senha inválidos' inline (mesmo corpo do contrato de auth.py)", async () => {
     requestMock.mockRejectedValueOnce(
-      erroDeApi(401, { detail: "usuário ou senha inválidos" }),
+      erroDeApi(401, "usuário ou senha inválidos"),
     );
     renderLogin();
     await submeterCom("admin", "senha-super-segura-123");
@@ -88,18 +103,18 @@ describe("LoginPage (D-11)", () => {
   });
 
   it("429 → 'muitas tentativas' inline e botão Entrar desabilitado com contagem mm:ss derivada do Retry-After, reabilitado ao zerar (fake timers)", async () => {
-    vi.useFakeTimers();
+    // SÓ o setInterval é fake: os waits do user-event precisam de setTimeout
+    // REAL (com ele fake, o type/click pendura), e com o interval fake a
+    // contagem mm:ss avança EXCLUSIVAMENTE pelo advanceTimersByTime —
+    // determinístico, sem auto-avanço por tempo real.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     requestMock.mockRejectedValueOnce(
-      erroDeApi(
-        429,
-        { detail: "muitas tentativas — aguarde e tente novamente" },
-        30,
-      ),
+      erroDeApi(429, "muitas tentativas — aguarde e tente novamente", 30),
     );
     renderLogin();
     await submeterCom("admin", "senha-super-segura-123");
 
-    expect(await screen.findByText(/muitas tentativas/)).toBeInTheDocument();
+    expect(screen.getByText(/muitas tentativas/)).toBeInTheDocument();
     const entrar = screen.getByRole("button", { name: "Entrar" });
     expect(entrar).toBeDisabled();
     expect(screen.getByText(/00:30/)).toBeInTheDocument();
@@ -119,17 +134,13 @@ describe("LoginPage (D-11)", () => {
   });
 
   it("contagem deriva do Retry-After da resposta (não de valor fixo)", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     requestMock.mockRejectedValueOnce(
-      erroDeApi(
-        429,
-        { detail: "muitas tentativas — aguarde e tente novamente" },
-        90,
-      ),
+      erroDeApi(429, "muitas tentativas — aguarde e tente novamente", 90),
     );
     renderLogin();
     await submeterCom("admin", "senha-super-segura-123");
-    expect(await screen.findByText(/01:30/)).toBeInTheDocument();
+    expect(screen.getByText(/01:30/)).toBeInTheDocument();
   });
 
   it("checkbox 'lembrar de mim' marcada envia remember: true no corpo", async () => {
@@ -161,7 +172,7 @@ describe("LoginPage (D-11)", () => {
 
   it("os fluxos não tocam localStorage nem sessionStorage (proibição do plano)", async () => {
     requestMock.mockRejectedValueOnce(
-      erroDeApi(401, { detail: "usuário ou senha inválidos" }),
+      erroDeApi(401, "usuário ou senha inválidos"),
     );
     renderLogin();
     await submeterCom("admin", "senha-super-segura-123");

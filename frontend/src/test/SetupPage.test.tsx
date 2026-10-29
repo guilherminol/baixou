@@ -13,15 +13,30 @@ import SetupPage from "../pages/SetupPage";
 const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }));
 
 vi.mock("../api/client", () => {
+  // Espelho FIEL do contrato do client real: mesmos argumentos do construtor
+  // e `.message` carregando o detail PT-BR do corpo (o que a página
+  // renderiza no inline).
   class ApiError extends Error {
     status: number;
     body: unknown;
     retryAfterSeconds?: number;
-    constructor(status: number, body: unknown, mensagem?: string) {
-      super(mensagem ?? `erro ${status}`);
+    constructor(
+      status: number,
+      body: unknown,
+      mensagem?: string,
+      retryAfterSeconds?: number,
+    ) {
+      const detail =
+        typeof body === "object" && body !== null && "detail" in body
+          ? (body as { detail: unknown }).detail
+          : undefined;
+      super(mensagem ?? (typeof detail === "string" ? detail : `erro ${status}`));
       this.name = "ApiError";
       this.status = status;
       this.body = body;
+      if (retryAfterSeconds !== undefined) {
+        this.retryAfterSeconds = retryAfterSeconds;
+      }
     }
   }
   return {
@@ -95,11 +110,15 @@ describe("SetupPage (D-13)", () => {
 
   it("422 do envelope D-08 → o problema do campo renderiza inline junto ao campo (password)", async () => {
     requestMock.mockRejectedValueOnce(
-      new ApiError(422, {
-        erros: [
-          { symbol: null, campo: "password", problema: "a senha deve ter pelo menos 12 caracteres" },
-        ],
-      }),
+      new ApiError(
+        422,
+        {
+          erros: [
+            { symbol: null, campo: "password", problema: "a senha deve ter pelo menos 12 caracteres" },
+          ],
+        },
+        "a senha deve ter pelo menos 12 caracteres",
+      ),
     );
     renderSetup();
     await submeter({ senha: "curta", confirmacao: "curta" });
@@ -114,9 +133,13 @@ describe("SetupPage (D-13)", () => {
 
   it("422 do envelope D-08 → problema de username fica sob o campo username", async () => {
     requestMock.mockRejectedValueOnce(
-      new ApiError(422, {
-        erros: [{ symbol: null, campo: "username", problema: "informe um nome de usuário" }],
-      }),
+      new ApiError(
+        422,
+        {
+          erros: [{ symbol: null, campo: "username", problema: "informe um nome de usuário" }],
+        },
+        "informe um nome de usuário",
+      ),
     );
     renderSetup();
     await submeter({});
@@ -147,7 +170,7 @@ describe("SetupPage (D-13)", () => {
 
   it("401 (token inválido) → 'token inválido' inline", async () => {
     requestMock.mockRejectedValueOnce(
-      new ApiError(401, { detail: "token inválido" }),
+      new ApiError(401, { detail: "token inválido" }, "token inválido"),
     );
     renderSetup();
     await submeter({});
@@ -156,7 +179,11 @@ describe("SetupPage (D-13)", () => {
 
   it("403 (admin já existe) → navega para /login", async () => {
     requestMock.mockRejectedValueOnce(
-      new ApiError(403, { detail: "o administrador já existe — use o login" }),
+      new ApiError(
+        403,
+        { detail: "o administrador já existe — use o login" },
+        "o administrador já existe — use o login",
+      ),
     );
     renderSetup();
     await submeter({});
