@@ -1,0 +1,134 @@
+/*
+ * Tela /status (UI-02) — consome as MESMAS variáveis do global.css (D-01:
+ * fonte única do design system, nunca valores literais) na densidade do
+ * mockup: linhas de 44px, divisores 1px var(--border), sem sombras.
+ * Seções e títulos reutilizam .market-section/.market-title/.table-wrap do
+ * global.css; aqui vive só o que é próprio da tela (rodadas, barra de cota,
+ * linhas de fonte/canal, faixa de nenhum canal).
+ */
+
+/* Rodadas (D-03): grid de dois valores — rótulo uppercase muted acima do
+   número mono (a hierarquia th/td do mockup em forma de grade). */
+.rodadas-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 12px 8px;
+  background: var(--surface);
+}
+
+.rodada {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rodada .rotulo {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+/* Cota da brapi (D-16): track fino de 4px na cor de borda, fill accent
+   proporcional a usadas/limite (satura em 100%) e o marcador de 2px FIXO na
+   posição 80% — o ponto do aviso único. Posição é estilo inline do componente;
+   aqui só a forma. */
+.cota-bloco {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 8px;
+  background: var(--surface);
+}
+
+.cota-barra {
+  position: relative;
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.cota-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--accent);
+  border-radius: 2px;
+  max-width: 100%;
+}
+
+.cota-marcador {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--muted);
+}
+
+/* O marcador alcançado pelo fill (cota ≥ 80%) ganha destaque na cor de erro —
+   decisão de exibição do plano ("se o marcador cair dentro do fill,
+   destaque-o"); nenhum limiar de estado nasce aqui. */
+.cota-marcador.atingido {
+  background: var(--error-text);
+}
+
+.cota-numeros {
+  min-width: 96px;
+  text-align: right;
+}
+
+/* Fontes (D-14) e canais (D-15): uma linha por item dentro do .table-wrap
+   (molde das listas) — 44px de densidade, divisores 1px, nomes mono. */
+.linha {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.linha:last-child {
+  border-bottom: none;
+}
+
+.fonte-extra {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Estado de fonte em destaque (D-14): "erro" e "falha prolongada" na cor de
+   erro do design system, SEMPRE com o texto legível ao lado do nome — a cor
+   nunca é a única portadora do estado. */
+.fonte-destaque {
+  color: var(--error-text);
+  font-weight: 600;
+}
+
+.fonte-sucesso {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.canal-resultado {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Faixa fixa "nenhum canal configurado" (literal UI-02, D-15): a linguagem do
+   banner do mockup (1px, raio 2px, 12px), mas INFORMATIVA — não é erro de
+   sistema, então as cores neutras em vez de --error-*. */
+.faixa-informativa {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--muted);
+  padding: 8px 12px;
+  font-size: 12px;
+}

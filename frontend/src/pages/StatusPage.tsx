@@ -1,16 +1,221 @@
+import { useEffect, useState } from "react";
 import AppHeader from "../components/AppHeader";
+import { buscarStatus, type StatusResponse } from "../api/status";
+import { formatTime, timeAgoMinutes } from "../lib/format";
+import "../styles/status.css";
 
-// Skeleton da tela de status — a tela completa (fontes D-14, canais D-15,
-// cota D-16) é o plano 05-04. O shell comum (cabeçalho com abas) já é o
-// definitivo.
+// Tela /status (UI-02): o painel de operação do admin — quando o aviso não
+// sai, esta tela diz por quê (fonte com erro nomeada, cota esgotada, canal
+// sem configuração). Tudo vem de UM endpoint: o GET /api/status (D-03), cujos
+// estados nascem DERIVADOS NO SERVIDOR — o navegador nunca calcula limiar
+// (D-02): só consome `estado` da fonte, `configurado` do canal e a cota
+// pronta. A única aritmética daqui é de EXIBIÇÃO (largura da barra).
+
+const INTERVALO_POLLING_MS = 60_000; // mesmo ciclo da página de alertas
+const POSICAO_MARCADOR = 80; // D-16: o ponto do aviso único (80% da cota)
+
+type StatusFonte = StatusResponse["fontes"][number];
+type StatusCanal = StatusResponse["canais"][number];
+
+/** Meta-line do cabeçalho (D-03) — a MESMA derivação da página de alertas:
+ * "Última consulta há X min · próxima em Y min · cota Z/W" em pt-BR. */
+function metaDoStatus(status: StatusResponse): string {
+  const ultima = status.ultima_rodada
+    ? `há ${timeAgoMinutes(status.ultima_rodada)} min`
+    : "—";
+  const proxima = Math.max(
+    0,
+    Math.round((new Date(status.proxima_rodada).getTime() - Date.now()) / 60000),
+  );
+  return `Última consulta ${ultima} · próxima em ${proxima} min · cota ${status.cota.usadas.toLocaleString("pt-BR")}/${status.cota.limite.toLocaleString("pt-BR")}`;
+}
+
+/** Estado da fonte em TEXTO legível (D-14): o enum vem pronto do servidor
+ * ("operacional" | "erro" | "falha_prolongada"); só o snake_case vira espaço. */
+export function textoEstadoFonte(estado: string): string {
+  if (estado === "falha_prolongada") return "falha prolongada";
+  return estado;
+}
+
+/** Classe do estado da fonte (D-14): erro e falha prolongada ganham destaque
+ * na cor de erro do design system — estado sempre além da cor, nunca só ela. */
+export function classeEstadoFonte(estado: string): string {
+  return estado === "operacional" ? "tag-state" : "tag-state fonte-destaque";
+}
+
+/** Largura do fill da barra de cota (D-16) — aritmética de EXIBIÇÃO
+ * (usadas/limite), não de estado: satura em 100%; limite 0 → 0 (sem cota). */
+export function larguraFill(usadas: number, limite: number): number {
+  if (limite <= 0) return 0;
+  return Math.min(100, (usadas / limite) * 100);
+}
+
+/** Linha de UMA fonte (D-14, literal UI-02): o NOME da fonte está na linha do
+ * erro — estado em texto, "N rodadas seguidas" quando houver falhas, o último
+ * erro quando existir e a hora do último sucesso ("—" quando null). */
+function linhaFonte(fonte: StatusFonte) {
+  return (
+    <div className="linha" data-testid={`fonte-${fonte.nome}`}>
+      <span className="symbol-cell">{fonte.nome}</span>
+      <span className={classeEstadoFonte(fonte.estado)}>
+        {textoEstadoFonte(fonte.estado)}
+      </span>
+      {fonte.falhas_seguidas > 0 ? (
+        <span className="fonte-extra">
+          {fonte.falhas_seguidas} rodadas seguidas
+        </span>
+      ) : null}
+      {fonte.ultimo_erro ? (
+        <span className="fonte-extra">último erro: {fonte.ultimo_erro}</span>
+      ) : null}
+      <span className="num fonte-sucesso">
+        último sucesso {formatTime(fonte.ultimo_sucesso)}
+      </span>
+    </div>
+  );
+}
+
+/** Linha de UM canal (D-15): nome, configurado ou não em texto e o último
+ * resultado conhecido VERBATIM da API (ex. "erro unavailable (HTTP 500)").
+ * Nenhum segredo passa por aqui: o contrato só expõe nome/booleano (K2). */
+function linhaCanal(canal: StatusCanal) {
+  return (
+    <div className="linha" data-testid={`canal-${canal.nome}`}>
+      <span className="symbol-cell">{canal.nome}</span>
+      <span className="tag-state">
+        {canal.configurado ? "configurado" : "não configurado"}
+      </span>
+      {canal.ultimo_resultado ? (
+        <span className="canal-resultado">{canal.ultimo_resultado}</span>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Tela /status (UI-02): Rodadas, Cota da brapi (barra D-16), Fontes (D-14) e
+ * Canais (D-15), com polling de 60 s no mesmo ciclo da página de alertas. O
+ * 401 segue o default do app (o handler global navega para /login — não há
+ * edição a preservar aqui, então esta página NÃO registra handler próprio).
+ */
 export default function StatusPage() {
+  const [status, setStatus] = useState<StatusResponse | null>(null);
+
+  useEffect(() => {
+    let vivo = true;
+    async function carregar() {
+      try {
+        const estado = await buscarStatus();
+        if (vivo) setStatus(estado);
+      } catch {
+        // 401 já disparou o handler global (redirect default); erro de rede
+        // preserva o estado atual — a leitura nunca derruba a tela.
+      }
+    }
+    void carregar();
+    const id = window.setInterval(() => void carregar(), INTERVALO_POLLING_MS);
+    return () => {
+      vivo = false;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  if (status === null) {
+    return (
+      <main className="container">
+        <AppHeader meta="Aguardando dados..." />
+      </main>
+    );
+  }
+
+  const semCota = status.cota.limite <= 0;
+  const fill = larguraFill(status.cota.usadas, status.cota.limite);
+  const nenhumCanal = status.canais.every((canal) => !canal.configurado);
+
   return (
     <main className="container">
-      <AppHeader />
-      <p className="empty-state">
-        Tela de status em construção — fontes, canais e cota chegam no plano
-        05-04.
-      </p>
+      <AppHeader meta={metaDoStatus(status)} />
+
+      <section className="market-section">
+        <h2 className="market-title">Rodadas</h2>
+        <div className="table-wrap">
+          <div className="rodadas-grid">
+            <div className="rodada">
+              <span className="rotulo">última</span>
+              {/* null → "—" (formatTime); próxima é SEMPRE presente (D-04). */}
+              <span className="num" data-testid="rodada-ultima">
+                {formatTime(status.ultima_rodada)}
+              </span>
+            </div>
+            <div className="rodada">
+              <span className="rotulo">próxima</span>
+              <span className="num" data-testid="rodada-proxima">
+                {formatTime(status.proxima_rodada)}
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="market-section">
+        <h2 className="market-title">Cota da brapi</h2>
+        <div className="table-wrap">
+          <div className="cota-bloco">
+            {/* D-16: barra fina com o marcador FIXO na posição 80% — o ponto
+                do aviso único. A classe .atingido é display (fill passou do
+                marcador), nunca limiar de estado no cliente. */}
+            <div
+              className="cota-barra"
+              role="img"
+              aria-label={`cota da brapi: ${status.cota.usadas} de ${status.cota.limite} chamadas no mês`}
+            >
+              <div
+                className="cota-fill"
+                data-testid="cota-fill"
+                style={{ width: `${fill}%` }}
+              />
+              <div
+                className={
+                  "cota-marcador" + (fill >= POSICAO_MARCADOR ? " atingido" : "")
+                }
+                data-testid="cota-marcador"
+                style={{ left: `${POSICAO_MARCADOR}%` }}
+              />
+            </div>
+            <span className="num cota-numeros" data-testid="cota-numeros">
+              {semCota
+                ? "—"
+                : `${status.cota.usadas.toLocaleString("pt-BR")}/${status.cota.limite.toLocaleString("pt-BR")}`}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section className="market-section">
+        <h2 className="market-title">Fontes</h2>
+        <div className="table-wrap">
+          {status.fontes.map((fonte) => (
+            <div key={fonte.nome}>{linhaFonte(fonte)}</div>
+          ))}
+        </div>
+      </section>
+
+      <section className="market-section">
+        <h2 className="market-title">Canais</h2>
+        {nenhumCanal ? (
+          // Literal UI-02 (D-15): faixa fixa INFORMATIVA no lugar das linhas —
+          // não é erro de sistema, é o estado vazio dos canais.
+          <div className="faixa-informativa" role="status">
+            nenhum canal configurado
+          </div>
+        ) : (
+          <div className="table-wrap">
+            {status.canais.map((canal) => (
+              <div key={canal.nome}>{linhaCanal(canal)}</div>
+            ))}
+          </div>
+        )}
+      </section>
     </main>
   );
 }
