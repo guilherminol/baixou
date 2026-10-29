@@ -10,8 +10,12 @@ congelado (WATCH-01/WATCH-02, D-06/D-07/D-08).
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import replace
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 from baixou.core.db import WEB_TIMEOUT_S, connect
 from baixou.core.migrations import apply_migrations
@@ -213,3 +217,370 @@ def test_get_sem_sessao_responde_401(settings, capsys):
     with TestClient(create_app(settings)) as anonimo:
         negado = anonimo.get("/api/watch")
     assert negado.status_code == 401
+
+
+# --- Task 2: POST/PATCH/DELETE item a item — validação híbrida D-03 e recusas
+# --- D-02/D-04/D-05/D-08 (SC-4)
+
+# Quarta 16:00 UTC = 13:00 em Brasília: dentro do pregão B3 (molde test_round).
+_QUARTA_16H = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
+# Domingo 15:00 UTC = 12:00 em Brasília: fora do pregão (SC-1).
+_DOMINGO = datetime(2026, 11, 1, 15, 0, 0, tzinfo=UTC)
+
+
+def _violento(request: httpx.Request) -> httpx.Response:
+    """Transporte que levanta se chamado — prova que a rede NEM SAIU (D-03)."""
+    raise AssertionError(f"rede não deveria ter sido chamada: {request.url.host}")
+
+
+def _injeta_transporte(monkeypatch, handler, requests: list[httpx.Request]) -> None:
+    """Roteia o cliente de validação para MockTransport (zero rede real).
+
+    Import tardio e emenda em ``watch._cliente_validacao``: na fase RED o
+    módulo de validação ainda não existe e a coleção da suíte não pode quebrar.
+    """
+    from baixou.web import watch
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        watch,
+        "_cliente_validacao",
+        lambda: httpx.Client(transport=httpx.MockTransport(recording)),
+        raising=False,
+    )
+
+
+def _congela_relogio(monkeypatch, now_utc: datetime) -> None:
+    """Congela o relógio da validação D-03 (import tardio — módulo nasce no GREEN)."""
+    from baixou.web import symbol_validation
+
+    class _Congelado(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now_utc.astimezone(tz)
+            return now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(symbol_validation, "datetime", _Congelado)
+
+
+def _simbolo_inexistente_binance(request: httpx.Request) -> httpx.Response:
+    """Lote e 1-a-1 da Binance recusam com 400 -1121 (símbolo inválido)."""
+    return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+
+def test_post_cripto_valido_cadastra_201_e_normaliza(settings, capsys, monkeypatch):
+    """POST normaliza para MAIÚSCULAS (D-05), valida na fonte e devolve o item."""
+    client = _admin_logado(settings, capsys)
+    requests: list[httpx.Request] = []
+
+    def binance_ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"symbol": "SOLUSDT", "price": "96.5"}])
+
+    _injeta_transporte(monkeypatch, binance_ok, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": " solusdt ", "market": "crypto", "target_below": 90.0},
+    )
+    assert resposta.status_code == 201
+    assert resposta.json() == {
+        "symbol": "SOLUSDT",
+        "market": "crypto",
+        "target_below": 90.0,
+        "currency": "US$",
+        "price": None,
+        "price_at": None,
+        "change_pct": None,
+        "alerted": False,
+        "alerted_at": None,
+        "notify_state": None,
+    }
+    assert json.loads(requests[0].url.params["symbols"]) == ["SOLUSDT"]  # normalizado
+    conn = _conn(settings)
+    try:
+        linha = conn.execute("SELECT * FROM quote WHERE symbol = 'SOLUSDT'").fetchone()
+        assert linha is not None
+        assert linha["alerted"] == 0 and linha["notify_state"] is None  # ciclo NOVO (D-02)
+    finally:
+        conn.close()
+
+
+def test_post_b3_fora_do_pregao_aceita_sem_chamar_a_brapi(settings, capsys, monkeypatch):
+    """D-03: fora do pregão o cadastro B3 é aceito SEM rede — a 1ª rodada valida."""
+    client = _admin_logado(settings, capsys)
+    _congela_relogio(monkeypatch, _DOMINGO)
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)  # levantaria se chamado
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "petr4", "market": "b3", "target_below": 38.5},
+    )
+    assert resposta.status_code == 201
+    assert requests == []  # prova: nenhuma chamada saiu
+    symbols = [i["symbol"] for i in client.get("/api/watch").json()["itens"]]
+    assert symbols == ["PETR4"]  # D-05: normalizado para maiúsculas
+
+
+def test_post_b3_em_pregao_inexistente_recusa_422(settings, capsys, monkeypatch):
+    """Em pregão, símbolo B3 inexistente (brapi 404) → 422 nomeando o ticker."""
+    client = _admin_logado(settings, capsys)
+    _congela_relogio(monkeypatch, _QUARTA_16H)
+    requests: list[httpx.Request] = []
+
+    def brapi_404(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "brapi.dev"
+        return httpx.Response(404, json={"message": "not found"})
+
+    _injeta_transporte(monkeypatch, brapi_404, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "nope4", "market": "b3", "target_below": 10.0},
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {"symbol": "NOPE4", "campo": "symbol", "problema": "símbolo não encontrado na fonte"}
+        ]
+    }
+    conn = _conn(settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_post_cripto_inexistente_recusa_422(settings, capsys, monkeypatch):
+    """Cripto inexistente (400 -1121 da Binance) → 422 nomeando o símbolo."""
+    client = _admin_logado(settings, capsys)
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _simbolo_inexistente_binance, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "BOGUS", "market": "crypto", "target_below": 1.0},
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {"symbol": "BOGUS", "campo": "symbol", "problema": "símbolo não encontrado na fonte"}
+        ]
+    }
+    conn = _conn(settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_post_duplicado_recusa_422_sem_tocar_o_banco(settings, capsys, monkeypatch):
+    """D-05: 'petr4' e 'PETR4' são o MESMO item — duplicado é recusa local, sem rede."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "petr4", "market": "b3", "target_below": 20.0},
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {"symbol": "PETR4", "campo": "symbol", "problema": "o símbolo já está na lista"}
+        ]
+    }
+    assert requests == []  # duplicado por SELECT ANTES de qualquer rede
+    conn = _conn(settings)
+    try:
+        linha = conn.execute("SELECT target_below FROM watch WHERE symbol = 'PETR4'").fetchone()
+        assert linha["target_below"] == 38.5  # banco intocado
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("alvo", [0, -1.5])
+def test_post_alvo_invalido_recusa_422(alvo, settings, capsys):
+    """Alvo <= 0 → 422 envelope D-08 com campo e problema exatos (SC-4)."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "PETR4", "market": "b3", "target_below": alvo},
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [
+            {"symbol": "PETR4", "campo": "target_below", "problema": "o alvo deve ser maior que zero"}
+        ]
+    }
+
+
+def test_post_market_invalido_fala_o_dialeto_do_envelope(settings, capsys):
+    """Erro de FORMA do pydantic sai no MESMO envelope D-08 (handler em main.py)."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "PETR4", "market": "acoes", "target_below": 10.0},
+    )
+    assert resposta.status_code == 422
+    assert resposta.json() == {
+        "erros": [{"symbol": "PETR4", "campo": "market", "problema": "market deve ser b3 ou crypto"}]
+    }
+
+
+def test_falha_de_rede_na_validacao_responde_503_nunca_422(settings, capsys, monkeypatch):
+    """D-04: rede/timeout → 503 'tente de novo' — nunca disfarçado de 422."""
+    client = _admin_logado(settings, capsys)
+    requests: list[httpx.Request] = []
+
+    def caindo(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    _injeta_transporte(monkeypatch, caindo, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "BTCUSDT", "market": "crypto", "target_below": 100.0},
+    )
+    assert resposta.status_code == 503
+    assert resposta.json() == {
+        "detail": "fonte indisponível para validar o símbolo — tente de novo"
+    }
+    conn = _conn(settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_token_da_brapi_nao_vaza_na_recusa_de_validacao(settings, capsys, monkeypatch):
+    """T-04-08: falha de transporte com token na query — o valor NUNCA aparece."""
+    marcador = "segredo-brapi-nao-vazar"
+    com_token = replace(settings, brapi_token=marcador)
+    client = _admin_logado(com_token, capsys)
+    _congela_relogio(monkeypatch, _QUARTA_16H)  # em pregão: a brapi seria chamada
+    requests: list[httpx.Request] = []
+
+    def caindo(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    _injeta_transporte(monkeypatch, caindo, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "PETR4", "market": "b3", "target_below": 30.0},
+    )
+    assert resposta.status_code == 503
+    assert marcador not in resposta.text
+    assert marcador not in capsys.readouterr().out  # K2: nem no log
+
+
+def test_patch_muda_o_alvo_e_normaliza_o_caminho(settings, capsys):
+    """PATCH /api/watch/petr4/b3 → 200 com o alvo novo; caminho normalizado (D-05)."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    resposta = client.patch("/api/watch/petr4/b3", json={"target_below": 30})
+    assert resposta.status_code == 200
+    assert resposta.json()["symbol"] == "PETR4"
+    assert resposta.json()["target_below"] == 30.0
+    lista = client.get("/api/watch").json()["itens"]
+    assert lista[0]["target_below"] == 30.0
+
+
+def test_patch_alvo_invalido_recusa_422(settings, capsys):
+    """PATCH herda o gt=0 do modelo e o dialeto D-08 do handler."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.patch("/api/watch/PETR4/b3", json={"target_below": 0})
+    assert resposta.status_code == 422
+    assert resposta.json()["erros"][0]["campo"] == "target_below"
+
+
+def test_patch_de_inexistente_responde_404(settings, capsys):
+    """PATCH de item fora da lista → 404 com detail fixo, sem alterar nada."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.patch("/api/watch/NOPE4/b3", json={"target_below": 30})
+    assert resposta.status_code == 404
+    assert resposta.json() == {"detail": "item não encontrado"}
+
+
+def test_delete_remove_a_watch_204_e_patch_seguinte_404(settings, capsys):
+    """DELETE → 204 e a linha de watch some; o PATCH seguinte confirma a remoção."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(conn, "PETR4", "b3", price=35.0, alerted=1)
+    finally:
+        conn.close()
+    resposta = client.delete("/api/watch/PETR4/b3")
+    assert resposta.status_code == 204
+    assert resposta.content == b""
+    conn = _conn(settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 0
+    finally:
+        conn.close()
+    depois = client.patch("/api/watch/PETR4/b3", json={"target_below": 30})
+    assert depois.status_code == 404
+
+
+def test_delete_de_inexistente_responde_404(settings, capsys):
+    """DELETE de item fora da lista → 404, nada apagado."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.delete("/api/watch/NOPE4/b3")
+    assert resposta.status_code == 404
+    assert resposta.json() == {"detail": "item não encontrado"}
+
+
+def test_recriar_apos_delete_comeca_ciclo_novo(settings, capsys, monkeypatch):
+    """D-02: recriar sobreõe a quote — alerted=0 e histórico de alerta NULL.
+
+    A quarentena da Fase 2 (last_fetch_error='not_found') é limpa por aqui:
+    o estado de alerta nunca atravessa uma remoção.
+    """
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.0,
+            alerted=1,
+            alerted_at="2026-10-28T16:05:00Z",
+            alerted_target=38.5,
+            notify_state='{"telegram": "ok"}',
+        )
+        conn.execute(
+            "UPDATE quote SET last_fetch_error = 'not_found' WHERE symbol = 'PETR4'"
+        )
+    finally:
+        conn.close()
+    assert client.delete("/api/watch/PETR4/b3").status_code == 204
+    _congela_relogio(monkeypatch, _DOMINGO)  # fora do pregão: 201 sem rede
+    requests: list[httpx.Request] = []
+    _injeta_transporte(monkeypatch, _violento, requests)
+    resposta = client.post(
+        "/api/watch",
+        json={"symbol": "petr4", "market": "b3", "target_below": 38.5},
+    )
+    assert resposta.status_code == 201
+    conn = _conn(settings)
+    try:
+        linha = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    finally:
+        conn.close()
+    assert linha["alerted"] == 0
+    assert linha["alerted_at"] is None
+    assert linha["alerted_target"] is None
+    assert linha["notify_state"] is None
+    assert linha["last_fetch_error"] is None  # quarentena da Fase 2 limpa
+
