@@ -178,10 +178,34 @@ def test_watch_protegida_lista_itens_ordenados(settings, capsys):
         )
         resposta = client.get("/api/watch")
     assert resposta.status_code == 200
+    # Forma completa desde o 04-02 (quote via LEFT JOIN + moeda de currency_for)
+    # — o mínimo do tracer 04-01 foi substituído pelo contrato congelado do plano.
     assert resposta.json() == {
         "itens": [
-            {"symbol": "PETR4", "market": "b3", "target_below": 38.5},
-            {"symbol": "BTCUSDT", "market": "crypto", "target_below": 350000.0},
+            {
+                "symbol": "PETR4",
+                "market": "b3",
+                "target_below": 38.5,
+                "currency": "R$",
+                "price": None,
+                "price_at": None,
+                "change_pct": None,
+                "alerted": False,
+                "alerted_at": None,
+                "notify_state": None,
+            },
+            {
+                "symbol": "BTCUSDT",
+                "market": "crypto",
+                "target_below": 350000.0,
+                "currency": "US$",
+                "price": None,
+                "price_at": None,
+                "change_pct": None,
+                "alerted": False,
+                "alerted_at": None,
+                "notify_state": None,
+            },
         ]
     }  # ORDER BY market, symbol: b3 antes de crypto
 

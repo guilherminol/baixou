@@ -43,9 +43,7 @@ def _admin_logado(settings, capsys) -> TestClient:
         == 201
     )
     assert (
-        client.post(
-            "/api/auth/login", json={"username": "admin", "password": SENHA}
-        ).status_code
+        client.post("/api/auth/login", json={"username": "admin", "password": SENHA}).status_code
         == 200
     )
     return client
@@ -86,7 +84,17 @@ def _seed_quote(
             alerted, alerted_at, alerted_target, notify_state)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (symbol, market, price, price_at, change_pct, alerted, alerted_at, alerted_target, notify_state),
+        (
+            symbol,
+            market,
+            price,
+            price_at,
+            change_pct,
+            alerted,
+            alerted_at,
+            alerted_target,
+            notify_state,
+        ),
     )
 
 
