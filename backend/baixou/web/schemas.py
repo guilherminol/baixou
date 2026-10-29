@@ -66,6 +66,17 @@ class PatchWatch(BaseModel):
     target_below: float = Field(gt=0)
 
 
+class PutWatch(BaseModel):
+    """Corpo do PUT /api/watch em lote (D-06): cria/edita numa transação única.
+
+    ``min_length=1``: PUT com corpo vazio é erro de FORMA (422). O lote NUNCA
+    remove (D-07): itens ausentes do corpo permanecem — remoção existe só
+    pelo DELETE explícito.
+    """
+
+    itens: list[WatchItem] = Field(min_length=1)
+
+
 def erro_item(symbol: str | None, campo: str, problema: str) -> dict:
     """Monta UMA entrada do envelope D-08 (PT-BR em ``problema``)."""
     return {"symbol": symbol, "campo": campo, "problema": problema}

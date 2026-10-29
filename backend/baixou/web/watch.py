@@ -28,7 +28,7 @@ from baixou.core.currency import currency_for
 from baixou.core.db import WEB_TIMEOUT_S, connect, write_tx
 from baixou.web import symbol_validation
 from baixou.web.auth import Sessao
-from baixou.web.schemas import PatchWatch, WatchItem, WatchListResponse, erro_item
+from baixou.web.schemas import PatchWatch, PutWatch, WatchItem, WatchListResponse, erro_item
 from baixou.worker.sources.base import SourceError, SymbolNotFoundError
 
 router = APIRouter()
@@ -240,3 +240,80 @@ def remover(request: Request, symbol: str, market: str, usuario: Sessao):  # noq
     finally:
         conn.close()
     return Response(status_code=204)
+
+
+@router.put("/api/watch", response_model=WatchListResponse)
+def salvar_lote(
+    request: Request, corpo: PutWatch, usuario: Sessao
+) -> WatchListResponse | JSONResponse:
+    """PUT em lote TUDO-OU-NADA: cria/edita os itens do corpo, NUNCA remove (D-06/D-07).
+
+    Ordem OBRIGATÓRIA do pipeline: (1) normaliza todos os símbolos (D-05);
+    (2) a forma e o alvo de cada item já saíram do pydantic (erros de forma
+    viram D-08 pelo handler de RequestValidationError); (3) duplicados DENTRO
+    do corpo, pós-normalização; (4) leitura FORA de transação separa novos de
+    existentes; (5) fonte SÓ dos novos — rede FORA de qualquer transação
+    (disciplina WAL; mesmas regras D-03/D-04 do POST); (6) SÓ ENTÃO UMA
+    ``write_tx``: INSERT dos novos (com o reset da quote, D-02) e UPDATE do
+    alvo dos existentes — sem DELETE em lugar nenhum (D-07). Qualquer recusa
+    nos passos 2–5 responde 422 com TODOS os erros acumulados sem ter aberto
+    transação; falha de rede no passo 5 → 503. A resposta devolve a lista
+    atualizada completa (mesma forma do GET) para a Fase 5 re-renderizar.
+    """
+    del usuario
+    settings = request.app.state.settings
+    erros: list[dict] = []
+    itens = [(_normalizar(item.symbol), item.market, item.target_below) for item in corpo.itens]
+    # Duplicado DENTRO do corpo pós-normalização: TODAS as ocorrências de uma
+    # chave repetida são nomeadas ("os dois" do D-08 — um item por erro).
+    repeticoes: dict[tuple[str, str], int] = {}
+    for symbol, market, _alvo in itens:
+        if symbol:
+            repeticoes[(symbol, market)] = repeticoes.get((symbol, market), 0) + 1
+    for symbol, market, _alvo in itens:
+        if not symbol:
+            erros.append(erro_item(None, "symbol", "informe o símbolo do ativo"))
+            continue
+        if repeticoes[(symbol, market)] > 1:
+            erros.append(erro_item(symbol, "symbol", "símbolo repetido no lote"))
+    conn = _abrir(request)
+    try:
+        existentes = {
+            (row["symbol"], row["market"])
+            for row in conn.execute("SELECT symbol, market FROM watch")
+        }
+        novos = [item for item in itens if item[0] and (item[0], item[1]) not in existentes]
+        if novos:  # passo 5: rede FORA de transação — a recusa nunca abriu write_tx
+            cliente = _cliente_validacao()
+            try:
+                for symbol, market, _alvo in novos:
+                    try:
+                        symbol_validation.validar(cliente, settings, symbol, market)
+                    except SymbolNotFoundError:
+                        erros.append(erro_item(symbol, "symbol", _MSG_INEXISTENTE_FONTE))
+                    except SourceError:
+                        return JSONResponse(
+                            status_code=503, content={"detail": _MSG_FONTE_INDISPONIVEL}
+                        )
+            finally:
+                cliente.close()
+        if erros:
+            return JSONResponse(status_code=422, content={"erros": erros})
+        with write_tx(conn):  # passo 6: transação ÚNICA e curta (T-04-07)
+            for symbol, market, alvo in itens:
+                if not symbol:
+                    continue
+                if (symbol, market) in existentes:
+                    conn.execute(
+                        "UPDATE watch SET target_below = ? WHERE symbol = ? AND market = ?",
+                        (alvo, symbol, market),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO watch (symbol, market, target_below) VALUES (?, ?, ?)",
+                        (symbol, market, alvo),
+                    )
+                    conn.execute(_RESET_QUOTE, (symbol, market))  # ciclo NOVO (D-02)
+        return WatchListResponse(itens=_listar_itens(conn))
+    finally:
+        conn.close()
