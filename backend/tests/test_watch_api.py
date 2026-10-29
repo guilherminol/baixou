@@ -674,8 +674,10 @@ def test_delete_remove_a_watch_204_e_patch_seguinte_404(settings, capsys):
         _seed_quote(conn, "PETR4", "b3", price=35.0, alerted=1)
     finally:
         conn.close()
-    # mutante exige JSON (guard 04-01); o delete() do httpx não leva corpo
-    resposta = client.request("DELETE", "/api/watch/PETR4/b3", json={})
+    # SEM corpo — a forma que o contrato congelado declara: DELETE sem
+    # requestBody no openapi.json, e o guard só exige JSON em mutação COM
+    # corpo (WR-01, opção (a) do 04-05)
+    resposta = client.delete("/api/watch/PETR4/b3")
     assert resposta.status_code == 204
     assert resposta.content == b""
     conn = _conn(settings)
@@ -690,7 +692,7 @@ def test_delete_remove_a_watch_204_e_patch_seguinte_404(settings, capsys):
 def test_delete_de_inexistente_responde_404(settings, capsys):
     """DELETE de item fora da lista → 404, nada apagado."""
     client = _admin_logado(settings, capsys)
-    resposta = client.request("DELETE", "/api/watch/NOPE4/b3", json={})
+    resposta = client.delete("/api/watch/NOPE4/b3")
     assert resposta.status_code == 404
     assert resposta.json() == {"detail": "item não encontrado"}
 
@@ -718,7 +720,8 @@ def test_recriar_apos_delete_comeca_ciclo_novo(settings, capsys, monkeypatch):
         conn.execute("UPDATE quote SET last_fetch_error = 'not_found' WHERE symbol = 'PETR4'")
     finally:
         conn.close()
-    assert client.request("DELETE", "/api/watch/PETR4/b3", json={}).status_code == 204
+    # sem corpo: a forma que o contrato congelado declara (WR-01)
+    assert client.delete("/api/watch/PETR4/b3").status_code == 204
     _congela_relogio(monkeypatch, _DOMINGO)  # fora do pregão: 201 sem rede
     requests: list[httpx.Request] = []
     _injeta_transporte(monkeypatch, _violento, requests)
@@ -925,7 +928,8 @@ def test_put_item_removido_renasce_ciclo_novo(settings, capsys, monkeypatch):
         )
     finally:
         conn.close()
-    assert client.request("DELETE", "/api/watch/PETR4/b3", json={}).status_code == 204
+    # sem corpo: a forma que o contrato congelado declara (WR-01)
+    assert client.delete("/api/watch/PETR4/b3").status_code == 204
     _congela_relogio(monkeypatch, _DOMINGO)
     requests: list[httpx.Request] = []
     _injeta_transporte(monkeypatch, _violento, requests)

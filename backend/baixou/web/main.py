@@ -3,7 +3,7 @@
 O /healthz é o contrato final desde o dia um: sem login, sem dados no corpo,
 sem cabeçalhos de versão — mede a vida do worker (run.last_run) contra
 2 × POLL_MINUTES. Fase 4: routers de auth e da lista sob /api, guard de
-mutação (Content-Type application/json + Origin) e o token de primeiro acesso
+mutação (JSON quando há corpo + Origin sempre) e o token de primeiro acesso
 impresso UMA vez no log quando não há usuário (SC-1).
 """
 
@@ -121,17 +121,30 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.middleware("http")
     async def guard_de_mutacao(request: Request, call_next):
-        """Todo método mutante sob /api exige JSON e Origin do próprio host.
+        """Todo método mutante sob /api com CORPO exige JSON; Origin, sempre.
 
         Arquitetura (linha do contrato da API): Content-Type application/json
-        obrigatório (415 sem ele) e conferência do Origin quando presente
-        (host divergente → 403) — SameSite=Strict é a primeira camada, este
-        guard é a segunda (T-04-03). O /healthz nunca passa por aqui: só
-        caminhos iniciados por "/api" são inspecionados.
+        obrigatório QUANDO a requisição carrega corpo (415 sem ele) e
+        conferência do Origin INCONDICIONAL quando presente (host divergente →
+        403) — SameSite=Strict é a primeira camada, este guard é a segunda
+        (T-04-03). A isenção de Content-Type em requisição SEM corpo existe
+        porque o contrato congelado (WR-01, opção (a)) declara DELETE
+        /api/watch/{symbol}/{market} e POST /api/auth/logout sem requestBody:
+        um cliente gerado do openapi.json não envia Content-Type nessas
+        operações — e a camada anti-CSRF segue inteira (Origin conferida com
+        ou sem corpo; logout sem sessão morre no require_session com 401;
+        DELETE não é emitível por formulário HTML). O /healthz nunca passa
+        por aqui: só caminhos iniciados por "/api" são inspecionados.
         """
         if request.method in _MUTATING_METHODS and request.url.path.startswith("/api"):
             content_type = request.headers.get("content-type", "")
-            if not content_type.strip().lower().startswith("application/json"):
+            # Presença de corpo pelos cabeçalhos (nunca pela leitura do fluxo):
+            # transfer-encoding OU content-length dígito > 0.
+            content_length = request.headers.get("content-length", "").strip()
+            tem_corpo = "transfer-encoding" in request.headers or (
+                content_length.isdigit() and int(content_length) > 0
+            )
+            if tem_corpo and not content_type.strip().lower().startswith("application/json"):
                 return JSONResponse(
                     status_code=415,
                     content={"detail": "content-type application/json é obrigatório"},

@@ -90,9 +90,10 @@ def test_fluxo_e2e_do_tracer_token_do_log_ate_logout(settings, capsys):
         lista = client.get("/api/watch")
         assert lista.status_code == 200
         assert lista.json() == {"itens": []}
-        # logout (método mutante: exige Content-Type json) → 204 e a MESMA
+        # logout SEM corpo — a forma que o contrato congelado declara (o guard
+        # só exige JSON em mutação COM corpo, WR-01) → 204 e a MESMA
         # sessão capturada já não acessa
-        assert client.post("/api/auth/logout", json={}).status_code == 204
+        assert client.post("/api/auth/logout").status_code == 204
         with _client(settings) as fresco:
             morto = fresco.get("/api/watch", cookies={"baixou_session": token_sessao})
         assert morto.status_code == 401
@@ -297,9 +298,7 @@ def test_guard_aceita_mutacao_sem_corpo_conforme_o_contrato_e_origin_divergente_
         token_sessao = client.cookies.get("baixou_session")
         assert token_sessao
         # perna 1 — Origin divergente SEM corpo: a camada anti-CSRF segue inteira
-        divergente = client.post(
-            "/api/auth/logout", headers={"Origin": "https://evil.example"}
-        )
+        divergente = client.post("/api/auth/logout", headers={"Origin": "https://evil.example"})
         assert divergente.status_code == 403
         # perna 2 — logout SEM corpo e SEM Content-Type (a forma declarada pelo
         # contrato) com sessão válida → 204
