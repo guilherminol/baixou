@@ -53,9 +53,7 @@ def test_seis_logins_validos_simultaneos_todos_200_e_sessoes_integras(settings, 
         )
 
         def loga(_: int) -> int:
-            resposta = client.post(
-                "/api/auth/login", json={"username": "admin", "password": SENHA}
-            )
+            resposta = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
             return resposta.status_code
 
         with ThreadPoolExecutor(max_workers=LOGINS_SIMULTANEOS) as piscina:
