@@ -1,8 +1,9 @@
 // Suíte de componente da UI-02 (tracer do 05-04): rodadas, cota com barra e
 // marcador na posição 80% (D-16), fontes com o NOME na linha do erro (D-14,
-// literal UI-02), canais com a faixa fixa de nenhum canal (D-15) e o polling
-// de 60 s. buscarStatus() é MOCKADO (vi.mock) — zero rede.
-import { act, cleanup, render, screen } from "@testing-library/react";
+// literal UI-02), canais com a faixa fixa de nenhum canal (D-15), o polling
+// de 60 s e o botão de teste por canal (NOTIF-02, D-05). buscarStatus() e o
+// client são MOCKADOS (vi.mock) — zero rede.
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 // O CSS e o código da página são lidos do DISCO para as verificações
 // estruturais (mesmo molde do 05-03): node:fs existe no runtime do vitest,
 // mas @types/node não está na lista fechada de pacotes aprovados.
@@ -12,16 +13,62 @@ import { readFileSync } from "node:fs";
 declare const process: { cwd(): string };
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "../api/client";
 import type { StatusResponse } from "../api/status";
 import StatusPage from "../pages/StatusPage";
 
-const { buscarStatusMock } = vi.hoisted(() => ({
+const { buscarStatusMock, requestMock } = vi.hoisted(() => ({
   buscarStatusMock: vi.fn(),
+  requestMock: vi.fn(),
 }));
 
 vi.mock("../api/status", () => ({
   buscarStatus: buscarStatusMock,
 }));
+
+// Espelho FIEL do contrato do client real (mesmo molde das suítes do 05-02/
+// 05-03): o POST do teste de canal passa por aqui sem tocar rede.
+vi.mock("../api/client", () => {
+  class ApiError extends Error {
+    status: number;
+    body: unknown;
+    retryAfterSeconds?: number;
+    constructor(
+      status: number,
+      body: unknown,
+      mensagem?: string,
+      retryAfterSeconds?: number,
+    ) {
+      const detail =
+        typeof body === "object" && body !== null && "detail" in body
+          ? (body as { detail: unknown }).detail
+          : undefined;
+      super(mensagem ?? (typeof detail === "string" ? detail : `erro ${status}`));
+      this.name = "ApiError";
+      this.status = status;
+      this.body = body;
+      if (retryAfterSeconds !== undefined) {
+        this.retryAfterSeconds = retryAfterSeconds;
+      }
+    }
+  }
+  return {
+    ApiError,
+    onUnauthorized: () => {},
+    parseErrosEnvelope: () => [],
+    request: requestMock,
+  };
+});
+
+/** Promise controlada pelo teste: segura o POST em voo para provar o estado
+ * "testando…" e a serialização por canal (SC-4). */
+function diferido<T>() {
+  let resolver!: (valor: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolver = res;
+  });
+  return { promise, resolver };
+}
 
 /** Envelope completo do /api/status (contrato congelado D-03) com dados
  * operacionais sadios — os testes sobrepõem só o que exercitam. */
@@ -70,6 +117,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   buscarStatusMock.mockReset();
+  requestMock.mockReset();
 });
 
 describe("StatusPage — UI-02 (tracer 05-04)", () => {
@@ -280,4 +328,180 @@ describe("StatusPage — UI-02 (tracer 05-04)", () => {
     expect(css).toMatch(/\.faixa-informativa\s*\{/);
   });
 });
+
+describe("StatusPage — botão de teste por canal (NOTIF-02, D-05)", () => {
+  it("cada canal configurado=true tem o botão 'Testar' (aria-label, alvo 44px); configurado=false NÃO tem botão", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [
+          { nome: "telegram", configurado: true, ultimo_resultado: null },
+          { nome: "ntfy", configurado: false, ultimo_resultado: null },
+        ],
+      }),
+    );
+    const botao = screen.getByRole("button", { name: "Testar canal telegram" });
+    expect(botao).toHaveTextContent("Testar");
+    expect(
+      screen.queryByRole("button", { name: "Testar canal ntfy" }),
+    ).not.toBeInTheDocument();
+    // Alvo de 44px no CSS do botão (contrato do artefato).
+    const css = readFileSync(process.cwd() + "/src/styles/status.css", "utf8");
+    expect(css).toMatch(/\.btn-testar\s*\{[^}]*min-height:\s*44px/);
+  });
+
+  it("clique dispara POST /api/notifiers/telegram/test SEM corpo (contrato do guard) e o {ok:true, mensagem} renderiza inline com aria-live", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
+      }),
+    );
+    requestMock.mockResolvedValueOnce({
+      ok: true,
+      mensagem: "aviso de teste aceito pelo canal",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    const resultado = await screen.findByTestId("resultado-telegram");
+    expect(resultado.textContent).toBe("aviso de teste aceito pelo canal");
+    expect(resultado).toHaveAttribute("aria-live", "polite");
+    const chamada = requestMock.mock.calls.find(
+      (c) => c[0] === "/api/notifiers/telegram/test",
+    );
+    expect(chamada?.[1]).toMatchObject({ method: "POST" });
+    // SEM corpo — o guard só exige Content-Type quando há corpo (WR-01).
+    expect((chamada?.[1] as RequestInit | undefined)?.body).toBeUndefined();
+    // O botão reabilita com o texto padrão.
+    const depois = screen.getByRole("button", { name: "Testar canal telegram" });
+    expect(depois).toBeEnabled();
+    expect(depois).toHaveTextContent("Testar");
+  });
+
+  it("{ok:false, mensagem} renderiza a mensagem EXATA da API — falha de entrega é resultado visível, não erro de rede", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
+      }),
+    );
+    requestMock.mockResolvedValueOnce({
+      ok: false,
+      mensagem: "o canal recusou o aviso de teste (erro http_status, HTTP 400)",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    const resultado = await screen.findByTestId("resultado-telegram");
+    expect(resultado.textContent).toBe(
+      "o canal recusou o aviso de teste (erro http_status, HTTP 400)",
+    );
+    expect(resultado).toHaveClass("falha"); // --error-text na falha (CSS)
+  });
+
+  it("enquanto em voo o botão fica desabilitado com 'testando…' — o SEGUNDO clique no mesmo canal é impossível (um canal por vez, SC-4)", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
+      }),
+    );
+    const pendente = diferido<{ ok: boolean; mensagem: string }>();
+    requestMock.mockReturnValueOnce(pendente.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    await screen.findByText("testando…");
+    expect(screen.getByRole("button", { name: "Testar canal telegram" })).toBeDisabled();
+    // O segundo clique num botão desabilitado não dispara nada (jsdom respeita).
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    pendente.resolver({ ok: true, mensagem: "aviso de teste aceito pelo canal" });
+    const resultado = await screen.findByTestId("resultado-telegram");
+    expect(resultado.textContent).toBe("aviso de teste aceito pelo canal");
+    const posts = requestMock.mock.calls.filter(
+      (c) => c[0] === "/api/notifiers/telegram/test",
+    );
+    expect(posts).toHaveLength(1); // exatamente UM aviso saiu
+  });
+
+  it("canais DIFERENTES podem disparar em paralelo e cada resultado fica na linha do seu canal", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [
+          { nome: "telegram", configurado: true, ultimo_resultado: null },
+          { nome: "ntfy", configurado: true, ultimo_resultado: null },
+        ],
+      }),
+    );
+    const pendenteTelegram = diferido<{ ok: boolean; mensagem: string }>();
+    requestMock.mockImplementation((path: string) => {
+      if (path === "/api/notifiers/telegram/test") return pendenteTelegram.promise;
+      if (path === "/api/notifiers/ntfy/test") {
+        return Promise.resolve({ ok: true, mensagem: "aviso de teste aceito pelo canal" });
+      }
+      throw new Error(`chamada inesperada: ${path}`);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    expect(screen.getByRole("button", { name: "Testar canal telegram" })).toBeDisabled();
+    // O ntfy continua HABILITADO enquanto o telegram está em voo.
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal ntfy" }));
+    const resultadoNtfy = await screen.findByTestId("resultado-ntfy");
+    expect(resultadoNtfy.textContent).toBe("aviso de teste aceito pelo canal");
+    expect(screen.queryByTestId("resultado-telegram")).not.toBeInTheDocument();
+    pendenteTelegram.resolver({
+      ok: false,
+      mensagem: "o canal não respondeu ao teste (erro transporte)",
+    });
+    const resultadoTelegram = await screen.findByTestId("resultado-telegram");
+    expect(resultadoTelegram.textContent).toBe(
+      "o canal não respondeu ao teste (erro transporte)",
+    );
+    expect(screen.getByRole("button", { name: "Testar canal telegram" })).toBeEnabled();
+  });
+
+  it("409 (defesa em profundidade) → 'canal não configurado' renderiza inline", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
+      }),
+    );
+    requestMock.mockRejectedValueOnce(
+      new ApiError(409, { detail: "canal não configurado" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    const resultado = await screen.findByTestId("resultado-telegram");
+    expect(resultado.textContent).toBe("canal não configurado");
+  });
+
+  it("outra ApiError → mensagem genérica PT-BR com o status; falha de rede → genérica sem status", async () => {
+    await montarCom(
+      statusPadrao({
+        canais: [{ nome: "telegram", configurado: true, ultimo_resultado: null }],
+      }),
+    );
+    requestMock.mockRejectedValueOnce(new ApiError(500, { detail: "boom" }));
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    const resultado = await screen.findByTestId("resultado-telegram");
+    expect(resultado.textContent).toBe("não foi possível concluir o teste (erro 500)");
+    requestMock.mockRejectedValueOnce(new Error("fetch failed"));
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    await screen.findByText("não foi possível concluir o teste");
+  });
+
+  it("remount com mocks zerados → nenhum resultado reaparece (estado em memória, nada gravado em storage)", async () => {
+    const canais = [{ nome: "telegram", configurado: true, ultimo_resultado: null }];
+    await montarCom(statusPadrao({ canais }));
+    requestMock.mockResolvedValueOnce({
+      ok: true,
+      mensagem: "aviso de teste aceito pelo canal",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Testar canal telegram" }));
+    await screen.findByTestId("resultado-telegram");
+    // "Recarregar a página": remount com o estado de memória zerado.
+    cleanup();
+    buscarStatusMock.mockResolvedValue(statusPadrao({ canais }));
+    render(
+      <MemoryRouter>
+        <StatusPage />
+      </MemoryRouter>,
+    );
+    await act(async () => {});
+    expect(screen.queryByTestId("resultado-telegram")).not.toBeInTheDocument();
+    // Proibição D-05: nada do resultado é gravado em storage.
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+});
+
 
