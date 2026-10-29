@@ -946,4 +946,24 @@ describe("AlertsPage — polling de 60 s e re-login no lugar (D-10)", () => {
     unmount();
     expect(onUnauthorizedMock).toHaveBeenLastCalledWith(null);
   });
+
+  it("nenhum dado de edição vai a localStorage/sessionStorage (proibição do plano, arquitetura)", async () => {
+    const respostaPut = { itens: listaMista };
+    await montarComTimersFake(listaMista, {
+      "DELETE /api/watch/PETR4/b3": () => undefined,
+      "PUT /api/watch": () => respostaPut,
+    });
+    // Um pouco de cada fluxo de edição: adicionar, editar alvo, remover, salvar.
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "BBDC4" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "60" } });
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
 });
