@@ -4,7 +4,7 @@
 // meta-line e a sub-linha D-06 (360px). O módulo client é MOCKADO (vi.mock)
 // — zero rede; a ApiError espelha o contrato do client real (mesmo molde das
 // suítes de acesso do 05-02).
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 // O CSS é lido do DISCO para a verificação estrutural da D-06: node:fs existe
 // no runtime do vitest (Node), mas os tipos do projeto são DOM/vite — @types/node
 // não está na lista fechada de pacotes aprovados, então declaramos só o que é
@@ -198,6 +198,7 @@ const listaMista: WatchItem[] = [
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   requestMock.mockReset();
   onUnauthorizedMock.mockReset();
 });
@@ -382,5 +383,302 @@ describe("AlertsPage — lista real agrupada (tracer UI-01)", () => {
 
   it("ApiError segue exportada pelo mock (contrato do molde das suítes)", () => {
     expect(new ApiError(422, { erros: [] }, "x").status).toBe(422);
+  });
+});
+
+// ─── Mutações (Task 2): adicionar, editar alvo, remover com Desfazer de 5 s,
+// Salvar (DELETE pendentes → PUT lote) e Pausar/Retomar ─────────────────────
+
+type Iniciar = { method?: string; body?: string };
+
+/** Handler composto: responde os GETs com a lista/estado e as rotas extras
+ * na forma "MÉTODO caminho"; rota extra pode devolver valor OU lançar. */
+function handlerDe(
+  itens: WatchItem[],
+  extras: Record<string, (init?: Iniciar) => unknown> = {},
+  estado: StatusResponse = statusPadrao(),
+) {
+  return async (path: string, init?: Iniciar) => {
+    const metodo = init?.method ?? "GET";
+    const rota = `${metodo} ${path}`;
+    if (rota in extras) return extras[rota](init);
+    if (metodo === "GET" && path === "/api/watch") return { itens };
+    if (metodo === "GET" && path === "/api/status") return estado;
+    throw new Error(`chamada inesperada: ${rota}`);
+  };
+}
+
+function chamadasDeMutacao(): Array<[string, Iniciar | undefined]> {
+  return requestMock.mock.calls.filter(
+    ([path, init]) => (init as Iniciar | undefined)?.method !== undefined,
+  ) as Array<[string, Iniciar | undefined]>;
+}
+
+function nomeDoBotao(rotulo: string) {
+  return screen.getByRole("button", { name: rotulo });
+}
+
+/** Renderiza com fake timers completos (a janela de Desfazer de 5 s é
+ * setTimeout POR item) e interações via fireEvent — o user-event depende de
+ * setTimeout real e não serve aqui (lição do 05-02, agora no inverso). */
+async function montarComTimersFake(itens: WatchItem[], extras: Record<string, (init?: Iniciar) => unknown> = {}) {
+  vi.useFakeTimers();
+  requestMock.mockImplementation(handlerDe(itens, extras));
+  renderAlertas();
+  await act(async () => {});
+}
+
+describe("AlertsPage — mutações da lista (UI-01)", () => {
+  it("adicionar válido: símbolo trimado/maiúsculo entra na seção do mercado escolhido e a barra vira 'Alterações não salvas'", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: " itub4 " } });
+    fireEvent.change(screen.getByLabelText("Mercado"), { target: { value: "crypto" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "12.5" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    const tabelaCripto = screen.getAllByRole("table")[1] as HTMLElement;
+    expect(within(tabelaCripto).getByText("ITUB4")).toBeInTheDocument();
+    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+    expect(nomeDoBotao("Salvar")).toBeEnabled();
+  });
+
+  it("adicionar com símbolo duplicado → erro inline 'Este ticker já está na lista.' (nunca alert()), sem adicionar", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "petr4" } });
+    fireEvent.change(screen.getByLabelText("Mercado"), { target: { value: "b3" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    expect(screen.getByText("Este ticker já está na lista.")).toBeInTheDocument();
+    expect(screen.getAllByText("PETR4").length).toBe(1);
+    expect(screen.queryByText("Alterações não salvas")).not.toBeInTheDocument();
+  });
+
+  it("adicionar com alvo inválido (zero/negativo/vazio) não adiciona nem marca dirty", async () => {
+    await montarComTimersFake(listaMista);
+    for (const alvo of ["0", "-5", ""]) {
+      fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "BBDC4" } });
+      fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: alvo } });
+      fireEvent.click(nomeDoBotao("Adicionar"));
+      await act(async () => {});
+    }
+    expect(screen.queryByText("BBDC4")).not.toBeInTheDocument();
+    expect(screen.getByText("Tudo salvo")).toBeInTheDocument();
+  });
+
+  it("editar alvo marca dirty, recalcula distância/estado da linha e preserva o valor no input", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.change(screen.getByLabelText("Alvo de PETR4"), { target: { value: "40" } });
+    await act(async () => {});
+    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+    expect(linhaDe("PETR4").textContent).toContain("no alvo"); // 38.42 <= 40
+    expect(screen.getByLabelText("Alvo de PETR4")).toHaveValue(40);
+  });
+
+  it("editar alvo com valor inválido (NaN/negativo) NÃO marca dirty", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.change(screen.getByLabelText("Alvo de PETR4"), { target: { value: "-3" } });
+    await act(async () => {});
+    expect(screen.getByText("Tudo salvo")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Alvo de PETR4"), { target: { value: "abc" } });
+    await act(async () => {});
+    expect(screen.getByText("Tudo salvo")).toBeInTheDocument();
+  });
+
+  it("remover: linha vira 'PETR4 removido.' + Desfazer; em 4999 ms ainda está lá e Desfazer restaura com ZERO chamadas de api", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {});
+    expect(screen.getByText("PETR4 removido.")).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(4_999);
+    });
+    expect(screen.getByText("PETR4 removido.")).toBeInTheDocument();
+    fireEvent.click(nomeDoBotao("Desfazer"));
+    await act(async () => {});
+    expect(screen.queryByText("PETR4 removido.")).not.toBeInTheDocument();
+    expect(linhaDe("PETR4").textContent).toContain("aguardando");
+    expect(chamadasDeMutacao()).toHaveLength(0); // nenhuma rede no undo
+  });
+
+  it("remover sem desfazer: aos 5 s a linha sai da lista local e fica pendente de DELETE", async () => {
+    await montarComTimersFake(listaMista);
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.queryByText("PETR4 removido.")).not.toBeInTheDocument();
+    expect(screen.queryByText("PETR4")).not.toBeInTheDocument();
+    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+    expect(chamadasDeMutacao()).toHaveLength(0); // o DELETE só sai no Salvar
+  });
+
+  it("salvar: flush de undo + DELETE de cada pendência e SÓ ENTÃO UM PUT cujo corpo NÃO contém os removidos (PUT nunca remove)", async () => {
+    const respostaPut = { itens: listaMista.filter((i) => i.symbol !== "PETR4") };
+    await montarComTimersFake(listaMista, {
+      "DELETE /api/watch/PETR4/b3": () => undefined,
+      "PUT /api/watch": () => respostaPut,
+    });
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000); // pendência confirmada
+    });
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const mutacoes = chamadasDeMutacao();
+    expect(mutacoes.map(([path]) => path)).toEqual([
+      "/api/watch/PETR4/b3", // DELETE primeiro
+      "/api/watch", // PUT depois
+    ]);
+    expect(mutacoes[0]?.[1]?.method).toBe("DELETE");
+    expect(mutacoes[0]?.[1]?.body).toBeUndefined(); // DELETE sem corpo (WR-01)
+    expect(mutacoes[1]?.[1]?.method).toBe("PUT");
+    const corpo = JSON.parse(mutacoes[1]?.[1]?.body ?? "{}") as {
+      itens: Array<{ symbol: string; market: string; target_below: number }>;
+    };
+    expect(corpo.itens.some((i) => i.symbol === "PETR4")).toBe(false);
+    expect(corpo.itens.find((i) => i.symbol === "VALE3")).toEqual({
+      symbol: "VALE3",
+      market: "b3",
+      target_below: 55,
+    });
+    // A resposta do PUT É a nova lista renderizada.
+    expect(screen.queryByText("PETR4")).not.toBeInTheDocument();
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+    expect(nomeDoBotao("Salvar")).toBeDisabled();
+  });
+
+  it("salvar com remoção ainda na janela de undo flusha o timer: removida vai para o DELETE, não para o PUT", async () => {
+    const respostaPut = { itens: listaMista.filter((i) => i.symbol !== "PETR4") };
+    await montarComTimersFake(listaMista, {
+      "DELETE /api/watch/PETR4/b3": () => undefined,
+      "PUT /api/watch": () => respostaPut,
+    });
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const mutacoes = chamadasDeMutacao();
+    expect(mutacoes.map(([path, init]) => `${init?.method} ${path}`)).toEqual([
+      "DELETE /api/watch/PETR4/b3",
+      "PUT /api/watch",
+    ]);
+    expect(screen.queryByText("PETR4")).not.toBeInTheDocument();
+  });
+
+  it("falha no DELETE interrompe ANTES do PUT com o estado dirty preservado (nenhum commit parcial)", async () => {
+    await montarComTimersFake(listaMista, {
+      "DELETE /api/watch/PETR4/b3": () => {
+        throw new ApiError(500, { detail: "item não encontrado" }, "item não encontrado");
+      },
+    });
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const metodos = chamadasDeMutacao().map(([, init]) => init?.method);
+    expect(metodos).toEqual(["DELETE"]); // o PUT não aconteceu
+    expect(screen.getByText("item não encontrado")).toBeInTheDocument();
+    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+    expect(nomeDoBotao("Salvar")).toBeEnabled();
+  });
+
+  it("PUT 422 → envelope D-08 renderiza o problema junto ao item nomeado e a barra segue 'Alterações não salvas'", async () => {
+    await montarComTimersFake(listaMista, {
+      "PUT /api/watch": () => {
+        throw new ApiError(
+          422,
+          {
+            erros: [
+              {
+                symbol: "VALE3",
+                campo: "target_below",
+                problema: "o alvo deve ser maior que zero",
+              },
+            ],
+          },
+          "erro de validação",
+        );
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "0" } });
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const erro = screen.getByTestId("erro-item-VALE3");
+    expect(erro.textContent).toBe("target_below: o alvo deve ser maior que zero");
+    expect(erro.closest("tr")?.textContent).toContain("VALE3");
+    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+  });
+
+  it("pausar chama PATCH imediato e substitui a linha pela resposta (estado 'pausado' sem recarregar)", async () => {
+    const pausado = item({
+      symbol: "PETR4",
+      market: "b3",
+      target_below: 36,
+      price: 38.42,
+      price_at: T1,
+      fresh: "ok",
+      paused: true,
+    });
+    await montarComTimersFake(listaMista, {
+      "PATCH /api/watch/PETR4/b3": (init) => {
+        expect(init?.body).toBe(JSON.stringify({ paused: true }));
+        return pausado;
+      },
+    });
+    fireEvent.click(nomeDoBotao("Pausar PETR4"));
+    await act(async () => {});
+    expect(linhaDe("PETR4").textContent).toContain("pausado");
+    expect(screen.getByText("Tudo salvo")).toBeInTheDocument(); // pausa não é pendência do lote
+    expect(screen.getByRole("button", { name: "Retomar PETR4" })).toBeInTheDocument();
+  });
+
+  it("retomar devolve o item à regra do D-07 (estado pela cotação, não mais 'pausado')", async () => {
+    const taee = listaMista.find((i) => i.symbol === "TAEE11") as WatchItem;
+    const retomado = { ...taee, paused: false };
+    await montarComTimersFake(listaMista, {
+      "PATCH /api/watch/TAEE11/b3": (init) => {
+        expect(init?.body).toBe(JSON.stringify({ paused: false }));
+        return retomado;
+      },
+    });
+    expect(linhaDe("TAEE11").textContent).toContain("pausado");
+    fireEvent.click(nomeDoBotao("Retomar TAEE11"));
+    await act(async () => {});
+    expect(linhaDe("TAEE11").textContent).toContain("aguardando"); // 8.9 > 8
+  });
+
+  it("salvar sem dirty não dispara chamada nenhuma (botão desabilitado)", async () => {
+    await montarComTimersFake(listaMista);
+    expect(nomeDoBotao("Salvar")).toBeDisabled();
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    expect(chamadasDeMutacao()).toHaveLength(0);
+  });
+
+  it("adicionar + salvar: o novo item vai no PUT e volta da resposta com a cotação vazia do ciclo novo", async () => {
+    const criado = item({ symbol: "ITUB4", market: "b3", target_below: 30, fresh: "none" });
+    const respostaPut = { itens: [...listaMista, criado] };
+    await montarComTimersFake(listaMista, {
+      "PUT /api/watch": (init) => {
+        const corpo = JSON.parse(init?.body ?? "{}") as { itens: unknown[] };
+        expect(corpo.itens).toContainEqual({
+          symbol: "ITUB4",
+          market: "b3",
+          target_below: 30,
+        });
+        return respostaPut;
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "itub4" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+    expect(linhaDe("ITUB4").textContent).toContain("—"); // sem cotação ainda
   });
 });
