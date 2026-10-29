@@ -1,0 +1,369 @@
+/*
+ * Design system do Baixou — nasce do mockup da fase (05-UI-MODELO.md, D-01):
+ * paleta clara #f7f5f0/#b8421e e escura automática via prefers-color-scheme,
+ * serif nos títulos, corpo 13px sans, números monoespaçados com tabular-nums,
+ * grade 4/8px, alvos de 44px, foco visível e prefers-reduced-motion.
+ * Sem kit de componentes — CSS próprio com variáveis.
+ */
+
+:root {
+  --bg: #f7f5f0;
+  --surface: #ffffff;
+  --text: #1a1917;
+  --muted: #6b665f;
+  --border: #dcd8cf;
+  --accent: #b8421e;
+  --accent-bg: #faece7;
+  --error-bg: #fdf2f2;
+  --error-text: #991b1b;
+  --font-serif: Georgia, "Iowan Old Style", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #13161a;
+    --surface: #181c22;
+    --text: #e2e4e6;
+    --muted: #8b929a;
+    --border: #262b32;
+    --accent: #e0633b;
+    --accent-bg: #2d1b16;
+    --error-bg: #2b1414;
+    --error-text: #f87171;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  padding-bottom: 96px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.container {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 16px 12px;
+}
+
+@media (min-width: 600px) {
+  .container {
+    padding: 24px 20px;
+  }
+}
+
+header {
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+}
+
+h1 {
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: normal;
+  letter-spacing: -0.01em;
+  margin-bottom: 4px;
+}
+
+.meta-line {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Abas do cabeçalho (D-12): a linguagem .market-title — uppercase, muted,
+   espaçado — com o destino ativo em cor de texto e "Sair" à direita. */
+.abas {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 4px;
+}
+
+.abas a {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-decoration: none;
+  padding: 4px 2px;
+}
+
+.abas a:hover,
+.abas a:focus {
+  color: var(--text);
+}
+
+.abas a.active {
+  color: var(--text);
+}
+
+.btn-sair {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.btn-sair:hover,
+.btn-sair:focus {
+  color: var(--text);
+}
+
+.banner-error {
+  background: var(--error-bg);
+  border: 1px solid var(--error-text);
+  color: var(--error-text);
+  padding: 8px 12px;
+  font-size: 12px;
+  margin-bottom: 16px;
+  border-radius: 2px;
+  display: none;
+}
+
+/* O mockup esconde a faixa por padrão e a exibe via script; em React a
+   renderização é condicional — a classe .visivel a torna visível. */
+.banner-error.visivel {
+  display: block;
+}
+
+.market-section {
+  margin-bottom: 24px;
+}
+
+.market-title {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  font-weight: normal;
+  margin-bottom: 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+th {
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+  padding: 8px;
+  height: 32px;
+  text-align: left;
+}
+
+td {
+  padding: 6px 8px;
+  height: 44px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.symbol-cell {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.tag-state {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  display: inline-block;
+}
+
+.state-hit {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.state-stale {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+input, select, button {
+  font-family: inherit;
+  font-size: 13px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  height: 34px;
+  padding: 0 8px;
+}
+
+input:focus, select:focus, button:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.input-target {
+  width: 90px;
+  text-align: right;
+  font-family: var(--font-mono);
+}
+
+.btn-action {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 8px;
+  font-size: 12px;
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-action:hover, .btn-action:focus {
+  color: var(--text);
+}
+
+.row-undo {
+  background-color: var(--bg);
+}
+
+.row-undo td {
+  color: var(--muted);
+}
+
+.add-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 12px;
+  margin-top: 16px;
+}
+
+.add-block h2 {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.add-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.add-form input, .add-form select {
+  flex: 1 1 120px;
+  min-height: 44px;
+}
+
+.add-form button {
+  flex: 1 1 80px;
+  min-height: 44px;
+  cursor: pointer;
+  background: var(--surface);
+}
+
+.action-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding: 10px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 10;
+}
+
+.action-bar-content {
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-save {
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  padding: 0 16px;
+  min-height: 44px;
+  cursor: not-allowed;
+}
+
+.btn-save.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.status-msg {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.status-msg.dirty {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.empty-state {
+  padding: 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
