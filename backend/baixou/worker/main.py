@@ -215,8 +215,9 @@ def run_round(conn: sqlite3.Connection, settings: Settings) -> float:
             # Quarentena derivada da coluna da 0002 (D-02/D-03): símbolo com
             # last_fetch_error = 'not_found' fica FORA das rodadas seguintes
             # — sem chamada 1-a-1 recorrente (peso 4 do lote único preservado).
-            # Volta só quando a linha em watch for recriada (cascata limpa a
-            # coluna). Vale só para Binance: a brapi falha 1-a-1 naturalmente.
+            # Volta só quando a linha em watch for recriada (o reset da
+            # cotação na recriação — D-02 — limpa a coluna). Vale só para
+            # Binance: a brapi falha 1-a-1 naturalmente.
             quarantined = {
                 row["symbol"]
                 for row in conn.execute(
