@@ -281,6 +281,37 @@ def test_origin_divergente_403_e_origem_propria_aceita(settings, capsys):
     assert propria.status_code == 401  # passou o guard: só as credenciais falham
 
 
+def test_guard_aceita_mutacao_sem_corpo_conforme_o_contrato_e_origin_divergente_sem_corpo_403(
+    settings, capsys
+):
+    """WR-01: o contrato congelado declara logout e DELETE SEM requestBody — um
+    cliente gerado do openapi.json não envia Content-Type nessas operações, e o
+    guard não pode recusá-las com 415. A conferência de Origin permanece
+    INCONDICIONAL: mutante sem corpo com Origin divergente continua 403.
+    """
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        logado = client.post("/api/auth/login", json={"username": "admin", "password": SENHA})
+        assert logado.status_code == 200
+        token_sessao = client.cookies.get("baixou_session")
+        assert token_sessao
+        # perna 1 — Origin divergente SEM corpo: a camada anti-CSRF segue inteira
+        divergente = client.post(
+            "/api/auth/logout", headers={"Origin": "https://evil.example"}
+        )
+        assert divergente.status_code == 403
+        # perna 2 — logout SEM corpo e SEM Content-Type (a forma declarada pelo
+        # contrato) com sessão válida → 204
+        saida = client.post("/api/auth/logout")
+        assert saida.status_code == 204
+    # perna 3 — a sessão morreu no logout da perna 2: o token capturado já
+    # não autentica
+    with _client(settings) as fresco:
+        morto = fresco.get("/api/watch", cookies={"baixou_session": token_sessao})
+    assert morto.status_code == 401
+
+
 # --- Fase 4 (plano 04-01, Task 2): "lembrar de mim" (D-10), validade sliding
 # --- (D-11) e Secure do cookie pelo env COOKIE_SECURE (molde WR-01)
 
