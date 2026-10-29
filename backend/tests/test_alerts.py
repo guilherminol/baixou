@@ -1,0 +1,569 @@
+"""Máquina de estados do alerta SEM rede — tabela completa da arquitetura.
+
+Mesmos padrões dos demais testes do worker (banco recém-migrado, seed por SQL
+direto em autocommit, relógio congelado, ``MockTransport`` no ``httpx.Client``
+passado ao ``process_alerts``): prova a regra "≥1 canal aceitou" com resultado
+por canal gravado (SC-3, D-15/D-16), o rearme pela margem REARM_PCT e a troca
+de alvo com ``alerted_at`` histórico (SC-2, D-12/D-13, ALERT-04) e o gate de
+frescor por idade ok/stale/closed/none (D-11, SC-5, ALERT-02) — cada task
+deste plano acrescenta suas linhas da tabela.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
+
+import httpx
+import pytest
+from baixou.core.config import Settings, load_settings
+from baixou.core.db import WORKER_TIMEOUT_S, connect
+from baixou.core.migrations import apply_migrations
+from baixou.worker import alerts
+
+_Handler = Callable[[httpx.Request], httpx.Response]
+
+# Quarta-feira 16:00 UTC = 13:00 em Brasília: dentro do pregão da B3 (SC-1).
+_MARKET_OPEN_NOW = datetime(2026, 10, 28, 16, 0, 0, tzinfo=UTC)
+
+_TELEGRAM_TOKEN = "123456789:bot-tok-secreto-xyz"  # formato <id>:<hash> exigido na subida (D-09)
+_TELEGRAM_CHAT_ID = "42"
+_NTFY_TOPIC = "baixou-testes"
+
+# price_at das cotações semeadas: 10 minutos antes do relógio congelado —
+# fresca por construção nos limites da B3 (75 min) e da cripto (30 min).
+_FRESH_PRICE_AT = "2026-10-28T15:50:00Z"
+
+
+def _configure_env(monkeypatch, tmp_path, *, telegram: bool = True, ntfy: bool = True) -> Settings:
+    """Envs de teste com os canais pedidos; devolve Settings carregadas."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("TZ_MARKET", "America/Sao_Paulo")
+    monkeypatch.setenv("POLL_MINUTES", "15")
+    monkeypatch.setenv("LOG_LEVEL", "info")
+    monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    if telegram:
+        monkeypatch.setenv("TELEGRAM_TOKEN", _TELEGRAM_TOKEN)
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", _TELEGRAM_CHAT_ID)
+    if ntfy:
+        monkeypatch.setenv("NTFY_TOPIC", _NTFY_TOPIC)
+    return load_settings()
+
+
+@pytest.fixture
+def both_channels(tmp_path, monkeypatch) -> tuple[Settings, sqlite3.Connection]:
+    """Settings com Telegram E ntfy configurados + banco recém-migrado."""
+    settings = _configure_env(monkeypatch, tmp_path, telegram=True, ntfy=True)
+    apply_migrations(settings.db_path)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    yield settings, conn
+    conn.close()
+
+
+def _seed_item(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str = "PETR4",
+    market: str = "b3",
+    target: float = 10.0,
+    price: float | None = 9.50,
+    price_at: str | None = _FRESH_PRICE_AT,
+    change_pct: float | None = -6.0,
+    alerted: int = 0,
+    alerted_target: float | None = None,
+    alerted_at: str | None = None,
+    notify_state: str | None = None,
+    last_fetch_error: str | None = None,
+) -> None:
+    """Semeia watch + quote por SQL direto (isolation_level=None: autocommit)."""
+    conn.execute(
+        "INSERT INTO watch (symbol, market, target_below) VALUES (?, ?, ?)",
+        (symbol, market, target),
+    )
+    conn.execute(
+        """
+        INSERT INTO quote (symbol, market, price, price_at, change_pct,
+            alerted, alerted_target, alerted_at, notify_state, last_fetch_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            symbol,
+            market,
+            price,
+            price_at,
+            change_pct,
+            alerted,
+            alerted_target,
+            alerted_at,
+            notify_state,
+            last_fetch_error,
+        ),
+    )
+
+
+def _quote_row(conn: sqlite3.Connection, symbol: str = "PETR4", market: str = "b3") -> sqlite3.Row:
+    return conn.execute(
+        "SELECT * FROM quote WHERE symbol = ? AND market = ?", (symbol, market)
+    ).fetchone()
+
+
+def _client(handler: _Handler) -> httpx.Client:
+    """Cliente httpx real com o transporte falso roteado pelo handler do teste."""
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+class _Recorder:
+    """Transporte falso com recorder de requisições e rota definida no teste."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self._handler: _Handler | None = None
+
+    def route(self, handler: _Handler) -> None:
+        self._handler = handler
+
+    def dispatch(self, request: httpx.Request) -> httpx.Response:
+        if self._handler is None:
+            raise AssertionError("nenhuma rota definida para o transporte falso")
+        self.requests.append(request)
+        return self._handler(request)
+
+
+def _recorder_client(recorder: _Recorder) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(recorder.dispatch))
+
+
+# --- Task 1 (SC-3, D-15/D-16): regra "≥1 canal aceitou" com resultado por canal ---
+
+
+def test_one_channel_accepts_other_fails_alerts_and_records_both(both_channels, capsys):
+    """Telegram 401 + ntfy 200: alertado, notify_state com os DOIS canais (SC-3)."""
+    settings, conn = both_channels
+    _seed_item(conn)  # PETR4 a 9.50 ≤ alvo 10.0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.telegram.org":
+            return httpx.Response(401, json={"ok": False, "error_code": 401})
+        return httpx.Response(200, json={"id": "abc"})  # ntfy aceita
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # um canal aceitou: o item conta como alertado
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+    assert quote["alerted_target"] == 10.0
+    state = json.loads(quote["notify_state"])
+    assert state == {"telegram": "erro auth (HTTP 401)", "ntfy": "ok"}
+    assert list(state) == ["telegram", "ntfy"]  # chaves na ordem de CHANNEL_ORDER (D-15)
+    out = capsys.readouterr().out
+    assert out.count("alert_delivery_failed") == 1  # um evento por canal recusado
+    assert out.count("alert_sent") == 1
+    assert _TELEGRAM_TOKEN not in out  # nunca URL/token no log (K2/T-03-01)
+
+
+def test_all_channels_refuse_keeps_waiting_and_retries_next_round(both_channels, capsys):
+    """Todos recusam: alerted=0 com notify_state gravado; a rodada seguinte reenvia (SC-3)."""
+    settings, conn = both_channels
+    _seed_item(conn)
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")  # os dois recusam
+
+    recorder.route(handler)
+
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0  # sem NENHUM aceite, o item NÃO fica alertado
+    assert quote["alerted_at"] is None
+    assert json.loads(quote["notify_state"]) == {
+        "telegram": "erro unavailable (HTTP 500)",
+        "ntfy": "erro unavailable (HTTP 500)",
+    }
+    out = capsys.readouterr().out
+    assert out.count("alert_delivery_failed") == 2
+    assert "alert_sent" not in out
+
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0  # segue aguardando: retry na rodada seguinte
+    assert len(recorder.requests) == 4  # os DOIS canais reenviam (sem reenvio seletivo)
+    assert json.loads(quote["notify_state"]) == {
+        "telegram": "erro unavailable (HTTP 500)",
+        "ntfy": "erro unavailable (HTTP 500)",
+    }
+
+
+def test_empty_channels_list_sends_and_writes_nothing(tmp_path, monkeypatch):
+    """Nenhum canal configurado (lista vazia): nenhum envio e nenhuma escrita (D-08)."""
+    settings = _configure_env(monkeypatch, tmp_path, telegram=False, ntfy=False)
+    apply_migrations(settings.db_path)
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        _seed_item(conn)
+
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+            raise AssertionError("nenhuma requisição deve sair sem canal configurado")
+
+        alerts.process_alerts(conn, settings, _client(handler), _MARKET_OPEN_NOW)
+
+        quote = _quote_row(conn)
+        assert quote["alerted"] == 0
+        assert quote["notify_state"] is None  # nenhuma escrita no item
+    finally:
+        conn.close()
+
+
+# --- Task 2 (SC-2, D-12/D-13, ALERT-04): rearme pela margem e troca de alvo ---
+
+# alerted_at histórico semeado (ALERT-04): uma hora antes do relógio congelado.
+_SEEDED_ALERTED_AT = "2026-10-28T15:00:00Z"
+
+
+def test_rearm_at_exact_inclusive_margin(both_channels):
+    """Margem exata rearma (borda inclusiva — D-12); um centavo abaixo não rearma."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        symbol="PETR4",
+        target=15.0,
+        price=15.15,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    _seed_item(
+        conn,
+        symbol="VALE3",
+        target=15.0,
+        price=15.149,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("rearme é mudança de estado: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    petr = _quote_row(conn, "PETR4")
+    vale = _quote_row(conn, "VALE3")
+    assert petr["alerted"] == 0  # price == alvo × (1 + 1/100): rearma na borda exata
+    assert petr["alerted_target"] is None
+    assert petr["alerted_at"] == _SEEDED_ALERTED_AT  # histórico preservado (ALERT-04)
+    assert vale["alerted"] == 1  # 15.149 < 15.15: um centavo abaixo da margem, não rearma
+    assert vale["alerted_target"] == 15.0
+    assert vale["alerted_at"] == _SEEDED_ALERTED_AT
+    assert recorder.requests == []  # rearme não é envio
+
+
+def test_crossing_after_rearm_sends_new_alert(both_channels, capsys):
+    """Pós-rearme, novo cruzamento para baixo dispara NOVO aviso (SC-2) com novo alerted_at."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=15.0,
+        price=15.15,
+        alerted=1,
+        alerted_target=15.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+        notify_state='{"telegram": "ok"}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # rodada 1: rearme
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0
+    assert quote["alerted_at"] == _SEEDED_ALERTED_AT  # rearme preserva o histórico
+    assert quote["notify_state"] == '{"telegram": "ok"}'  # rearme não é entrega: intacto
+
+    conn.execute("UPDATE quote SET price = 14.0 WHERE symbol = 'PETR4'")  # cruza de novo
+    later = datetime(2026, 10, 28, 16, 15, 0, tzinfo=UTC)
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, later)  # rodada 2: novo disparo
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1
+    assert quote["alerted_at"] == "2026-10-28T16:15:00Z"  # novo disparo, novo alerted_at
+    assert quote["alerted_target"] == 15.0
+    out = capsys.readouterr().out
+    assert out.count("alert_sent") == 1  # o aviso repetiu só depois do rearme
+
+
+def test_target_change_resets_without_sending(both_channels):
+    """Alvo trocado com o item alertado: zera SEM enviar nesta rodada (D-13)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=12.0,
+        price=11.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+        notify_state='{"telegram": "ok"}',
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("troca de alvo não envia na mesma rodada")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0  # volta a aguardando
+    assert quote["alerted_target"] is None  # zerado; a reavaliação é na rodada seguinte
+    assert quote["alerted_at"] == _SEEDED_ALERTED_AT  # histórico sobrevive (ALERT-04)
+    assert quote["notify_state"] == '{"telegram": "ok"}'  # troca não é entrega: intacto
+    assert recorder.requests == []
+
+
+def test_target_change_reevaluates_next_round(both_channels):
+    """Rodada seguinte à troca: avalia com o alvo NOVO e grava alerted_target novo (D-13)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn,
+        target=12.0,
+        price=11.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # troca de alvo
+    assert _quote_row(conn)["alerted"] == 0
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)  # rodada seguinte
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # 11.0 ≤ NOVO alvo 12.0: cruza e dispara
+    assert quote["alerted_target"] == 12.0  # alvo novo gravado no disparo
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+
+
+# --- Task 3 (D-11, SC-5, ALERT-02): gate de frescor por idade ok/stale/closed/none ---
+
+# Sábado 16:00 UTC = 13:00 em Brasília: B3 FORA do pregão (fim de semana — SC-1).
+_MARKET_CLOSED_NOW = datetime(2026, 10, 31, 16, 0, 0, tzinfo=UTC)
+
+
+def test_freshness_derivation_table(both_channels):
+    """Tabela D-11: none/ok/stale/closed com borda inclusiva e closed acima de stale."""
+    settings, conn = both_channels
+    _seed_item(conn, symbol="NOPX", price=None)  # sem preço: none
+    _seed_item(conn, symbol="NOAT", price=9.50, price_at=None)  # sem price_at: none
+    _seed_item(conn, symbol="FRESH", price_at="2026-10-28T15:50:00Z")  # 10 min: ok
+    _seed_item(conn, symbol="EDGE", price_at="2026-10-28T14:45:00Z")  # 75 min exatos: ok
+    _seed_item(conn, symbol="STALE", price_at="2026-10-28T14:44:00Z")  # 76 min: stale
+    _seed_item(conn, symbol="CLOSED", price_at="2026-10-28T15:50:00Z")
+
+    assert alerts.freshness_state(_quote_row(conn, "NOPX"), settings, _MARKET_OPEN_NOW) == "none"
+    assert alerts.freshness_state(_quote_row(conn, "NOAT"), settings, _MARKET_OPEN_NOW) == "none"
+    assert alerts.freshness_state(_quote_row(conn, "FRESH"), settings, _MARKET_OPEN_NOW) == "ok"
+    edge = _quote_row(conn, "EDGE")
+    assert alerts.freshness_state(edge, settings, _MARKET_OPEN_NOW) == "ok"  # borda INCLUSIVA
+    stale = _quote_row(conn, "STALE")
+    assert alerts.freshness_state(stale, settings, _MARKET_OPEN_NOW) == "stale"
+    closed = _quote_row(conn, "CLOSED")
+    # closed tem PRECEDÊNCIA sobre a idade: fora do pregão é closed mesmo com cotação velha
+    assert alerts.freshness_state(closed, settings, _MARKET_CLOSED_NOW) == "closed"
+
+
+def test_crypto_never_closed_and_uses_30m_limit(both_channels):
+    """Cripto é 24/7: nunca devolve closed; o limite de idade é o da cripto (30 min)."""
+    settings, conn = both_channels
+    _seed_item(
+        conn, symbol="BTCUSDT", market="crypto", price_at="2026-10-31T15:30:00Z"
+    )  # 30 min exatos: ok (borda inclusiva)
+    _seed_item(
+        conn, symbol="ETHUSDT", market="crypto", price_at="2026-10-31T15:29:00Z"
+    )  # 31 min: stale
+    btc = _quote_row(conn, "BTCUSDT", "crypto")
+    eth = _quote_row(conn, "ETHUSDT", "crypto")
+    # fim de semana: a B3 estaria closed; a cripto segue ok (mercado não fecha)
+    assert alerts.freshness_state(btc, settings, _MARKET_CLOSED_NOW) == "ok"
+    assert alerts.freshness_state(eth, settings, _MARKET_CLOSED_NOW) == "stale"
+
+
+def test_stale_quote_never_evaluates(both_channels):
+    """stale: acima do limite não avalia — preço abaixo do alvo não dispara (D-11)."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, price_at="2026-10-28T14:00:00Z")  # 120 min: acima de 75
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("cotação stale não avalia: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 0
+    assert quote["notify_state"] is None  # nenhum envio nem escrita fora de "ok"
+    assert recorder.requests == []
+
+
+def test_age_at_exact_limit_still_evaluates(both_channels):
+    """Borda inclusiva no gate: idade IGUAL ao limite (75 min) cruza e dispara."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, price_at="2026-10-28T14:45:00Z")  # exatamente 75 min
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # idade == limite é "ok": avalia e dispara
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+
+
+def test_b3_closed_holds_last_quote_without_evaluating(both_channels):
+    """b3 fora do pregão: mantém a cotação sem reavaliar — nem cruzamento, nem rearme."""
+    settings, conn = both_channels
+    # aguardando com preço abaixo do alvo: o cruzamento NÃO sai fora do pregão
+    _seed_item(conn, symbol="WAIT", price=9.50)
+    # alertado com preço acima da margem: o rearme NÃO acontece fora do pregão
+    _seed_item(
+        conn,
+        symbol="HELD",
+        target=10.0,
+        price=12.0,
+        alerted=1,
+        alerted_target=10.0,
+        alerted_at=_SEEDED_ALERTED_AT,
+    )
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("mercado fechado não reavalia: nenhuma requisição sai")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_CLOSED_NOW)
+
+    wait = _quote_row(conn, "WAIT")
+    assert wait["alerted"] == 0
+    assert wait["notify_state"] is None
+    held = _quote_row(conn, "HELD")
+    assert held["alerted"] == 1  # permanece alertado até o pregão abrir
+    assert held["alerted_target"] == 10.0
+    assert held["alerted_at"] == _SEEDED_ALERTED_AT
+    assert recorder.requests == []
+
+
+def test_missing_price_or_timestamp_never_evaluates(both_channels):
+    """none: sem preço ou sem price_at nunca avalia — nenhuma escrita, nenhum envio."""
+    settings, conn = both_channels
+    _seed_item(conn, symbol="NOPX", price=None)
+    _seed_item(conn, symbol="NOAT", price=9.50, price_at=None)
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("estado none nunca avalia")
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    for symbol in ("NOPX", "NOAT"):
+        quote = _quote_row(conn, symbol)
+        assert quote["alerted"] == 0
+        assert quote["notify_state"] is None
+    assert recorder.requests == []
+
+
+def test_source_failure_with_fresh_price_still_evaluates(both_channels):
+    """D-11: a fonte que falhou na rodada não invalida a cotação anterior dentro do limite."""
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, last_fetch_error="unavailable")  # erro + preço preservado
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    with _client(handler) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # o que bloqueia é preço NULL, não o erro gravado
+    assert quote["last_fetch_error"] == "unavailable"
+
+
+# --- Bordas do requisito (validação Nyquist da fase) ---
+
+
+def test_crossing_at_exact_target_price_alerts(both_channels):
+    """Preço IGUAL ao alvo cruza (borda inclusiva ≤ — D-12): dispara e grava o alerta.
+
+    A igualdade não é "acima do alvo": o cruzamento para baixo inclui o preço
+    exatamente no alvo — mesma disciplina de borda inclusiva do rearme (D-12).
+    """
+    settings, conn = both_channels
+    _seed_item(conn, target=10.0, price=10.0)  # 10.0 ≤ 10.0: na borda exata
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # igualdade CRUZA e dispara
+    assert quote["alerted_target"] == 10.0
+    assert quote["alerted_at"] == "2026-10-28T16:00:00Z"
+    assert len(recorder.requests) == 2  # os DOIS canais receberam o aviso
+
+
+def test_suspect_variation_notes_delivery_without_blocking(both_channels):
+    """ALERT-02: variação ≥ SUSPECT_PCT sai como nota no aviso ENTREGUE, sem bloquear.
+
+    A nota de conferência (D-04/D-10) é linha extra do corpo que viaja no aviso
+    real pelos canais — a entrega acontece normalmente (D-04: nunca bloqueia).
+    """
+    settings, conn = both_channels
+    _seed_item(conn, price=9.50, change_pct=-25.0)  # |−25| ≥ 20: variação suspeita
+    recorder = _Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "abc"})
+
+    recorder.route(handler)
+    with _recorder_client(recorder) as client:
+        alerts.process_alerts(conn, settings, client, _MARKET_OPEN_NOW)
+
+    quote = _quote_row(conn)
+    assert quote["alerted"] == 1  # a nota de conferência NÃO bloqueia o alerta (D-04)
+    bodies = []
+    for request in recorder.requests:
+        payload = json.loads(request.content)
+        # "text" (telegram) e "message" (ntfy — G-03-2) são as chaves de corpo reais
+        bodies.append(payload.get("text") or payload.get("message") or "")
+    assert len(bodies) == 2  # entregue pelos DOIS canais
+    assert all("evento corporativo" in b for b in bodies)  # a nota viaja no aviso real

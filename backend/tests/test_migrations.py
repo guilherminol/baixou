@@ -1,14 +1,16 @@
 """Disciplina de migrações: fresh, apply-once, refuse-newer e corrida (D-03, Pitfall 9).
 
-Cinco casos do <behavior> do plano 01-02, Task 2. A corrida usa duas threads
-com conexões separadas (uma por chamada de apply_migrations) e largada
-sincronizada por Barrier — o árbitro do lock ``BEGIN IMMEDIATE`` +
+Cinco casos do <behavior> do plano 01-02, Task 2, estendidos pelo plano
+03-04 para a 0003 (tabela notify_episode — D-05/D-06). A corrida usa duas
+threads com conexões separadas (uma por chamada de apply_migrations) e
+largada sincronizada por Barrier — o árbitro do lock ``BEGIN IMMEDIATE`` +
 busy_timeout: ambas retornam sem exceção, ``schema_migrations`` fica com
-exatamente 1 linha e as 10 tabelas íntegras.
+exatamente 1 linha por versão e as tabelas íntegras.
 """
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
@@ -26,6 +28,7 @@ EXPECTED_TABLES = {
     "login_attempt",
     "setup",
     "schema_migrations",
+    "notify_episode",
 }
 
 
@@ -44,24 +47,24 @@ def _schema_state(db_path) -> tuple[list[str], set[str]]:
 
 
 def test_fresh_database_applies_0001_once_with_event(settings, capsys):
-    """Banco vazio: 10 tabelas, exatamente 1 linha de versão 0001, evento emitido."""
+    """Banco vazio: tabelas do esquema completo, versões 0001–0003, evento emitido."""
     applied_now = apply_migrations(settings.db_path)
 
-    assert applied_now == ["0001", "0002"]
+    assert applied_now == ["0001", "0002", "0003"]
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002"]
+    assert versions == ["0001", "0002", "0003"]
     assert EXPECTED_TABLES <= tables
     assert "migration_applied" in capsys.readouterr().out
 
 
 def test_second_application_is_noop(settings):
-    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 2 linhas."""
+    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 3 linhas."""
     apply_migrations(settings.db_path)
     applied_now = apply_migrations(settings.db_path)
 
     assert applied_now == []
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002"]
+    assert versions == ["0001", "0002", "0003"]
     assert EXPECTED_TABLES <= tables
 
 
@@ -75,6 +78,29 @@ def test_quote_gains_last_fetch_error_column(settings):
     finally:
         conn.close()
     assert columns.get("last_fetch_error") == "TEXT"
+
+
+def test_notify_episode_table_created_with_delivery_flag(settings):
+    """A migração 0003 cria notify_episode: chave do episódio + flag de ENTREGA (D-06).
+
+    delivered NOT NULL DEFAULT 0: linha ausente = episódio não iniciado;
+    delivered=0 = pendente (reenvia toda rodada); delivered=1 = entregue
+    (nunca mais neste episódio).
+    """
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        columns = {
+            row["name"]: (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+            for row in conn.execute("PRAGMA table_info(notify_episode)")
+        }
+    finally:
+        conn.close()
+    assert set(columns) == {"key", "delivered", "updated_at"}
+    assert columns["key"] == ("TEXT", 1, None, 1)  # PRIMARY KEY do episódio
+    assert columns["delivered"] == ("INTEGER", 1, "0", 0)  # NOT NULL DEFAULT 0
+    assert columns["updated_at"] == ("TEXT", 1, None, 0)  # NOT NULL (UTC ISO-8601)
 
 
 def test_newer_schema_is_refused(settings, capsys):
@@ -91,9 +117,9 @@ def test_newer_schema_is_refused(settings, capsys):
     with pytest.raises(SystemExit):
         apply_migrations(settings.db_path)
     assert "newer_schema_refused" in capsys.readouterr().out
-    # Nada foi aplicado além da recusa: as versões continuam 0001, 0002 e 9999.
+    # Nada foi aplicado além da recusa: as versões continuam 0001–0003 e 9999.
     versions, _ = _schema_state(settings.db_path)
-    assert sorted(versions) == ["0001", "0002", "9999"]
+    assert sorted(versions) == ["0001", "0002", "0003", "9999"]
 
 
 def test_concurrent_apply_race_is_exactly_once(settings):
@@ -116,8 +142,8 @@ def test_concurrent_apply_race_is_exactly_once(settings):
 
     assert failures == []  # ambas retornam sem exceção
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002"]  # exatamente 2 linhas, sem duplicar versão
-    assert EXPECTED_TABLES <= tables  # todas as 10 tabelas íntegras
+    assert versions == ["0001", "0002", "0003"]  # exatamente 1 linha por versão
+    assert EXPECTED_TABLES <= tables  # todas as tabelas íntegras
 
 
 def test_journal_mode_is_wal_after_apply(settings):
@@ -129,3 +155,29 @@ def test_journal_mode_is_wal_after_apply(settings):
     finally:
         conn.close()
     assert mode.lower() == "wal"
+
+
+def test_watch_direction_column_defaults_to_below_and_refuses_others(settings):
+    """ALERT-01: watch.direction nasce 'below' e o CHECK recusa qualquer outro valor.
+
+    O requisito manda o esquema nascer com a coluna direction (v0.1 aceita só
+    'below'): o padrão sem env explícito e a recusa do CHECK são comportamento
+    do esquema 0001, provados por INSERT real.
+    """
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        conn.execute(
+            "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', 10.0)"
+        )
+        row = conn.execute("SELECT direction FROM watch WHERE symbol = 'PETR4'").fetchone()
+        assert row["direction"] == "below"  # padrão do esquema v0.1
+
+        with pytest.raises(sqlite3.IntegrityError):  # v0.1 só aceita 'below'
+            conn.execute(
+                "INSERT INTO watch (symbol, market, target_below, direction) "
+                "VALUES ('BTCUSDT', 'crypto', 10.0, 'above')"
+            )
+    finally:
+        conn.close()
