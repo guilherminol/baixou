@@ -13,16 +13,19 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { readFileSync } from "node:fs";
 
 declare const process: { cwd(): string };
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
 import type { WatchItem } from "../api/watch";
 import type { StatusResponse } from "../api/status";
 import AlertsPage from "../pages/AlertsPage";
 
-const { requestMock, onUnauthorizedMock } = vi.hoisted(() => ({
+const { requestMock, onUnauthorizedMock, holder401 } = vi.hoisted(() => ({
   requestMock: vi.fn(),
   onUnauthorizedMock: vi.fn(),
+  // Guarda o ÚLTIMO handler registrado — o mock de request dispara-o ANTES de
+  // lançar um 401, replicando o contrato do client real (handler antes do throw).
+  holder401: { handler: null as null | (() => void) },
 }));
 
 vi.mock("../api/client", () => {
@@ -52,7 +55,10 @@ vi.mock("../api/client", () => {
   }
   return {
     ApiError,
-    onUnauthorized: onUnauthorizedMock,
+    onUnauthorized: (handler: (() => void) | null) => {
+      holder401.handler = handler;
+      onUnauthorizedMock(handler);
+    },
     parseErrosEnvelope: (body: unknown): { campo: string; problema: string }[] => {
       if (typeof body !== "object" || body === null || !("erros" in body)) return [];
       const erros = (body as { erros: unknown }).erros;
@@ -62,6 +68,13 @@ vi.mock("../api/client", () => {
     request: requestMock,
   };
 });
+
+/** Reproduz o client real num 401: o handler registrado é disparado ANTES do
+ * throw (client.ts chama handler401() antes de lançar a ApiError). */
+function disparar401(): never {
+  holder401.handler?.();
+  throw new ApiError(401, { detail: "não autenticado" }, "não autenticado");
+}
 
 // Fábrica de WatchItem com os defaults do contrato (item sem cotação).
 function item(
@@ -693,5 +706,244 @@ describe("AlertsPage — mutações da lista (UI-01)", () => {
     await act(async () => {});
     expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
     expect(linhaDe("BBDC4").textContent).toContain("—"); // sem cotação ainda
+  });
+});
+
+// ─── Resiliência da edição (Task 3): polling de 60 s sem sobrescrever
+// (merge determinístico, T-05-10) e 401 → modal de re-login no lugar (D-10) ──
+
+function contagemGet(caminho: string): number {
+  return requestMock.mock.calls.filter(
+    ([path, init]) => path === caminho && ((init as Iniciar | undefined)?.method ?? "GET") === "GET",
+  ).length;
+}
+
+function renderAlertasComRotas() {
+  return render(
+    <MemoryRouter initialEntries={["/"]}>
+      <Routes>
+        <Route path="/" element={<AlertsPage />} />
+        <Route path="/login" element={<p>PROBE-PAGINA-LOGIN</p>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("AlertsPage — polling de 60 s e re-login no lugar (D-10)", () => {
+  it("60 s após a carga refaz /api/watch e /api/status e atualiza os campos somente-leitura", async () => {
+    let carga = 0;
+    const atualizada = listaMista.map((i) =>
+      i.symbol === "PETR4" ? { ...i, price: 40.0, change_pct: 5 } : i,
+    );
+    vi.useFakeTimers();
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") {
+        carga += 1;
+        return { itens: carga === 1 ? listaMista : atualizada };
+      }
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertas();
+    await act(async () => {});
+    expect(linhaDe("PETR4").textContent).toContain("38,42");
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(linhaDe("PETR4").textContent).toContain("40,00"); // preço novo no mesmo tick
+    expect(contagemGet("/api/watch")).toBe(2);
+    expect(contagemGet("/api/status")).toBe(2);
+  });
+
+  it("merge (T-05-10): alvo editado NÃO salvo é preservado enquanto o preço atualiza no MESMO tick; item sem pendência substitui integralmente", async () => {
+    const segundoTick = listaMista.map((i) => {
+      if (i.symbol === "PETR4") return { ...i, price: 39.0, target_below: 36 };
+      if (i.symbol === "VALE3") return { ...i, price: 60.0 };
+      return i;
+    });
+    vi.useFakeTimers();
+    let carga = 0;
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") {
+        carga += 1;
+        return { itens: carga === 1 ? listaMista : segundoTick };
+      }
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertas();
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText("Alvo de PETR4"), { target: { value: "40" } });
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    // Alvo editado fica LOCAL; preço (somente-leitura) atualiza no mesmo tick.
+    expect(screen.getByLabelText("Alvo de PETR4")).toHaveValue(40);
+    expect(linhaDe("PETR4").textContent).toContain("39,00");
+    expect(linhaDe("PETR4").textContent).toContain("no alvo"); // 39 <= 40 (alvo local)
+    // Item sem pendência substitui integralmente (preço novo do servidor).
+    expect(linhaDe("VALE3").textContent).toContain("60,00");
+  });
+
+  it("input de alvo EM FOCO não é substituído pelo servidor no refresh; após o blur, o valor do servidor entra no tick seguinte", async () => {
+    const tickFoco = listaMista.map((i) =>
+      i.symbol === "PETR4" ? { ...i, target_below: 99 } : i,
+    );
+    const tickBlur = listaMista.map((i) =>
+      i.symbol === "PETR4" ? { ...i, target_below: 88 } : i,
+    );
+    vi.useFakeTimers();
+    let carga = 0;
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") {
+        carga += 1;
+        return { itens: carga === 1 ? listaMista : carga === 2 ? tickFoco : tickBlur };
+      }
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertas();
+    await act(async () => {});
+    fireEvent.focus(screen.getByLabelText("Alvo de PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByLabelText("Alvo de PETR4")).toHaveValue(36); // foco protege
+    fireEvent.blur(screen.getByLabelText("Alvo de PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByLabelText("Alvo de PETR4")).toHaveValue(88); // sem foco, servidor vence
+  });
+
+  it("pendência de remoção não ressuscita no refresh e item novo do servidor aparece", async () => {
+    const comNovo = [
+      ...listaMista.filter((i) => i.symbol !== "PETR4"),
+      item({ symbol: "BTCBRL", market: "crypto", target_below: 300000, price: 350000, currency: "R$", price_at: T1, fresh: "ok" }),
+    ];
+    vi.useFakeTimers();
+    let carga = 0;
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") {
+        carga += 1;
+        return { itens: carga === 1 ? listaMista : comNovo }; // o servidor AINDA tem PETR4
+      }
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertas();
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000); // pendência de DELETE confirmada
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(60_000); // tick de polling
+    });
+    expect(screen.queryByText("PETR4")).not.toBeInTheDocument(); // não ressuscita
+    expect(linhaDe("BTCBRL").textContent).toContain("R$"); // item novo aparece
+  });
+
+  it("401 no meio da edição → ReloginModal NO LUGAR (sem navegar), campos preservados e polling pausado", async () => {
+    vi.useFakeTimers();
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") return { itens: listaMista };
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      if (metodo === "PATCH" && path === "/api/watch/PETR4/b3") disparar401();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertasComRotas();
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "60" } });
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Pausar PETR4")); // 401 a caminho
+    await act(async () => {});
+    expect(screen.getByText("Sessão expirada")).toBeInTheDocument();
+    expect(screen.queryByText("PROBE-PAGINA-LOGIN")).not.toBeInTheDocument(); // sem navegação
+    expect(screen.getByLabelText("Alvo de VALE3")).toHaveValue(60); // edição em memória
+    const chamadasAntes = contagemGet("/api/watch");
+    await act(async () => {
+      vi.advanceTimersByTime(120_000); // dois ciclos com o modal aberto
+    });
+    expect(contagemGet("/api/watch")).toBe(chamadasAntes); // polling pausado
+  });
+
+  it("re-login com sucesso dentro do modal: fecha, recarrega watch+status na hora e o ciclo de 60 s retoma", async () => {
+    let carga = 0;
+    const aposRelogar = listaMista.map((i) =>
+      i.symbol === "PETR4" ? { ...i, price: 41.0 } : i,
+    );
+    vi.useFakeTimers();
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") {
+        carga += 1;
+        return { itens: carga >= 2 ? aposRelogar : listaMista };
+      }
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      if (metodo === "PATCH" && path === "/api/watch/PETR4/b3") disparar401();
+      if (metodo === "POST" && path === "/api/auth/login") return {};
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertasComRotas();
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Pausar PETR4"));
+    await act(async () => {});
+    expect(screen.getByText("Sessão expirada")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Usuário"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("Senha"), { target: { value: "senha-super-segura-123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Entrar" }));
+    await act(async () => {});
+    expect(screen.queryByText("Sessão expirada")).not.toBeInTheDocument(); // modal fechou
+    expect(contagemGet("/api/watch")).toBe(2); // carga IMEDIATA após re-entrar
+    expect(linhaDe("PETR4").textContent).toContain("41,00");
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(contagemGet("/api/watch")).toBe(3); // o ciclo de 60 s retomou
+  });
+
+  it("re-login com credenciais erradas mostra o erro inline no modal, que permanece aberto", async () => {
+    vi.useFakeTimers();
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") return { itens: listaMista };
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      if (metodo === "PATCH" && path === "/api/watch/PETR4/b3") disparar401();
+      if (metodo === "POST" && path === "/api/auth/login") {
+        throw new ApiError(401, { detail: "usuário ou senha inválidos" }, "usuário ou senha inválidos");
+      }
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    renderAlertasComRotas();
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Pausar PETR4"));
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText("Usuário"), { target: { value: "admin" } });
+    fireEvent.change(screen.getByLabelText("Senha"), { target: { value: "errada" } });
+    fireEvent.click(screen.getByRole("button", { name: "Entrar" }));
+    await act(async () => {});
+    expect(screen.getByText("usuário ou senha inválidos")).toBeInTheDocument();
+    expect(screen.getByText("Sessão expirada")).toBeInTheDocument(); // segue aberto
+  });
+
+  it("o handler de 401 é registrado no mount e desregistrado com null no unmount — sem vazamento", async () => {
+    vi.useFakeTimers();
+    requestMock.mockImplementation(async (path, init) => {
+      const metodo = init?.method ?? "GET";
+      if (metodo === "GET" && path === "/api/watch") return { itens: listaMista };
+      if (metodo === "GET" && path === "/api/status") return statusPadrao();
+      throw new Error(`chamada inesperada: ${metodo} ${path}`);
+    });
+    const { unmount } = renderAlertasComRotas();
+    await act(async () => {});
+    expect(onUnauthorizedMock).toHaveBeenCalledWith(expect.any(Function));
+    unmount();
+    expect(onUnauthorizedMock).toHaveBeenLastCalledWith(null);
   });
 });
