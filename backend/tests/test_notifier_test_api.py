@@ -20,7 +20,6 @@ import inspect
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
 
 import httpx
 from baixou.core.db import WEB_TIMEOUT_S, connect
@@ -123,8 +122,10 @@ def _injeta_cliente(monkeypatch, handler) -> list[httpx.Request]:
 
 
 def _canal_aceita(request: httpx.Request) -> httpx.Response:
-    # sanity: o envio real usa o token do Settings (o módulo sob teste monta a URL)
-    assert ("bot" + TOKEN_SECRETO) in str(request.url)
+    # sanity: o envio TELEGRAM usa o token real do Settings na URL do bot —
+    # o ntfy via sem token na URL (o Bearer vai no cabeçalho, D-14).
+    if request.url.host == "api.telegram.org":
+        assert ("bot" + TOKEN_SECRETO) in str(request.url)
     return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
 
 

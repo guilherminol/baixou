@@ -23,7 +23,7 @@ from baixou.core.config import Settings, load_settings
 from baixou.core.db import WEB_TIMEOUT_S, check_sqlite_version, connect
 from baixou.core.log import configure
 from baixou.core.migrations import apply_migrations
-from baixou.web import auth, status, watch
+from baixou.web import auth, notifier_test, status, watch
 from baixou.web.schemas import erro_item
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -162,6 +162,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(watch.router)
     app.include_router(status.router)
+    app.include_router(notifier_test.router)
     # Erros de forma do pydantic no MESMO envelope D-08 das recusas de negócio:
     # a Fase 5 renderiza os dois com o mesmo código (D-08, contrato congelado).
     app.add_exception_handler(RequestValidationError, envelope_validacao)

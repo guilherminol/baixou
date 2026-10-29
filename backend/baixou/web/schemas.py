@@ -173,6 +173,20 @@ class StatusResponse(BaseModel):
     canais: list[StatusCanal]
 
 
+class TesteNotificador(BaseModel):
+    """Resultado do POST /api/notifiers/{canal}/test — contrato CONGELADO (D-05, NOTIF-02).
+
+    A falha de entrega do canal é RESULTADO do teste, NUNCA erro HTTP: todo
+    caminho tentado responde 200 com ``ok`` e ``mensagem`` PT-BR (409 só para
+    canal sem configuração; 422 no envelope D-08 para canal fora do Literal).
+    As mensagens citam apenas o kind e o código HTTP — nunca token, chat_id,
+    tópico ou URL (K2/T-05-01). Nomes definitivos: geram os tipos TS da Fase 5.
+    """
+
+    ok: bool
+    mensagem: str
+
+
 def erro_item(symbol: str | None, campo: str, problema: str) -> dict:
     """Monta UMA entrada do envelope D-08 (PT-BR em ``problema``)."""
     return {"symbol": symbol, "campo": campo, "problema": problema}

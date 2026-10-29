@@ -250,6 +250,25 @@
         "title": "StatusResponse",
         "type": "object"
       },
+      "TesteNotificador": {
+        "description": "Resultado do POST /api/notifiers/{canal}/test — contrato CONGELADO (D-05, NOTIF-02).\n\nA falha de entrega do canal é RESULTADO do teste, NUNCA erro HTTP: todo\ncaminho tentado responde 200 com ``ok`` e ``mensagem`` PT-BR (409 só para\ncanal sem configuração; 422 no envelope D-08 para canal fora do Literal).\nAs mensagens citam apenas o kind e o código HTTP — nunca token, chat_id,\ntópico ou URL (K2/T-05-01). Nomes definitivos: geram os tipos TS da Fase 5.",
+        "properties": {
+          "mensagem": {
+            "title": "Mensagem",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "mensagem"
+        ],
+        "title": "TesteNotificador",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -483,6 +502,50 @@
           }
         },
         "summary": "Logout"
+      }
+    },
+    "/api/notifiers/{canal}/test": {
+      "post": {
+        "description": "Envia UM aviso de teste pelo canal e devolve {ok, mensagem} (D-05).\n\nImport dos módulos de canal DENTRO do handler (molde configured_channels);\n409 para canal não configurado vem ANTES de criar cliente ou rede. O\nresultado tipado do canal é mapeado SEM levantar: aceite → ok; recusa com\ncódigo HTTP → kind + HTTP; falha de transporte (sem código) → só o kind.\nNenhuma escrita em lugar nenhum: o módulo nem importa o helper de conexão.",
+        "operationId": "testar_canal_api_notifiers__canal__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canal",
+            "required": true,
+            "schema": {
+              "enum": [
+                "telegram",
+                "ntfy"
+              ],
+              "title": "Canal",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TesteNotificador"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Testar Canal"
       }
     },
     "/api/setup": {
