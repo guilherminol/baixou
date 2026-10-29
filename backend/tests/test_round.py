@@ -102,11 +102,14 @@ def fake_http(monkeypatch) -> _FakeHttp:
     return fake
 
 
-def seed_watch(conn: sqlite3.Connection, symbol: str, market: str) -> None:
-    """Semeia um ticker na watch (isolation_level=None: INSERT em autocommit)."""
+def seed_watch(conn: sqlite3.Connection, symbol: str, market: str, paused: int = 0) -> None:
+    """Semeia um ticker na watch (isolation_level=None: INSERT em autocommit).
+
+    ``paused`` semeia a coluna da migração 0004 (04-03): default 0 = ativo.
+    """
     conn.execute(
-        "INSERT INTO watch (symbol, market, target_below) VALUES (?, ?, ?)",
-        (symbol, market, 10.0),
+        "INSERT INTO watch (symbol, market, target_below, paused) VALUES (?, ?, ?, ?)",
+        (symbol, market, 10.0, paused),
     )
 
 
@@ -911,3 +914,113 @@ def test_round_quota_door_reopens_after_utc_rollover(db, settings, monkeypatch, 
     assert row["month"] == "2026-11"  # reset da virada (D-06)
     assert row["calls"] == 1  # e a chamada da rodada nova conta a partir do zero
     assert row["warned_80"] == 0
+
+
+# --- 04-03 Task 3 (D-09/D-01): pausa obedecida ANTES da fonte e pruning de órfãs ---
+
+
+def test_round_skips_paused_item_never_consulting_its_source(db, settings, monkeypatch, fake_http):
+    """PETR4 pausado × BTCUSDT ativo: ZERO requisições brapi; exatamente a da Binance (D-09)."""
+    seed_watch(db, "PETR4", "b3", paused=1)
+    seed_watch(db, "BTCUSDT", "crypto")
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
+    assert brapi_requests == []  # a cota da brapi não é queimada pelo pausado
+    binance_requests = [r for r in fake_http.requests if r.url.host == "api.binance.com"]
+    assert len(binance_requests) == 1  # o ativo segue com o lote único normal
+    assert json.loads(binance_requests[0].url.params["symbols"]) == ["BTCUSDT"]
+
+
+def test_round_keeps_paused_quote_frozen(db, settings, monkeypatch, fake_http):
+    """Quote do pausado bit-a-bit igual antes/depois da rodada: sem linha nova, sem erro novo."""
+    seed_watch(db, "PETR4", "b3", paused=1)
+    db.execute(
+        "INSERT INTO quote (symbol, market, price, price_at, change_pct, alerted) "
+        "VALUES ('PETR4', 'b3', 35.2, '2026-10-28T15:45:00Z', -1.2, 0)"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    _SELECAO = "SELECT price, price_at, change_pct, alerted, last_fetch_error FROM quote"
+    antes = tuple(
+        db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone()
+    )
+    worker_main.run_round(db, settings)
+    depois = tuple(
+        db.execute(f"{_SELECAO} WHERE symbol = 'PETR4'").fetchone()
+    )
+
+    assert antes == depois  # congelada: nenhum campo mudou
+    assert (
+        db.execute("SELECT COUNT(*) AS n FROM quote WHERE market = 'b3'").fetchone()["n"] == 1
+    )  # sem linha nova
+    run_row = db.execute("SELECT last_run FROM run WHERE id = 1").fetchone()
+    assert run_row["last_run"] is not None  # a rodada segue completa com o batimento
+
+
+def test_round_resume_consults_source_again_next_round(db, settings, monkeypatch, fake_http):
+    """Retomar (paused=0): a rodada seguinte reconsulta a fonte — o frescor se resolve sozinho."""
+    seed_watch(db, "PETR4", "b3", paused=1)
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+    assert [r for r in fake_http.requests if r.url.host == "brapi.dev"] == []  # pausado não sai
+
+    db.execute("UPDATE watch SET paused = 0 WHERE symbol = 'PETR4'")
+    worker_main.run_round(db, settings)
+
+    brapi_requests = [r for r in fake_http.requests if r.url.host == "brapi.dev"]
+    assert [r.url.path.rsplit("/", 1)[-1] for r in brapi_requests] == ["PETR4"]  # reconsultado
+    quote = db.execute("SELECT price FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["price"] == 38.25  # frescor resolvido na própria rodada
+
+
+def test_round_prunes_orphan_quotes_even_with_fetch_error(db, settings, monkeypatch, fake_http):
+    """Órfã com last_fetch_error='not_found' é apagada pela rodada; presentes permanecem (D-01)."""
+    seed_watch(db, "PETR4", "b3")
+    seed_watch(db, "BTCUSDT", "crypto")
+    # Órfã direto no banco (o pai já saiu pela web): a migração 0004 deixou de
+    # cascata — ela só some pelo pruning da write_tx única.
+    db.execute(
+        "INSERT INTO quote (symbol, market, price, alerted, last_fetch_error) "
+        "VALUES ('VALE3', 'b3', 61.0, 1, 'not_found')"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    orfas = db.execute(
+        "SELECT COUNT(*) AS n FROM quote WHERE symbol = 'VALE3'"
+    ).fetchone()["n"]
+    assert orfas == 0  # a órfã some, inclusive com o last_fetch_error preenchido
+    assert db.execute("SELECT COUNT(*) AS n FROM watch").fetchone()["n"] == 2  # watch intacta
+    assert (
+        db.execute("SELECT price FROM quote WHERE symbol = 'PETR4'").fetchone()["price"] == 38.25
+    )
+    assert (
+        db.execute("SELECT price FROM quote WHERE symbol = 'BTCUSDT'").fetchone()["price"]
+        == 270000.0
+    )  # as quotes dos presentes permanecem
+
+
+def test_round_with_empty_watch_still_prunes_orphans(db, settings, monkeypatch, fake_http):
+    """Rodada sem nenhum item em watch ainda poda órfãs (DELETE incondicional na write_tx)."""
+    db.execute(
+        "INSERT INTO quote (symbol, market, price, last_fetch_error) "
+        "VALUES ('SOLUSDT', 'crypto', 96.5, NULL)"
+    )
+    fake_http.route(_happy_handlers())
+    _freeze_clock_inside_market(monkeypatch)
+
+    worker_main.run_round(db, settings)
+
+    assert db.execute("SELECT COUNT(*) AS n FROM quote").fetchone()["n"] == 0  # órfã podada
+    run_row = db.execute("SELECT last_run, worker_lock_at FROM run WHERE id = 1").fetchone()
+    assert run_row["last_run"] is not None  # a rodada segue completa
+    assert run_row["worker_lock_at"] is not None
