@@ -1,13 +1,25 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import AppHeader from "../components/AppHeader";
-import { listarItens, type WatchItem } from "../api/watch";
+import {
+  listarItens,
+  patchPause,
+  removerItem,
+  salvarLote,
+  type Market,
+  type WatchItem,
+} from "../api/watch";
 import { buscarStatus, type StatusResponse } from "../api/status";
+import { ApiError, parseErrosEnvelope } from "../api/client";
 import { formatCurrency, formatPercent, formatTime, timeAgoMinutes } from "../lib/format";
 import "../styles/alerts.css";
 
 /** Chave única do item: symbol|market (o símbolo é único por mercado). */
+function chaveDe(symbol: string, market: string): string {
+  return `${symbol}|${market}`;
+}
+
 function chave(item: WatchItem): string {
-  return `${item.symbol}|${item.market}`;
+  return chaveDe(item.symbol, item.market);
 }
 
 /**
@@ -105,6 +117,7 @@ export function problemasDoStatus(status: StatusResponse): string[] {
 }
 
 const COLUNAS = 8; // Ticker · Preço · Alvo · Distância · Estado · Atualização · Disparo · ações
+const JANELA_UNDO_MS = 5000; // WATCH-01: "Desfazer" por 5 s, timer POR item
 
 function CabecalhoTabela() {
   return (
@@ -123,29 +136,66 @@ function CabecalhoTabela() {
   );
 }
 
-function LinhaItem({ item }: { item: WatchItem }) {
-  const dist = distancia(item);
-  const suspeita = linhaSuspeita(item);
-  const canais = falhasDeCanal(item);
+function LinhaUndo({ item, desfazer }: { item: WatchItem; desfazer: () => void }) {
+  return (
+    <tr className="row-undo">
+      <td colSpan={COLUNAS}>
+        <span>{item.symbol} removido. </span>
+        <button type="button" className="btn-action" onClick={desfazer}>
+          Desfazer
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+function LinhaItem({
+  item,
+  alvo,
+  valorAlvo,
+  erroSalva,
+  aoEditarAlvo,
+  aoAlternarPausa,
+  aoRemover,
+}: {
+  item: WatchItem;
+  alvo: number;
+  valorAlvo: string;
+  erroSalva: string | null;
+  aoEditarAlvo: (item: WatchItem, valor: string) => void;
+  aoAlternarPausa: (item: WatchItem) => void;
+  aoRemover: (item: WatchItem) => void;
+}) {
+  // A linha renderiza com o alvo EFETIVO (o editado localmente quando houver):
+  // distância e estado recalculam na hora (comportamento do mockup).
+  const visual: WatchItem = { ...item, target_below: alvo };
+  const dist = distancia(visual);
+  const suspeita = linhaSuspeita(visual);
+  const canais = falhasDeCanal(visual);
   return (
     <>
       <tr>
-        <td className="symbol-cell">{item.symbol}</td>
-        <td className="num">{formatCurrency(item.price, item.currency)}</td>
+        <td className="symbol-cell">{visual.symbol}</td>
+        <td className="num">{formatCurrency(visual.price, visual.currency)}</td>
         <td className="num">
-          {/* A edição liga no próximo passo; aqui o molde já está no DOM. */}
           <input
             className="input-target"
             type="number"
             step="any"
             min="0"
-            aria-label={`Alvo de ${item.symbol}`}
-            defaultValue={item.target_below}
+            aria-label={`Alvo de ${visual.symbol}`}
+            value={valorAlvo}
+            onChange={(evento) => aoEditarAlvo(item, evento.target.value)}
           />
         </td>
         <td className={dist.classe + " col-dobra"}>{dist.texto}</td>
         <td>
-          <span className={estadoClasse(item)}>{estadoTexto(item)}</span>
+          <span className={estadoClasse(visual)}>{estadoTexto(visual)}</span>
+          {erroSalva !== null ? (
+            <span className="erro-item" data-testid={`erro-item-${visual.symbol}`}>
+              {erroSalva}
+            </span>
+          ) : null}
           {suspeita !== null ? (
             <span className="estado-extra">{suspeita}</span>
           ) : null}
@@ -155,17 +205,36 @@ function LinhaItem({ item }: { item: WatchItem }) {
             </span>
           ))}
         </td>
-        <td className="num col-dobra">{formatTime(item.price_at)}</td>
-        <td className="num col-dobra">{formatTime(item.alerted_at)}</td>
-        <td></td>
+        <td className="num col-dobra">{formatTime(visual.price_at)}</td>
+        <td className="num col-dobra">{formatTime(visual.alerted_at)}</td>
+        <td className="num">
+          {/* D-09: Pausar/Retomar + Remover na célula de ações, alvos de 44px.
+              A pausa é PATCH imediato — nunca entra no lote do Salvar. */}
+          <button
+            type="button"
+            className="btn-action"
+            aria-label={`${visual.paused ? "Retomar" : "Pausar"} ${visual.symbol}`}
+            onClick={() => aoAlternarPausa(item)}
+          >
+            {visual.paused ? "Retomar" : "Pausar"}
+          </button>
+          <button
+            type="button"
+            className="btn-action"
+            aria-label={`Remover ${visual.symbol}`}
+            onClick={() => aoRemover(item)}
+          >
+            Remover
+          </button>
+        </td>
       </tr>
       {/* Sub-linha D-06: oculta no desktop, revelada <= 600px pela media
           query de alerts.css (o conteúdo dobra distância + horas). */}
       <tr className="sub-linha-row">
         <td colSpan={COLUNAS} className="sub-linha">
           <span>distância {dist.texto}</span>
-          <span>atualização {formatTime(item.price_at)}</span>
-          <span>disparo {formatTime(item.alerted_at)}</span>
+          <span>atualização {formatTime(visual.price_at)}</span>
+          <span>disparo {formatTime(visual.alerted_at)}</span>
         </td>
       </tr>
     </>
@@ -177,11 +246,27 @@ function SecaoMercado({
   itens,
   vazia,
   carregando,
+  emUndo,
+  alvoDe,
+  valorAlvoDe,
+  erroDe,
+  aoEditarAlvo,
+  aoAlternarPausa,
+  aoRemover,
+  aoDesfazer,
 }: {
   titulo: string;
   itens: WatchItem[];
   vazia: string;
   carregando: boolean;
+  emUndo: Set<string>;
+  alvoDe: (item: WatchItem) => number;
+  valorAlvoDe: (item: WatchItem) => string;
+  erroDe: (item: WatchItem) => string | null;
+  aoEditarAlvo: (item: WatchItem, valor: string) => void;
+  aoAlternarPausa: (item: WatchItem) => void;
+  aoRemover: (item: WatchItem) => void;
+  aoDesfazer: (item: WatchItem) => void;
 }) {
   return (
     <section className="market-section">
@@ -190,14 +275,33 @@ function SecaoMercado({
         <table>
           <CabecalhoTabela />
           <tbody>
-            {carregando ? null : itens.length === 0 ? (
+            {carregando ? null : itens.length === 0 && emUndo.size === 0 ? (
               <tr>
                 <td colSpan={COLUNAS} className="empty-state">
                   {vazia}
                 </td>
               </tr>
             ) : (
-              itens.map((item) => <LinhaItem key={chave(item)} item={item} />)
+              itens.map((item) =>
+                emUndo.has(chave(item)) ? (
+                  <LinhaUndo
+                    key={chave(item)}
+                    item={item}
+                    desfazer={() => aoDesfazer(item)}
+                  />
+                ) : (
+                  <LinhaItem
+                    key={chave(item)}
+                    item={item}
+                    alvo={alvoDe(item)}
+                    valorAlvo={valorAlvoDe(item)}
+                    erroSalva={erroDe(item)}
+                    aoEditarAlvo={aoEditarAlvo}
+                    aoAlternarPausa={aoAlternarPausa}
+                    aoRemover={aoRemover}
+                  />
+                ),
+              )
             )}
           </tbody>
         </table>
@@ -206,14 +310,31 @@ function SecaoMercado({
   );
 }
 
-// Página de alertas (UI-01) — caminho de LEITURA: carrega /api/watch e
-// /api/status em paralelo, agrupa por mercado e renderiza estados em texto
-// (D-07), coluna Disparo (D-08), meta-line (D-03) e banner do sistema
-// (D-17). As mutações (adicionar/editar/remover/salvar/pausar) entram na
-// sequência deste plano; o polling e o re-login no lugar (D-10) depois delas.
+// Página de alertas (UI-01): leitura agrupada + o ciclo completo de edição —
+// adicionar (lista local, pendência do lote), editar alvo inline, remover com
+// "Desfazer" de 5 s (timer POR item), Salvar executando os DELETE pendentes e
+// SÓ ENTÃO o PUT em lote (que NUNCA remove, D-07) — e pausar/retomar por
+// PATCH imediato (D-09). Alterações vivem SÓ em memória (sem storage).
 export default function AlertsPage() {
   const [itens, setItens] = useState<WatchItem[] | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  // Estado de edição (molde setDirty do mockup, portado para React):
+  const [edicoes, setEdicoes] = useState<Map<string, number>>(new Map()); // alvos válidos editados (chave → alvo)
+  const [rascunhosAlvo, setRascunhosAlvo] = useState<Map<string, string>>(new Map()); // texto cru do input (inválido fica só no rascunho)
+  const [novos, setNovos] = useState<Set<string>>(new Set()); // itens só-locais (vão no PUT como criação)
+  const [emUndo, setEmUndo] = useState<Set<string>>(new Set()); // remoções na janela de 5 s (linha .row-undo)
+  const [pendenciasRemocao, setPendenciasRemocao] = useState<Set<string>>(new Set()); // remoções confirmadas (DELETE no Salvar)
+  const [salvando, setSalvando] = useState(false);
+  const [salvoAgora, setSalvoAgora] = useState(false);
+  const [erroBarra, setErroBarra] = useState<string | null>(null);
+  const [errosSalvar, setErrosSalvar] = useState<Map<string, string>>(new Map()); // envelope D-08 por symbol
+  const [novo, setNovo] = useState<{ symbol: string; market: Market; alvo: string }>({
+    symbol: "",
+    market: "b3",
+    alvo: "",
+  });
+  const [erroNovo, setErroNovo] = useState<string | null>(null);
+  const timersUndo = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     let vivo = true;
@@ -236,10 +357,227 @@ export default function AlertsPage() {
     };
   }, []);
 
+  // Timers de undo são cancelados no unmount (sem vazamento, sem setState pós-morte).
+  useEffect(() => {
+    const timers = timersUndo.current;
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+
+  const dirty =
+    edicoes.size > 0 || pendenciasRemocao.size > 0 || novos.size > 0;
+
+  function editarAlvo(itemDaLinha: WatchItem, valor: string) {
+    const chaveItem = chave(itemDaLinha);
+    setRascunhosAlvo((anterior) => new Map(anterior).set(chaveItem, valor));
+    setSalvoAgora(false);
+    if (valor.trim() === "") return; // NaN: não marca dirty
+    const numero = Number(valor);
+    if (!Number.isFinite(numero) || numero < 0) return; // inválido: só o rascunho
+    setEdicoes((anterior) => new Map(anterior).set(chaveItem, numero));
+    setErrosSalvar((anterior) => {
+      if (!anterior.has(itemDaLinha.symbol)) return anterior;
+      const proximo = new Map(anterior);
+      proximo.delete(itemDaLinha.symbol);
+      return proximo;
+    });
+  }
+
+  function remover(itemDaLinha: WatchItem) {
+    const chaveItem = chave(itemDaLinha);
+    setSalvoAgora(false);
+    setEmUndo((anterior) => new Set(anterior).add(chaveItem));
+    // Timer POR item (molde 590–602): expirado, a linha sai da lista local e a
+    // chave vira pendência de DELETE — remoção persiste SÓ por DELETE.
+    const timer = window.setTimeout(() => {
+      timersUndo.current.delete(chaveItem);
+      setEmUndo((anterior) => {
+        const proximo = new Set(anterior);
+        proximo.delete(chaveItem);
+        return proximo;
+      });
+      setItens((anterior) =>
+        (anterior ?? []).filter((i) => chave(i) !== chaveItem),
+      );
+      setPendenciasRemocao((anterior) => new Set(anterior).add(chaveItem));
+    }, JANELA_UNDO_MS);
+    timersUndo.current.set(chaveItem, timer);
+  }
+
+  function desfazer(itemDaLinha: WatchItem) {
+    const chaveItem = chave(itemDaLinha);
+    const timer = timersUndo.current.get(chaveItem);
+    if (timer !== undefined) window.clearTimeout(timer);
+    timersUndo.current.delete(chaveItem);
+    setEmUndo((anterior) => {
+      const proximo = new Set(anterior);
+      proximo.delete(chaveItem);
+      return proximo;
+    });
+    // SEM rede: o item nunca saiu de itens — restaura na hora.
+  }
+
+  async function alternarPausa(itemDaLinha: WatchItem) {
+    try {
+      // PATCH imediato (D-09): a resposta é o WatchItem completo que substitui
+      // a linha — o item pausado segue visível com estado "pausado".
+      const resposta = await patchPause(
+        itemDaLinha.symbol,
+        itemDaLinha.market,
+        !itemDaLinha.paused,
+      );
+      setItens((anterior) =>
+        (anterior ?? []).map((i) =>
+          chave(i) === chave(resposta) ? resposta : i,
+        ),
+      );
+    } catch {
+      // 401 vai pelo handler global; falha de pausa preserva a linha como está.
+    }
+  }
+
+  function adicionar(evento: FormEvent) {
+    evento.preventDefault();
+    const symbol = novo.symbol.trim().toUpperCase(); // espelho do _normalizar do servidor
+    if (!symbol) {
+      setErroNovo("informe o ticker do ativo");
+      return;
+    }
+    if (novo.alvo.trim() === "" || !Number.isFinite(Number(novo.alvo)) || Number(novo.alvo) <= 0) {
+      setErroNovo("o alvo deve ser maior que zero");
+      return;
+    }
+    const chaveNova = chaveDe(symbol, novo.market);
+    const duplicado =
+      novos.has(chaveNova) ||
+      (itens ?? []).some(
+        (i) => chave(i) === chaveNova && !emUndo.has(chave(i)),
+      );
+    if (duplicado) {
+      // Erro inline no lugar do alert() do mockup (adaptação acordada no CONTEXT).
+      setErroNovo("Este ticker já está na lista.");
+      return;
+    }
+    setItens((anterior) => [
+      ...(anterior ?? []),
+      {
+        symbol,
+        market: novo.market,
+        target_below: Number(novo.alvo),
+        paused: false,
+        currency: "",
+        price: null,
+        price_at: null,
+        change_pct: null,
+        alerted: false,
+        alerted_at: null,
+        notify_state: null,
+        fresh: "none",
+        suspect: false,
+      },
+    ]);
+    setNovos((anterior) => new Set(anterior).add(chaveNova));
+    setErroNovo(null);
+    setSalvoAgora(false);
+    setNovo((anterior) => ({ ...anterior, symbol: "", alvo: "" }));
+  }
+
+  async function salvar() {
+    if (!dirty || salvando || itens === null) return;
+    setSalvoAgora(false);
+    // Molde 676–681: o Salvar FLUSHA os timers de undo — o que está na janela
+    // é confirmado como remoção agora (vai para o DELETE, nunca para o PUT).
+    const chavesEmJanela = [...emUndo];
+    for (const timer of timersUndo.current.values()) window.clearTimeout(timer);
+    timersUndo.current.clear();
+    const chavesApagadas = [...pendenciasRemocao, ...chavesEmJanela];
+    const itensRestantes = itens.filter(
+      (i) => !chavesApagadas.includes(chave(i)),
+    );
+    if (chavesEmJanela.length > 0) {
+      setEmUndo(new Set());
+      setItens(itensRestantes);
+    }
+    setSalvando(true);
+    setErroBarra(null);
+    try {
+      // T-05-11: DELETE item a item, em sequência; qualquer falha interrompe
+      // ANTES do PUT — remoção persiste SÓ por DELETE, NUNCA por PUT menor.
+      for (const chaveApagada of chavesApagadas) {
+        const [symbolApagado, marketApagado] = chaveApagada.split("|");
+        await removerItem(symbolApagado, marketApagado as Market);
+      }
+      const resposta = await salvarLote(
+        itensRestantes.map((i) => ({
+          symbol: i.symbol,
+          market: i.market,
+          target_below: edicoes.get(chave(i)) ?? i.target_below,
+        })),
+      );
+      // A resposta do PUT É a nova lista renderizada (watch.py devolve a lista completa).
+      setItens(resposta.itens);
+      setNovos(new Set());
+      setPendenciasRemocao(new Set());
+      setEmUndo(new Set());
+      setEdicoes(new Map());
+      setRascunhosAlvo(new Map());
+      setErrosSalvar(new Map());
+      setSalvoAgora(true);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 422) {
+        // Envelope D-08: o problema de cada item renderiza inline junto ao
+        // ticker nomeado; o estado permanece dirty (parser ÚNICO do client).
+        const erros = new Map<string, string>();
+        for (const entrada of parseErrosEnvelope(e.body)) {
+          if (entrada.symbol !== null) {
+            erros.set(entrada.symbol, `${entrada.campo}: ${entrada.problema}`);
+          }
+        }
+        setErrosSalvar(erros);
+      } else if (e instanceof ApiError) {
+        setErroBarra(e.message);
+      } else {
+        setErroBarra("Erro de rede ao salvar");
+      }
+    } finally {
+      setSalvando(false);
+    }
+  }
+
   const carregando = itens === null;
-  const b3 = (itens ?? []).filter((item) => item.market === "b3");
-  const cripto = (itens ?? []).filter((item) => item.market === "crypto");
+  const lista = itens ?? [];
+  const b3 = lista.filter((item) => item.market === "b3");
+  const cripto = lista.filter((item) => item.market === "crypto");
   const problemas = status === null ? [] : problemasDoStatus(status);
+  const alvoDe = (itemDaLinha: WatchItem): number =>
+    edicoes.get(chave(itemDaLinha)) ?? itemDaLinha.target_below;
+  const valorAlvoDe = (itemDaLinha: WatchItem): string => {
+    const chaveItem = chave(itemDaLinha);
+    return rascunhosAlvo.get(chaveItem) ?? String(alvoDe(itemDaLinha));
+  };
+
+  const statusBarra = salvando
+    ? "Salvando..."
+    : erroBarra !== null
+      ? erroBarra
+      : dirty
+        ? "Alterações não salvas"
+        : salvoAgora
+          ? "Alterações salvas com sucesso"
+          : "Tudo salvo";
+
+  const propsSecao = {
+    emUndo,
+    alvoDe,
+    valorAlvoDe,
+    erroDe: (itemDaLinha: WatchItem) => errosSalvar.get(itemDaLinha.symbol) ?? null,
+    aoEditarAlvo: editarAlvo,
+    aoAlternarPausa: (itemDaLinha: WatchItem) => void alternarPausa(itemDaLinha),
+    aoRemover: remover,
+    aoDesfazer: desfazer,
+  };
 
   return (
     <main className="container">
@@ -254,13 +592,108 @@ export default function AlertsPage() {
         itens={b3}
         vazia="Nenhuma ação monitorada. Use o formulário abaixo."
         carregando={carregando}
+        {...propsSecao}
       />
       <SecaoMercado
         titulo="Cripto"
         itens={cripto}
         vazia="Nenhuma criptomoeda monitorada. Use o formulário abaixo."
         carregando={carregando}
+        {...propsSecao}
       />
+
+      {/* Novo alerta (molde .add-block): fica SÓ na lista local e entra no
+          PUT do Salvar — a validação na fonte vale no Salvar (decisão do plano). */}
+      <section className="add-block">
+        <h2>Novo alerta</h2>
+        <form
+          className="add-form"
+          onSubmit={adicionar}
+          noValidate
+          aria-label="Novo alerta"
+        >
+          <div>
+            <label htmlFor="novo-ticker" className="rotulo-sr">
+              Novo ticker
+            </label>
+            <input
+              id="novo-ticker"
+              type="text"
+              placeholder="Ticker (ex: ITUB4)"
+              autoComplete="off"
+              autoCapitalize="characters"
+              value={novo.symbol}
+              onChange={(evento) =>
+                setNovo((anterior) => ({ ...anterior, symbol: evento.target.value }))
+              }
+            />
+          </div>
+          <div>
+            <label htmlFor="novo-mercado" className="rotulo-sr">
+              Mercado
+            </label>
+            <select
+              id="novo-mercado"
+              value={novo.market}
+              onChange={(evento) =>
+                setNovo((anterior) => ({
+                  ...anterior,
+                  market: evento.target.value as Market,
+                }))
+              }
+            >
+              <option value="b3">Ações (B3)</option>
+              <option value="crypto">Cripto</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="novo-alvo" className="rotulo-sr">
+              Novo alvo
+            </label>
+            <input
+              id="novo-alvo"
+              type="number"
+              step="any"
+              min="0"
+              placeholder="Alvo em R$"
+              value={novo.alvo}
+              onChange={(evento) =>
+                setNovo((anterior) => ({ ...anterior, alvo: evento.target.value }))
+              }
+            />
+          </div>
+          <button type="submit">Adicionar</button>
+        </form>
+        {erroNovo !== null ? (
+          <p className="erro-campo" role="alert">
+            {erroNovo}
+          </p>
+        ) : null}
+      </section>
+
+      {/* Barra de salvar fixa (molde .action-bar): Salvar habilita só com
+          pendências; aria-live anuncia o status (contrato de interação). */}
+      <div className="action-bar">
+        <div className="action-bar-content">
+          <span
+            className={
+              "status-msg" + (dirty || erroBarra !== null ? " dirty" : "")
+            }
+            role="status"
+            aria-live="polite"
+          >
+            {statusBarra}
+          </span>
+          <button
+            type="button"
+            className={"btn-save" + (dirty ? " active" : "")}
+            disabled={!dirty || salvando}
+            onClick={() => void salvar()}
+          >
+            Salvar
+          </button>
+        </div>
+      </div>
     </main>
   );
 }

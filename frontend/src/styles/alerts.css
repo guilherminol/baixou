@@ -46,6 +46,20 @@
   white-space: normal;
 }
 
+/* Rótulos visualmente ocultos (contrato de interação: todo input com
+   <label>) — o bloco "Novo alerta" usa placeholders como o mockup. */
+.rotulo-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* D-06 (SC-5): em telas estreitas as 3 colunas dobráveis (Distância,
    Atualização, Disparo) saem e a sub-linha entra — as 4 colunas (Ticker ·
    Preço · Alvo · Estado) + ações permanecem visíveis em 360px, sem rolagem

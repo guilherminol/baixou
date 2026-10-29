@@ -292,10 +292,12 @@ describe("AlertsPage — lista real agrupada (tracer UI-01)", () => {
     expect(screen.getByText(/próxima em \d+ min/)).toBeInTheDocument();
   });
 
-  it("meta-line mostra 'Aguardando dados...' durante a primeira carga", () => {
+  it("meta-line mostra 'Aguardando dados...' durante a primeira carga", async () => {
     carregarCom(listaMista);
     renderAlertas();
     expect(screen.getByText("Aguardando dados...")).toBeInTheDocument();
+    // A carga termina DENTRO do act (sem warning de update pós-teste).
+    await act(async () => {});
   });
 
   it("banner D-17 cita o NOME da fonte em falha_prolongada (role=alert)", async () => {
@@ -410,7 +412,7 @@ function handlerDe(
 
 function chamadasDeMutacao(): Array<[string, Iniciar | undefined]> {
   return requestMock.mock.calls.filter(
-    ([path, init]) => (init as Iniciar | undefined)?.method !== undefined,
+    ([, init]) => (init as Iniciar | undefined)?.method !== undefined,
   ) as Array<[string, Iniciar | undefined]>;
 }
 
@@ -552,10 +554,20 @@ describe("AlertsPage — mutações da lista (UI-01)", () => {
     const respostaPut = { itens: listaMista.filter((i) => i.symbol !== "PETR4") };
     await montarComTimersFake(listaMista, {
       "DELETE /api/watch/PETR4/b3": () => undefined,
-      "PUT /api/watch": () => respostaPut,
+      "PUT /api/watch": (init) => {
+        const corpo = JSON.parse(init?.body ?? "{}") as {
+          itens: Array<{ symbol: string; target_below: number }>;
+        };
+        // O flush acontece ANTES do payload: VALE3 leva o alvo editado, e
+        // PETR4 (na janela de undo no clique) não entra.
+        expect(corpo.itens.find((i) => i.symbol === "VALE3")?.target_below).toBe(60);
+        expect(corpo.itens.some((i) => i.symbol === "PETR4")).toBe(false);
+        return respostaPut;
+      },
     });
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "60" } });
     fireEvent.click(nomeDoBotao("Remover PETR4"));
-    fireEvent.click(nomeDoBotao("Salvar"));
+    fireEvent.click(nomeDoBotao("Salvar")); // dentro da janela de 5 s
     await act(async () => {});
     const mutacoes = chamadasDeMutacao();
     expect(mutacoes.map(([path, init]) => `${init?.method} ${path}`)).toEqual([
@@ -579,8 +591,9 @@ describe("AlertsPage — mutações da lista (UI-01)", () => {
     await act(async () => {});
     const metodos = chamadasDeMutacao().map(([, init]) => init?.method);
     expect(metodos).toEqual(["DELETE"]); // o PUT não aconteceu
-    expect(screen.getByText("item não encontrado")).toBeInTheDocument();
-    expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+    // A barra carrega a mensagem de erro na classe dirty; o estado permanece
+    // dirty (Salvar segue habilitado — nenhum commit parcial no servidor).
+    expect(screen.getByText("item não encontrado")).toHaveClass("dirty");
     expect(nomeDoBotao("Salvar")).toBeEnabled();
   });
 
@@ -659,26 +672,26 @@ describe("AlertsPage — mutações da lista (UI-01)", () => {
   });
 
   it("adicionar + salvar: o novo item vai no PUT e volta da resposta com a cotação vazia do ciclo novo", async () => {
-    const criado = item({ symbol: "ITUB4", market: "b3", target_below: 30, fresh: "none" });
+    const criado = item({ symbol: "BBDC4", market: "b3", target_below: 30, fresh: "none" });
     const respostaPut = { itens: [...listaMista, criado] };
     await montarComTimersFake(listaMista, {
       "PUT /api/watch": (init) => {
         const corpo = JSON.parse(init?.body ?? "{}") as { itens: unknown[] };
         expect(corpo.itens).toContainEqual({
-          symbol: "ITUB4",
+          symbol: "BBDC4",
           market: "b3",
           target_below: 30,
         });
         return respostaPut;
       },
     });
-    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "itub4" } });
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "bbdc4" } });
     fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
     fireEvent.click(nomeDoBotao("Adicionar"));
     await act(async () => {});
     fireEvent.click(nomeDoBotao("Salvar"));
     await act(async () => {});
     expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
-    expect(linhaDe("ITUB4").textContent).toContain("—"); // sem cotação ainda
+    expect(linhaDe("BBDC4").textContent).toContain("—"); // sem cotação ainda
   });
 });
