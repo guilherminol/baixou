@@ -135,6 +135,7 @@ def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
                 "symbol": "PETR4",
                 "market": "b3",
                 "target_below": 38.5,
+                "paused": False,  # exposto desde o 04-03 (WATCH-03)
                 "currency": "R$",
                 "price": 35.2,
                 "price_at": "2026-10-28T16:00:00Z",
@@ -147,6 +148,7 @@ def test_get_devolve_itens_com_cotacao_e_moeda(settings, capsys):
                 "symbol": "BTCUSDT",
                 "market": "crypto",
                 "target_below": 350000.0,
+                "paused": False,
                 "currency": "US$",
                 "price": None,
                 "price_at": None,
@@ -290,6 +292,7 @@ def test_post_cripto_valido_cadastra_201_e_normaliza(settings, capsys, monkeypat
         "symbol": "SOLUSDT",
         "market": "crypto",
         "target_below": 90.0,
+        "paused": False,  # cadastro nasce ativo (a pausa é exclusivo do PATCH, WATCH-03)
         "currency": "US$",
         "price": None,
         "price_at": None,
@@ -510,6 +513,156 @@ def test_patch_de_inexistente_responde_404(settings, capsys):
     """PATCH de item fora da lista → 404 com detail fixo, sem alterar nada."""
     client = _admin_logado(settings, capsys)
     resposta = client.patch("/api/watch/NOPE4/b3", json={"target_below": 30})
+    assert resposta.status_code == 404
+    assert resposta.json() == {"detail": "item não encontrado"}
+
+
+# --- 04-03 Task 2: pausa por item via PATCH (WATCH-03, D-09) — o lado web
+
+
+def test_patch_pausa_item_e_o_mantem_visivel_na_lista(settings, capsys):
+    """WATCH-03: pausar NÃO esconde o item — a lista NÃO encolhe e o preço congela."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T16:00:00Z",
+            change_pct=-1.2,
+        )
+    finally:
+        conn.close()
+    resposta = client.patch("/api/watch/PETR4/b3", json={"paused": True})
+    assert resposta.status_code == 200
+    assert resposta.json()["paused"] is True
+    itens = client.get("/api/watch").json()["itens"]
+    assert len(itens) == 1  # nunca lista oculta: o pausado fica na MESMA lista
+    assert itens[0]["paused"] is True
+    assert itens[0]["price"] == 35.2  # cotação congelada: o MESMO preço de antes
+    assert itens[0]["price_at"] == "2026-10-28T16:00:00Z"
+
+
+def test_patch_retoma_item_pausado(settings, capsys):
+    """paused=false de volta: 200 e o GET reflete o estado ativo."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        conn.execute("UPDATE watch SET paused = 1 WHERE symbol = 'PETR4'")
+    finally:
+        conn.close()
+    resposta = client.patch("/api/watch/petr4/b3", json={"paused": False})
+    assert resposta.status_code == 200
+    assert resposta.json()["paused"] is False
+    assert resposta.json()["target_below"] == 38.5  # só a pausa mudou
+    itens = client.get("/api/watch").json()["itens"]
+    assert [i["paused"] for i in itens] == [False]
+
+
+def test_patch_muda_alvo_e_pausa_na_mesma_write_tx(settings, capsys):
+    """PATCH {"target_below": 30, "paused": true} → 200 mudando os dois de uma vez."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    resposta = client.patch(
+        "/api/watch/PETR4/b3", json={"target_below": 30, "paused": True}
+    )
+    assert resposta.status_code == 200
+    assert resposta.json()["target_below"] == 30.0
+    assert resposta.json()["paused"] is True
+
+
+def test_patch_pausa_repetida_e_idempotente(settings, capsys):
+    """Pausar item já pausado: 200, estado permanece, nenhuma outra coluna reescrita."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        conn.execute("UPDATE watch SET paused = 1 WHERE symbol = 'PETR4'")
+    finally:
+        conn.close()
+    resposta = client.patch("/api/watch/PETR4/b3", json={"paused": True})
+    assert resposta.status_code == 200
+    conn = _conn(settings)
+    try:
+        linha = conn.execute(
+            "SELECT target_below, paused FROM watch WHERE symbol = 'PETR4'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert linha["paused"] == 1  # estado permanece
+    assert linha["target_below"] == 38.5  # nada foi reescrito
+
+
+def test_patch_vazio_recusa_422_envelope(settings, capsys):
+    """PATCH sem nenhum campo → 422 no envelope D-08 (ao menos um campo)."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+    finally:
+        conn.close()
+    resposta = client.patch("/api/watch/PETR4/b3", json={})
+    assert resposta.status_code == 422
+    corpo = resposta.json()
+    assert set(corpo) == {"erros"} and corpo["erros"]
+    assert corpo["erros"][0]["problema"] == "informe ao menos um campo para atualizar"
+
+
+def test_patch_paused_nao_booleano_recusa_422(settings, capsys):
+    """PATCH {"paused": "sim"} → 422 envelope: o valor deve ser verdadeiro ou falso."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.patch("/api/watch/PETR4/b3", json={"paused": "sim"})
+    assert resposta.status_code == 422
+    erro = resposta.json()["erros"][0]
+    assert erro["campo"] == "paused"
+    assert erro["problema"] == "o valor deve ser verdadeiro ou falso"
+
+
+def test_patch_pausa_nao_toca_estado_de_alerta_da_quote(settings, capsys):
+    """Pausar não toca quote: alerted/alerted_at/alerted_target/notify_state intactos."""
+    client = _admin_logado(settings, capsys)
+    conn = _conn(settings)
+    try:
+        _seed_watch(conn, "PETR4", "b3", 38.5)
+        _seed_quote(
+            conn,
+            "PETR4",
+            "b3",
+            price=35.2,
+            price_at="2026-10-28T16:00:00Z",
+            change_pct=-1.2,
+            alerted=1,
+            alerted_at="2026-10-28T16:05:00Z",
+            alerted_target=38.5,
+            notify_state='{"telegram": "ok"}',
+        )
+    finally:
+        conn.close()
+    assert client.patch("/api/watch/PETR4/b3", json={"paused": True}).status_code == 200
+    conn = _conn(settings)
+    try:
+        linha = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    finally:
+        conn.close()
+    assert linha["alerted"] == 1  # nada do estado de alerta é resetado pela pausa
+    assert linha["alerted_at"] == "2026-10-28T16:05:00Z"
+    assert linha["alerted_target"] == 38.5
+    assert linha["notify_state"] == '{"telegram": "ok"}'
+    assert linha["price"] == 35.2 and linha["price_at"] == "2026-10-28T16:00:00Z"
+
+
+def test_patch_de_inexistente_com_paused_responde_404(settings, capsys):
+    """Pausar item fora da lista → 404, nada alterado (mesmo dialeto do PATCH de alvo)."""
+    client = _admin_logado(settings, capsys)
+    resposta = client.patch("/api/watch/NOPE4/b3", json={"paused": True})
     assert resposta.status_code == 404
     assert resposta.json() == {"detail": "item não encontrado"}
 
