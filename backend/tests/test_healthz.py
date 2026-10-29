@@ -136,7 +136,10 @@ def test_healthz_heartbeat_one_minute_old_returns_200_with_empty_body(settings):
 def test_healthz_boundary_29m59s_returns_200_and_30m00s_returns_503(settings):
     apply_migrations(settings.db_path)
     limit = timedelta(minutes=2 * settings.poll_minutes)
-    _set_last_run(settings, _iso(datetime.now(UTC) - limit + timedelta(seconds=1)))
+    # WR-02 (aviso da Phase 1, resolvido aqui): microssegundos PRESERVADOS no
+    # valor injetado — o _iso truncava em segundos e a margem do lado 200
+    # ficava < 1 s (flake de ~1–3% sob carga da suíte inteira).
+    _set_last_run(settings, (datetime.now(UTC) - limit + timedelta(seconds=1)).isoformat())
     with _client(settings) as client:
         assert client.get("/healthz").status_code == 200  # 29m59s ainda é vivo
     _set_last_run(settings, _iso(datetime.now(UTC) - limit))

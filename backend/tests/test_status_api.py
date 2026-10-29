@@ -18,7 +18,6 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import pytest
 from baixou.core.db import WEB_TIMEOUT_S, connect, write_tx
 from baixou.core.migrations import apply_migrations
 from baixou.core.schedule import next_slot
