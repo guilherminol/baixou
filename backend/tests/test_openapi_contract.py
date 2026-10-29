@@ -43,9 +43,7 @@ _MODELOS_ESPERADOS = (
     "PutWatch",
 )
 
-_METHOD_KEYS = frozenset(
-    {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
-)
+_METHOD_KEYS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 
 
 def _settings_de_teste(tmp_path) -> Settings:
