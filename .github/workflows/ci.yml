@@ -1,7 +1,9 @@
 # CI mínimo e real da Fase 1 (D-05): ruff + pytest, somente em pull requests.
 # Escolha explícita do autor (01-CONTEXT D-05): nada de execução em empurrão
-# direto de branch. Crescimento por fase — frontend/tipos entram na Fase 5;
-# audit, varredura de segredos e publicação na Fase 6. O pytest daqui executa
+# direto de branch. Crescimento por fase — o job do frontend entrou na Fase 5
+# (05-05): lint, tsc, testes, build, cheque de desatualização dos tipos
+# gerados do openapi.json e npm audit de produção; audit, varredura de
+# segredos e publicação continuam na Fase 6. O pytest daqui executa
 # a suíte completa do backend, incluindo migrações, config, fronteira de
 # importação (D-07) e o /healthz. `uv sync --frozen` nunca re-resolve o
 # uv.lock (T-01-SC).
@@ -38,3 +40,53 @@ jobs:
 
       - name: Testes (pytest)
         run: uv run pytest backend/tests -q
+
+  # Fase 5 (05-05): a malha da arquitetura sobre o frontend, no MESMO PR do
+  # backend (jobs independentes — sem needs). Node vem do frontend/.nvmrc,
+  # a MESMA major do estágio node do Dockerfile (uma fonte, três consumidores).
+  # O cheque de desatualização reprova o PR em que os tipos gerados
+  # divergirem do backend/openapi.json (T-05-15); o audit reprova
+  # vulnerabilidade high/critical em dependências de PRODUÇÃO (T-05-16) —
+  # devDeps não bloqueiam.
+  frontend:
+    name: lint + test + build (frontend)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependências exatas do lock
+        run: npm ci
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      - name: Tipos (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Testes (vitest)
+        run: npm run test
+
+      - name: Build (vite)
+        run: npm run build
+
+      - name: Regenerar tipos do contrato congelado
+        run: npm run generate-types
+
+      - name: Tipos gerados em dia com o openapi.json
+        run: |
+          if ! git diff --exit-code -- src/api/generated; then
+            echo "::error::frontend/src/api/generated está desatualizado frente ao backend/openapi.json — rode npm run generate-types e commite os tipos regenerados no mesmo PR"
+            exit 1
+          fi
+
+      - name: Audit das dependências de produção
+        run: npm audit --omit=dev --audit-level=high

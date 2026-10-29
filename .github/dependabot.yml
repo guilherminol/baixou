@@ -1,0 +1,15 @@
+# Bot de atualização de dependências (arquitetura §Ferramentas: "npm audit no
+# CI e um bot de atualização de dependências"). PRs semanais revisáveis —
+# nada entra no lock sem passar pelo job do CI (T-05-16); o dependabot de
+# github-actions mantém os pins das actions (direção do IN-03 da Fase 1).
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
