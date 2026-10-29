@@ -9,12 +9,14 @@ impresso UMA vez no log quando não há usuário (SC-1).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from baixou.core.config import Settings, load_settings
@@ -22,8 +24,88 @@ from baixou.core.db import WEB_TIMEOUT_S, check_sqlite_version, connect
 from baixou.core.log import configure
 from baixou.core.migrations import apply_migrations
 from baixou.web import auth, watch
+from baixou.web.schemas import erro_item
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _problema_ptbr(erro: dict) -> str:
+    """Traduz o erro do pydantic para a mensagem PT-BR curta do envelope D-08."""
+    loc = erro.get("loc") or ("corpo",)
+    campo = str(loc[-1])
+    tipo = str(erro.get("type", ""))
+    if tipo == "missing":
+        return "campo obrigatório"
+    if tipo == "greater_than":
+        if campo == "target_below":
+            return "o alvo deve ser maior que zero"
+        return f"o valor deve ser maior que {(erro.get('ctx') or {}).get('gt', 0)}"
+    if tipo == "greater_than_equal":
+        return f"o valor deve ser maior ou igual a {(erro.get('ctx') or {}).get('ge', 0)}"
+    if tipo == "literal_error":
+        if campo == "market":
+            return "market deve ser b3 ou crypto"
+        return "valor fora das opções aceitas"
+    if tipo == "too_short":
+        if campo == "itens":
+            return "informe ao menos um item"
+        return "valor curto demais"
+    if tipo in {"string_type", "string_unicode_type"}:
+        return "o valor deve ser texto"
+    if tipo in {"float_type", "float_parsing", "int_type", "int_parsing", "decimal_type"}:
+        return "o valor deve ser numérico"
+    if tipo == "bool_type":
+        return "o valor deve ser verdadeiro ou falso"
+    if tipo == "string_too_short":
+        return "texto curto demais"
+    return "valor inválido"
+
+
+def _corpo_parseado(corpo: object) -> object:
+    """O ``body`` da exceção pode vir cru (bytes): parseia JSON quando der."""
+    if isinstance(corpo, bytes | bytearray | str):
+        try:
+            return json.loads(corpo)
+        except ValueError:
+            return None
+    return corpo
+
+
+def _simbolo_do_corpo(corpo: object, loc: tuple) -> str | None:
+    """Best-effort: o symbol do item apontado pelo loc, normalizado (D-05).
+
+    O PRIMEIRO segmento do loc do FastAPI é o literal ``"body"`` (a raiz do
+    corpo da requisição), não uma chave do dict.
+    """
+    if loc and loc[0] == "body":
+        loc = loc[1:]
+    atual = _corpo_parseado(corpo)
+    for parte in loc[:-1]:
+        if isinstance(atual, dict) and isinstance(parte, str):
+            atual = atual.get(parte)
+        elif isinstance(atual, list) and isinstance(parte, int) and 0 <= parte < len(atual):
+            atual = atual[parte]
+        else:
+            return None
+    if isinstance(atual, dict):
+        symbol = atual.get("symbol")
+        if isinstance(symbol, str):
+            return symbol.strip().upper()
+    return None
+
+
+def envelope_validacao(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """TODO 422 de FORMA da API fala o dialeto D-08 (um item por erro, PT-BR)."""
+    del request
+    erros = [
+        erro_item(
+            _simbolo_do_corpo(exc.body, tuple(erro.get("loc") or ())),
+            str((erro.get("loc") or ("corpo",))[-1]),
+            _problema_ptbr(erro),
+        )
+        for erro in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"erros": erros})
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -60,6 +142,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.include_router(auth.router)
     app.include_router(watch.router)
+    # Erros de forma do pydantic no MESMO envelope D-08 das recusas de negócio:
+    # a Fase 5 renderiza os dois com o mesmo código (D-08, contrato congelado).
+    app.add_exception_handler(RequestValidationError, envelope_validacao)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> Response:

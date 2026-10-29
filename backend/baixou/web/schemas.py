@@ -60,6 +60,12 @@ class WatchListResponse(BaseModel):
     itens: list[WatchItem]
 
 
+class PatchWatch(BaseModel):
+    """Corpo do PATCH /api/watch/{symbol}/{market}: só o alvo muda (SC-4)."""
+
+    target_below: float = Field(gt=0)
+
+
 def erro_item(symbol: str | None, campo: str, problema: str) -> dict:
     """Monta UMA entrada do envelope D-08 (PT-BR em ``problema``)."""
     return {"symbol": symbol, "campo": campo, "problema": problema}

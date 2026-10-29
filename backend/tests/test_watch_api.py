@@ -390,9 +390,7 @@ def test_post_duplicado_recusa_422_sem_tocar_o_banco(settings, capsys, monkeypat
     )
     assert resposta.status_code == 422
     assert resposta.json() == {
-        "erros": [
-            {"symbol": "PETR4", "campo": "symbol", "problema": "o símbolo já está na lista"}
-        ]
+        "erros": [{"symbol": "PETR4", "campo": "symbol", "problema": "o símbolo já está na lista"}]
     }
     assert requests == []  # duplicado por SELECT ANTES de qualquer rede
     conn = _conn(settings)
@@ -415,7 +413,11 @@ def test_post_alvo_invalido_recusa_422(alvo, settings, capsys):
     assert resposta.status_code == 422
     assert resposta.json() == {
         "erros": [
-            {"symbol": "PETR4", "campo": "target_below", "problema": "o alvo deve ser maior que zero"}
+            {
+                "symbol": "PETR4",
+                "campo": "target_below",
+                "problema": "o alvo deve ser maior que zero",
+            }
         ]
     }
 
@@ -429,7 +431,9 @@ def test_post_market_invalido_fala_o_dialeto_do_envelope(settings, capsys):
     )
     assert resposta.status_code == 422
     assert resposta.json() == {
-        "erros": [{"symbol": "PETR4", "campo": "market", "problema": "market deve ser b3 ou crypto"}]
+        "erros": [
+            {"symbol": "PETR4", "campo": "market", "problema": "market deve ser b3 ou crypto"}
+        ]
     }
 
 
@@ -519,7 +523,8 @@ def test_delete_remove_a_watch_204_e_patch_seguinte_404(settings, capsys):
         _seed_quote(conn, "PETR4", "b3", price=35.0, alerted=1)
     finally:
         conn.close()
-    resposta = client.delete("/api/watch/PETR4/b3")
+    # mutante exige JSON (guard 04-01); o delete() do httpx não leva corpo
+    resposta = client.request("DELETE", "/api/watch/PETR4/b3", json={})
     assert resposta.status_code == 204
     assert resposta.content == b""
     conn = _conn(settings)
@@ -534,7 +539,7 @@ def test_delete_remove_a_watch_204_e_patch_seguinte_404(settings, capsys):
 def test_delete_de_inexistente_responde_404(settings, capsys):
     """DELETE de item fora da lista → 404, nada apagado."""
     client = _admin_logado(settings, capsys)
-    resposta = client.delete("/api/watch/NOPE4/b3")
+    resposta = client.request("DELETE", "/api/watch/NOPE4/b3", json={})
     assert resposta.status_code == 404
     assert resposta.json() == {"detail": "item não encontrado"}
 
@@ -559,12 +564,10 @@ def test_recriar_apos_delete_comeca_ciclo_novo(settings, capsys, monkeypatch):
             alerted_target=38.5,
             notify_state='{"telegram": "ok"}',
         )
-        conn.execute(
-            "UPDATE quote SET last_fetch_error = 'not_found' WHERE symbol = 'PETR4'"
-        )
+        conn.execute("UPDATE quote SET last_fetch_error = 'not_found' WHERE symbol = 'PETR4'")
     finally:
         conn.close()
-    assert client.delete("/api/watch/PETR4/b3").status_code == 204
+    assert client.request("DELETE", "/api/watch/PETR4/b3", json={}).status_code == 204
     _congela_relogio(monkeypatch, _DOMINGO)  # fora do pregão: 201 sem rede
     requests: list[httpx.Request] = []
     _injeta_transporte(monkeypatch, _violento, requests)
@@ -583,4 +586,3 @@ def test_recriar_apos_delete_comeca_ciclo_novo(settings, capsys, monkeypatch):
     assert linha["alerted_target"] is None
     assert linha["notify_state"] is None
     assert linha["last_fetch_error"] is None  # quarentena da Fase 2 limpa
-
