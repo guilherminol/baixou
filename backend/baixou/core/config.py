@@ -21,12 +21,19 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from baixou.core.log import log
 
 _VALID_LOG_LEVELS = ("debug", "info", "warning", "error")
+_VALID_COOKIE_SECURE = ("auto", "sim", "nao")
 _FILE_SUFFIX = "_FILE"
 
 
 @dataclass(frozen=True)
 class Settings:
-    """Configuração tipada da Fase 1."""
+    """Configuração tipada dos serviços (Fases 1–4).
+
+    ``cookie_secure`` (Fase 4, AUTH-01) comanda o atributo Secure do cookie de
+    sessão: ``auto`` (padrão) só marca Secure em https; ``sim``/``nao``
+    forçam sempre/nunca — em http://IP:porta um cookie Secure é descartado e
+    o login falha sem explicação.
+    """
 
     data_dir: Path
     tz_market: str
@@ -242,6 +249,17 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     raw_click_url = environ.get("NOTIFY_CLICK_URL")
     notify_click_url = "" if raw_click_url is None else raw_click_url
 
+    # Fase 4 (AUTH-01): Secure do cookie de sessão — molde do LOG_LEVEL
+    # (conjunto fechado): ausente → padrão "auto"; valor DEFINIDO (mesmo
+    # vazio) precisa cair no conjunto depois de aparado e em minúsculo —
+    # sempre nomeando a variável, nunca o valor (K2/WR-01).
+    cookie_secure = resolve("COOKIE_SECURE")
+    if cookie_secure is None:  # ausente → padrão; string vazia não está no conjunto
+        cookie_secure = "auto"
+    cookie_secure = cookie_secure.strip().lower()
+    if cookie_secure not in _VALID_COOKIE_SECURE:
+        _fail("COOKIE_SECURE", "use auto, sim ou nao")
+
     # Pares de canal (D-08): configuração pela metade é config inválida —
     # fail-fast nomeando a variável que FALTA. NTFY_TOPIC sozinho é VÁLIDO
     # (o token é opcional). Sem NENHUM canal configurado o worker sobe normal
@@ -295,5 +313,6 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         ntfy_topic=ntfy_topic,
         ntfy_token=ntfy_token,
         notify_click_url=notify_click_url,
+        cookie_secure=cookie_secure,
         secrets=secrets,
     )

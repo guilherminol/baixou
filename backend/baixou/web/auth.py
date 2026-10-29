@@ -105,6 +105,18 @@ def require_session(request: Request) -> sqlite3.Row:
                 with write_tx(conn):
                     conn.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],))
                 row = None
+            else:
+                # D-11: validade sliding — todo uso autenticado renova o prazo
+                # para o TTL cheio da PRÓPRIA linha (remember=1 → 30 dias,
+                # senão 12 h) e registra o último uso: sessão em uso contínuo
+                # nunca expira. Transação única e curta (disciplina WAL).
+                ttl = _SESSION_TTL_REMEMBER if row["remember"] else _SESSION_TTL_SHORT
+                agora = _now()
+                with write_tx(conn):
+                    conn.execute(
+                        "UPDATE sessions SET expires_at = ?, last_used_at = ? WHERE token_hash = ?",
+                        ((agora + ttl).isoformat(), agora.isoformat(), row["token_hash"]),
+                    )
         if row is None:
             raise HTTPException(status_code=401, detail="sessão ausente ou expirada")
         return row
