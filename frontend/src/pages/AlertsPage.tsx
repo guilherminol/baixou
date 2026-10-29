@@ -11,7 +11,15 @@ import {
 } from "../api/watch";
 import { buscarStatus, type StatusResponse } from "../api/status";
 import { ApiError, onUnauthorized, parseErrosEnvelope } from "../api/client";
-import { formatCurrency, formatPercent, formatTime, timeAgoMinutes } from "../lib/format";
+import { formatCurrency, formatTime, timeAgoMinutes } from "../lib/format";
+import {
+  distancia,
+  estadoClasse,
+  estadoTexto,
+  falhasDeCanal,
+  linhaSuspeita,
+  problemasDoStatus,
+} from "../lib/estados";
 import "../styles/alerts.css";
 
 /** Chave única do item: symbol|market (o símbolo é único por mercado). */
@@ -21,65 +29,6 @@ function chaveDe(symbol: string, market: string): string {
 
 function chave(item: WatchItem): string {
   return chaveDe(item.symbol, item.market);
-}
-
-/**
- * Estado do item em TEXTO, sempre além da cor (D-07), com a precedência
- * congelada do contrato: pausado → sem cotação (fresh none) → fechado
- * (fresh closed) → desatualizado (fresh stale) → no alvo (price <= alvo e
- * NÃO alertado) → alertado → aguardando. O navegador NUNCA deriva frescor
- * por idade: consome o `fresh`/`suspect`/`paused` prontos da API (D-02).
- */
-export function estadoTexto(item: WatchItem): string {
-  if (item.paused) return "pausado";
-  if (item.fresh === "none") return "sem cotação";
-  if (item.fresh === "closed") return "fechado";
-  if (item.fresh === "stale") return "desatualizado";
-  if (!item.alerted && item.price != null && item.price <= item.target_below) {
-    return "no alvo";
-  }
-  if (item.alerted) return "alertado";
-  return "aguardando";
-}
-
-/** Classe do estado na linguagem do mockup: accent para no alvo/alertado,
- * riscado para desatualizado, muted para o resto. */
-export function estadoClasse(item: WatchItem): string {
-  const texto = estadoTexto(item);
-  if (texto === "no alvo" || texto === "alertado") return "tag-state state-hit";
-  if (texto === "desatualizado") return "tag-state state-stale";
-  return "tag-state";
-}
-
-/** Distância até o alvo (molde do mockup): price <= alvo → "no alvo" em
- * accent; senão ((alvo - preço) / preço) × 100; sem preço → "—". */
-export function distancia(item: WatchItem): { texto: string; classe: string } {
-  const price = item.price ?? null; // o tipo gerado traz price?: number | null
-  if (price === null) return { texto: "—", classe: "num" };
-  if (price <= item.target_below) {
-    return { texto: "no alvo", classe: "num state-hit" };
-  }
-  return {
-    texto: formatPercent(((item.target_below - price) / price) * 100),
-    classe: "num",
-  };
-}
-
-/** Linha curta de variação suspeita (D-07) — o servidor decide a borda
- * inclusiva (suspect), o navegador só formata o change_pct recebido. */
-export function linhaSuspeita(item: WatchItem): string | null {
-  if (!item.suspect || typeof item.change_pct !== "number") return null;
-  return `variação de ${formatPercent(item.change_pct)} hoje — confira evento corporativo`;
-}
-
-/** Falha de canal sob o estado (D-07/D-15): cada entrada de notify_state
- * com valor != "ok" vira a linha curta "{canal}: erro". */
-export function falhasDeCanal(item: WatchItem): string[] {
-  const estado = item.notify_state;
-  if (estado === null || estado === undefined) return [];
-  return Object.entries(estado)
-    .filter(([, valor]) => valor !== "ok")
-    .map(([canal]) => `${canal}: erro`);
 }
 
 /** Meta-line do cabeçalho (D-03): "Última consulta há X min · próxima em
@@ -93,28 +42,6 @@ function metaDoStatus(status: StatusResponse): string {
     Math.round((new Date(status.proxima_rodada).getTime() - Date.now()) / 60000),
   );
   return `Última consulta ${ultima} · próxima em ${proxima} min · cota ${status.cota.usadas.toLocaleString("pt-BR")}/${status.cota.limite.toLocaleString("pt-BR")}`;
-}
-
-/**
- * Problemas do banner "Aviso do sistema" (D-17) — derivados SOMENTE do
- * /api/status, nunca de limiares no cliente: cota esgotada (usadas >=
- * limite), fonte em falha_prolongada (citando o NOME da fonte) e nenhum
- * canal configurado.
- */
-export function problemasDoStatus(status: StatusResponse): string[] {
-  const problemas: string[] = [];
-  if (status.cota.usadas >= status.cota.limite) {
-    problemas.push("cota mensal da brapi esgotada");
-  }
-  for (const fonte of status.fontes) {
-    if (fonte.estado === "falha_prolongada") {
-      problemas.push(`fonte ${fonte.nome} em falha prolongada`);
-    }
-  }
-  if (status.canais.every((canal) => !canal.configurado)) {
-    problemas.push("nenhum canal configurado");
-  }
-  return problemas;
 }
 
 const COLUNAS = 8; // Ticker · Preço · Alvo · Distância · Estado · Atualização · Disparo · ações
@@ -361,12 +288,18 @@ export default function AlertsPage() {
     novos: new Set<string>(),
     foco: null as string | null,
   });
-  estadoRef.current.itens = itens;
-  estadoRef.current.edicoes = edicoes;
-  estadoRef.current.rascunhos = rascunhosAlvo;
-  estadoRef.current.emUndo = emUndo;
-  estadoRef.current.pendencias = pendenciasRemocao;
-  estadoRef.current.novos = novos;
+  // Espelho do estado de edição lido pelo tick do polling (padrão
+  // latest-ref: o foco vive SÓ aqui — focar não re-renderiza). A escrita do
+  // espelho acontece APÓS o commit (react-hooks/refs: nada de ref durante o
+  // render); o intervalo e o re-login leem o instantâneo já consolidado.
+  useEffect(() => {
+    estadoRef.current.itens = itens;
+    estadoRef.current.edicoes = edicoes;
+    estadoRef.current.rascunhos = rascunhosAlvo;
+    estadoRef.current.emUndo = emUndo;
+    estadoRef.current.pendencias = pendenciasRemocao;
+    estadoRef.current.novos = novos;
+  });
 
   useEffect(() => {
     let vivo = true;
@@ -397,18 +330,6 @@ export default function AlertsPage() {
     onUnauthorized(() => setSessaoExpirada(true));
     return () => onUnauthorized(null);
   }, []);
-
-  // Polling de 60 s (arquitetura §Frontend): refaz /api/watch + /api/status e
-  // NUNCA sobrescreve edição em curso nem alteração não salva — o merge é
-  // determinístico (T-05-10). Com o modal de re-login aberto, o tick não executa.
-  useEffect(() => {
-    if (sessaoExpirada) return; // guard: polling pausado enquanto o modal está aberto
-    const id = window.setInterval(() => {
-      void recarregar();
-    }, INTERVALO_POLLING_MS);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessaoExpirada]);
 
   /** Carga de watch+status com merge determinístico: itens com alvo editado
    * não salvo, rascunho em edição, input focado ou pendência local preservam
@@ -468,6 +389,19 @@ export default function AlertsPage() {
       // 401 vai pelo handler global (modal); erro de rede preserva o estado.
     }
   }
+
+  // Polling de 60 s (arquitetura §Frontend): refaz /api/watch + /api/status e
+  // NUNCA sobrescreve edição em curso nem alteração não salva — o merge é
+  // determinístico (T-05-10). Com o modal de re-login aberto, o tick não executa.
+  // (Declarado DEPOIS de recarregar: o lint react-hooks reprova acesso a
+  // variável antes da declaração.)
+  useEffect(() => {
+    if (sessaoExpirada) return; // guard: polling pausado enquanto o modal está aberto
+    const id = window.setInterval(() => {
+      void recarregar();
+    }, INTERVALO_POLLING_MS);
+    return () => window.clearInterval(id);
+  }, [sessaoExpirada]);
 
   /** Fechou o modal por SUCESSO no re-login: recarrega na hora e o efeito do
    * intervalo retoma o ciclo de 60 s (a mudança de sessaoExpirada religa). */

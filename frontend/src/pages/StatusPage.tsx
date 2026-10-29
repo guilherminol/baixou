@@ -4,6 +4,11 @@ import { buscarStatus, type StatusResponse } from "../api/status";
 import { ApiError, request } from "../api/client";
 import type { components } from "../api/generated/schema";
 import { formatTime, timeAgoMinutes } from "../lib/format";
+import {
+  classeEstadoFonte,
+  larguraFill,
+  textoEstadoFonte,
+} from "../lib/estados";
 import "../styles/status.css";
 
 // Tela /status (UI-02): o painel de operação do admin — quando o aviso não
@@ -38,26 +43,6 @@ function metaDoStatus(status: StatusResponse): string {
     Math.round((new Date(status.proxima_rodada).getTime() - Date.now()) / 60000),
   );
   return `Última consulta ${ultima} · próxima em ${proxima} min · cota ${status.cota.usadas.toLocaleString("pt-BR")}/${status.cota.limite.toLocaleString("pt-BR")}`;
-}
-
-/** Estado da fonte em TEXTO legível (D-14): o enum vem pronto do servidor
- * ("operacional" | "erro" | "falha_prolongada"); só o snake_case vira espaço. */
-export function textoEstadoFonte(estado: string): string {
-  if (estado === "falha_prolongada") return "falha prolongada";
-  return estado;
-}
-
-/** Classe do estado da fonte (D-14): erro e falha prolongada ganham destaque
- * na cor de erro do design system — estado sempre além da cor, nunca só ela. */
-export function classeEstadoFonte(estado: string): string {
-  return estado === "operacional" ? "tag-state" : "tag-state fonte-destaque";
-}
-
-/** Largura do fill da barra de cota (D-16) — aritmética de EXIBIÇÃO
- * (usadas/limite), não de estado: satura em 100%; limite 0 → 0 (sem cota). */
-export function larguraFill(usadas: number, limite: number): number {
-  if (limite <= 0) return 0;
-  return Math.min(100, (usadas / limite) * 100);
 }
 
 /** Linha de UMA fonte (D-14, literal UI-02): o NOME da fonte está na linha do
