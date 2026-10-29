@@ -1,0 +1,61 @@
+/*
+ * CSS da página de alertas (05-03) — consome as variáveis do design system
+ * (global.css, D-01). A tabela densa do mockup (table-wrap/th/td,
+ * .symbol-cell, .tag-state/.state-hit/.state-stale, .row-undo, .action-bar,
+ * .add-block) já vive no global.css; aqui vive só o que a página acrescenta:
+ * a sub-linha D-06 do celular e os destaques de estado do item (D-07).
+ */
+
+/* Sub-linha D-06: segundo <tr> por item com distância + atualização +
+   disparo empilhados. Nasce oculta (desktop mostra a tabela completa) e a
+   media query <= 600px a revela ao esconder as três colunas dobráveis. */
+.sub-linha-row {
+  display: none;
+}
+
+.sub-linha {
+  height: auto;
+  padding: 4px 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: normal;
+}
+
+.sub-linha span {
+  display: inline-block;
+  margin-right: 12px;
+}
+
+/* Detalhes do item sob o estado (D-07): linha curta de variação suspeita e
+   falha de canal ("telegram: erro") — texto always, 11px muted, quebra a
+   linha dentro da célula. */
+.estado-extra {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+}
+
+/* Problema do envelope D-08 renderizado inline junto ao item nomeado. */
+.erro-item {
+  color: var(--error-text);
+  font-size: 12px;
+  white-space: normal;
+}
+
+/* D-06 (SC-5): em telas estreitas as 3 colunas dobráveis (Distância,
+   Atualização, Disparo) saem e a sub-linha entra — as 4 colunas (Ticker ·
+   Preço · Alvo · Estado) + ações permanecem visíveis em 360px, sem rolagem
+   lateral. Acima de 600px a tabela completa volta. */
+@media (max-width: 600px) {
+  .col-dobra {
+    display: none;
+  }
+
+  .sub-linha-row {
+    display: table-row;
+  }
+}
