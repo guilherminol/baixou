@@ -55,12 +55,6 @@ vi.mock("../api/client", () => {
   }
   return {
     ApiError,
-    // RED→GREEN: a página fala o protocolo antigo até o feat trocar os
-    // importadores; o pushUnauthorized restaurativo já vive no mock (o teste
-    // de registro nasce vermelho contra a árvore intocada).
-    onUnauthorized: (handler: (() => void) | null) => {
-      holder401.handler = handler;
-    },
     // Protocolo restaurativo (D-10): o registro EMPILHA e devolve o restore,
     // que limpa o holder só se o topo é o próprio handler — o unmount da
     // página devolve o dono anterior em vez de esvaziar o slot.

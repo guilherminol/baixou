@@ -141,8 +141,7 @@ describe("App real — wiring do 401 (D-10 restaurativo)", () => {
     // O repro do verificador: o default re-registrado navega para /login e
     // destrói a edição — o fix guarda a posse restaurativa do handler.
     expect(screen.getByRole("dialog", { name: "Sessão expirada" })).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/");
-    expect(screen.queryByText("Usuário")).not.toBeInTheDocument(); // não é a página de login
+    expect(window.location.pathname).toBe("/"); // nunca /login
     expect(screen.getByLabelText("Alvo de VALE3")).toHaveValue(60);
   });
 

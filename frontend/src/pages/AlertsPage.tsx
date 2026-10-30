@@ -10,7 +10,7 @@ import {
   type WatchItem,
 } from "../api/watch";
 import { buscarStatus, type StatusResponse } from "../api/status";
-import { ApiError, onUnauthorized, parseErrosEnvelope } from "../api/client";
+import { ApiError, parseErrosEnvelope, pushUnauthorized } from "../api/client";
 import { formatCurrency, formatTime, timeAgoMinutes } from "../lib/format";
 import {
   distancia,
@@ -323,12 +323,13 @@ export default function AlertsPage() {
   }, []);
 
   // 401 → modal de re-login NO LUGAR (D-10): enquanto a página de alertas
-  // está montada, ELA dona do handler global (o App registra o default
-  // durante o bootstrap, antes desta página existir na árvore); ao desmontar
-  // devolve null — sem vazamento.
+  // está montada, ELA está no TOPO da pilha restaurativa (empilha o próprio
+  // handler sobre o default do App — a ordem de efeitos pai/filho deixa de
+  // importar e nenhum re-registro por navegação sobrescreve o modal); o
+  // restore no unmount DEVOLVE o dono anterior (o default do App), nunca
+  // deixa o slot sem dono.
   useEffect(() => {
-    onUnauthorized(() => setSessaoExpirada(true));
-    return () => onUnauthorized(null);
+    return pushUnauthorized(() => setSessaoExpirada(true));
   }, []);
 
   /** Carga de watch+status com merge determinístico: itens com alvo editado

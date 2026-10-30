@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -7,7 +7,7 @@ import {
   useNavigate,
 } from "react-router";
 import type { operations } from "./api/generated/schema";
-import { onUnauthorized, request } from "./api/client";
+import { pushUnauthorized, request } from "./api/client";
 import AlertsPage from "./pages/AlertsPage";
 import StatusPage from "./pages/StatusPage";
 import LoginPage from "./pages/LoginPage";
@@ -22,13 +22,26 @@ function Rotas() {
   // null = bootstrap em andamento; D-13: a rota certa aparece sozinha no
   // primeiro acesso (setup_pending → /setup).
   const [checando, setChecando] = useState(true);
-
+  // Espelho do navigate — escrito em efeito PÓS-commit (precedente do espelho
+  // do AlertsPage: react-hooks/refs reprova escrita de ref no render); o
+  // handler default abaixo lê por aqui o navigate atual em cada 401.
+  const navigateRef = useRef(navigate);
   useEffect(() => {
-    // Handler 401 default — o redirect para /login; a página de alertas
-    // troca pelo modal de re-login no 05-03 (D-10).
-    onUnauthorized(() => navigate("/login", { replace: true }));
-    return () => onUnauthorized(null);
-  }, [navigate]);
+    navigateRef.current = navigate;
+  });
+
+  // Posse restaurativa do handler 401 (D-10; Gap 1 do 05-VERIFICATION): o
+  // redirect default é registrado UMA VEZ na vida do Rotas (deps []) e a
+  // página montada depois EMPILHA o próprio handler por cima
+  // (pushUnauthorized) — o restore do unmount dela devolve este default ao
+  // topo. O efeito antigo [navigate] re-registrava o default a cada location
+  // (o useNavigateUnstable do react-router 7 recria `navigate`) e, na ordem
+  // pai/filho do mesmo commit, sobrescrevia o handler do modal em toda volta
+  // de navegação para / — exatamente a causa do Gap 1, que não volta.
+  useEffect(
+    () => pushUnauthorized(() => navigateRef.current("/login", { replace: true })),
+    [],
+  );
 
   useEffect(() => {
     let vivo = true;

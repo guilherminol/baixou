@@ -60,15 +60,32 @@ export function parseErrosEnvelope(body: unknown): ErroDeCampo[] {
   return itens;
 }
 
-let handler401: (() => void) | null = null;
+// Pilha restaurativa de handlers 401 (D-10, Gap 1 do 05-VERIFICATION): o
+// TOPO governa — o App registra o redirect default UMA vez por vida do Rotas
+// e a página montada empilha o próprio handler; o restore do unmount devolve
+// SEMPRE o dono anterior, e a ordem de efeitos pai/filho deixa de importar.
+const pilha401: Array<() => void> = [];
 
 /**
- * Registra O handler global de 401 — o App registra o redirect default para
- * /login; a página de alertas troca pelo modal de re-login no 05-03 (D-10).
- * `null` desregistra (limpeza no unmount).
+ * Empilha um handler de 401 e devolve a função de RESTORE — invocá-la remove
+ * a ÚLTIMA ocorrência daquele handler (`lastIndexOf` + `splice`), de modo que
+ * pushes aninhados do mesmo componente desempilhem sem corromper a pilha
+ * alheia. O slot nunca fica sem dono enquanto o default não voltou.
  */
-export function onUnauthorized(handler: (() => void) | null): void {
-  handler401 = handler;
+export function pushUnauthorized(handler: () => void): () => void {
+  pilha401.push(handler);
+  return () => {
+    const indice = pilha401.lastIndexOf(handler);
+    if (indice !== -1) {
+      pilha401.splice(indice, 1);
+    }
+  };
+}
+
+/** O handler no TOPO da pilha (ou null — pilha vazia). */
+function handlerAtual(): (() => void) | null {
+  const topo = pilha401[pilha401.length - 1];
+  return topo ?? null;
 }
 
 function detailDoCorpo(body: unknown): string | null {
@@ -112,8 +129,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!response.ok) {
-    if (response.status === 401 && handler401 !== null) {
-      handler401(); // ANTES do throw: o App já navega para /login
+    if (response.status === 401) {
+      handlerAtual()?.(); // ANTES do throw: o TOPO da pilha decide (modal ou /login)
     }
     // D-11: o bloqueio de login chega com o header Retry-After (segundos) —
     // lido da PRÓPRIA resposta, nunca de valor fixo no cliente.
