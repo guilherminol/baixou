@@ -92,10 +92,11 @@ function pxDe(regra: string, propriedade: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
-/** Os dois valores de um `padding: vertical horizontal` (0 sem unidade
- * coberto no primeiro). */
+/** Os dois valores de um `padding: vertical horizontal` (o 0 sem unidade
+ * do botão coberto pelo `(?:px)?` — o grupo inteiro é opcional, não só o
+ * x de `px?`). */
 function ladosDoPadding(regra: string): { vertical: number | null; horizontal: number | null } {
-  const m = regra.match(/padding:\s*(\d+(?:\.\d+)?)px?\s+(\d+(?:\.\d+)?)px/);
+  const m = regra.match(/padding:\s*(\d+(?:\.\d+)?)(?:px)?\s+(\d+(?:\.\d+)?)px/);
   return m
     ? { vertical: Number(m[1]), horizontal: Number(m[2]) }
     : { vertical: null, horizontal: null };

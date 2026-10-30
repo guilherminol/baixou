@@ -108,3 +108,43 @@
     display: table-row;
   }
 }
+
+/* Piso de 360 px da tabela de alertas (SC-5, critério travado do ROADMAP;
+   fechamento do gap G-05-2): a 360 px exatos a linha visível a ≤600 px
+   (5 td + input de alvo de 90 px + 2 botões de ação) media scrollWidth
+   434/446 — excesso de 74-86 px. Este bloco compacta o piso DECLARADO com
+   economia ≥ 90 px contra as bases do global.css (input 90, td/th 8 px por
+   lado, botão 8 px por lado): (input −30) + td −40 + th −40 + botões −16 =
+   126 declarados, dos quais a linha de dados responde 86 = pior excesso
+   medido e o th é margem. Dentro da decisão de design D-01/D-06 (CSS
+   próprio, sub-linha e media query de 600 px intocadas); alvos de toque de
+   44×44 px e rótulos PT-BR (Pausar/Retomar/Remover) PRESERVADOS — D-07
+   proíbe icon-only, então aqui NUNCA há min-width/min-height/display para
+   .btn-action (fica o mínimo de 44 px da base) e nenhum TSX muda. A cascade
+   vence pela ordem de import (alerts.css depois de global.css) sem
+   !important; o orçamento é travado pelo teste estrutural
+   AlertsCompacto360.test.tsx.
+   Efeito colateral DECLARADO no irmão: a .sub-linha D-06 é um td de
+   .table-wrap, então o override (0,1,1) vence o padding 4px 8px 10px dela a
+   ≤400 px — a célula passa a 6px 4px: horizontal 8→4 por lado (mesma
+   direção do conserto, a favor do orçamento SC-5), vertical 4/10→6/6
+   (deslocamento cosmético de 2 px); a regra .sub-linha e a media query de
+   600 px NÃO são editadas — o efeito vem da cascade, não de edição. */
+@media (max-width: 400px) {
+  .input-target {
+    width: 60px;
+  }
+
+  .table-wrap td {
+    padding: 6px 4px;
+  }
+
+  .table-wrap th {
+    padding: 8px 4px;
+  }
+
+  .btn-action {
+    padding: 0 4px;
+    font-size: 11px;
+  }
+}
