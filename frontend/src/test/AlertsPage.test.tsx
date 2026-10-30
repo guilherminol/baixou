@@ -436,6 +436,11 @@ function chamadasDeMutacao(): Array<[string, Iniciar | undefined]> {
   ) as Array<[string, Iniciar | undefined]>;
 }
 
+/** As mutações em ordem, na forma "MÉTODO caminho" (leitura de sequência). */
+function mutacoesFormatadas(): string[] {
+  return chamadasDeMutacao().map(([path, init]) => `${init?.method} ${path}`);
+}
+
 function nomeDoBotao(rotulo: string) {
   return screen.getByRole("button", { name: rotulo });
 }
@@ -643,6 +648,125 @@ describe("AlertsPage — mutações da lista (UI-01)", () => {
     expect(erro.textContent).toBe("target_below: o alvo deve ser maior que zero");
     expect(erro.closest("tr")?.textContent).toContain("VALE3");
     expect(screen.getByText("Alterações não salvas")).toBeInTheDocument();
+  });
+
+  it("repro do verificador (SC-1): DELETE 404 é remoção já satisfeita — o save TERMINA e o Salvar seguinte dispara o PUT com a edição (o wedge acabou)", async () => {
+    const respostaPut = { itens: listaMista };
+    await montarComTimersFake(listaMista, {
+      // Resposta legítima do contrato (watch.py: rowcount 0 → 404) — o item
+      // pendente já não existe no servidor; o save NÃO pode abortar por ela.
+      "DELETE /api/watch/BBDC4/b3": () => {
+        throw new ApiError(404, { detail: "item não encontrado" }, "item não encontrado");
+      },
+      "PUT /api/watch": () => respostaPut,
+    });
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "bbdc4" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Remover BBDC4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000); // pendência confirmada
+    });
+    fireEvent.click(nomeDoBotao("Salvar")); // DELETE 404 a caminho
+    await act(async () => {});
+    expect(mutacoesFormatadas()).toEqual([
+      "DELETE /api/watch/BBDC4/b3",
+      "PUT /api/watch", // o 404 NÃO aborta: o PUT sai
+    ]);
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+    // Segundo Salvar com uma edição real: o PUT sai com o alvo novo — antes
+    // do fix o wedge re-DELETEava a chave e o PUT ficava em 0 para sempre.
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "60" } });
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const mutacoes = chamadasDeMutacao();
+    expect(mutacoes).toHaveLength(3); // 1 DELETE (o do 1º save; NENHUM re-DELETE) + 2 PUT
+    const corpo = JSON.parse(mutacoes[2]?.[1]?.body ?? "{}") as {
+      itens: Array<{ symbol: string; target_below: number }>;
+    };
+    expect(corpo.itens.find((i) => i.symbol === "VALE3")?.target_below).toBe(60);
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+  });
+
+  it("404 satisfeito solta a chave no ATO: retry após falha REAL (PUT 500) não re-DELETE a chave já satisfeita", async () => {
+    let puts = 0;
+    await montarComTimersFake(listaMista, {
+      "DELETE /api/watch/BBDC4/b3": () => {
+        throw new ApiError(404, { detail: "item não encontrado" }, "item não encontrado");
+      },
+      "PUT /api/watch": () => {
+        puts += 1;
+        if (puts === 1) {
+          throw new ApiError(500, { detail: "erro do servidor" }, "erro do servidor");
+        }
+        return { itens: listaMista };
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Novo ticker"), { target: { value: "bbdc4" } });
+    fireEvent.change(screen.getByLabelText("Novo alvo"), { target: { value: "30" } });
+    fireEvent.click(nomeDoBotao("Adicionar"));
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Remover BBDC4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    fireEvent.click(nomeDoBotao("Salvar")); // DELETE 404 satisfeito → PUT 500
+    await act(async () => {});
+    expect(screen.getByText("erro do servidor")).toBeInTheDocument(); // a falha REAL aparece
+    fireEvent.click(nomeDoBotao("Salvar")); // retry
+    await act(async () => {});
+    expect(mutacoesFormatadas()).toEqual([
+      "DELETE /api/watch/BBDC4/b3", // só o do 1º save
+      "PUT /api/watch", // 1º save (500)
+      "PUT /api/watch", // retry — sem re-DELETE da chave satisfeita
+    ]);
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+  });
+
+  it("salva só de remoções: NENHUM PUT sai (o 422 do lote vazio fica impossível) e o save termina satisfeito com a lista vazia", async () => {
+    await montarComTimersFake(
+      [item({ symbol: "PETR4", market: "b3", target_below: 36, price: 38.42, price_at: T1, fresh: "ok" })],
+      { "DELETE /api/watch/PETR4/b3": () => undefined },
+    );
+    fireEvent.click(nomeDoBotao("Remover PETR4"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    expect(mutacoesFormatadas()).toEqual(["DELETE /api/watch/PETR4/b3"]); // zero PUT
+    expect(screen.queryByText("PETR4")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText("Nenhuma ação monitorada. Use o formulário abaixo.").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Alterações salvas com sucesso")).toBeInTheDocument();
+    expect(nomeDoBotao("Salvar")).toBeDisabled(); // pendências/edits/novos limpos
+  });
+
+  it("PUT 422 com entrada de envelope SEM symbol: o 'problema' aparece na barra de status (aria-live) com dirty preservado — nada em silêncio", async () => {
+    await montarComTimersFake(listaMista, {
+      "PUT /api/watch": () => {
+        throw new ApiError(
+          422,
+          {
+            erros: [
+              { symbol: null, campo: "itens", problema: "o lote não pode ficar vazio" },
+            ],
+          },
+          "erro de validação",
+        );
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Alvo de VALE3"), { target: { value: "60" } });
+    await act(async () => {});
+    fireEvent.click(nomeDoBotao("Salvar"));
+    await act(async () => {});
+    const barra = screen.getByRole("status");
+    expect(barra.textContent).toContain("o lote não pode ficar vazio"); // o que hoje some
+    expect(barra).toHaveClass("dirty");
+    expect(screen.queryByTestId("erro-item-VALE3")).not.toBeInTheDocument(); // sem symbol → não é erro de linha
   });
 
   it("pausar chama PATCH imediato e substitui a linha pela resposta (estado 'pausado' sem recarregar)", async () => {
