@@ -607,8 +607,9 @@ def test_backup_enabled_invalid_exits_naming_variable(monkeypatch, tmp_path, cap
         load_settings()
     captured = capsys.readouterr()
     _assert_exit_names_variable(excinfo, "BACKUP_ENABLED", captured)
-    if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
-        assert invalid not in captured.out + captured.err
+    if invalid:  # o valor nunca aparece na MENSAGEM (K2/WR-01) — o log carrega
+        # timestamp com dígitos, então a checagem vai na exceção, não na saída
+        assert invalid not in str(excinfo.value)
 
 
 def test_backup_dir_defined_creates_nested_directory(monkeypatch, tmp_path):
@@ -695,8 +696,9 @@ def test_phase6_backup_int_invalid_exits_naming_variable(
         load_settings()
     captured = capsys.readouterr()
     _assert_exit_names_variable(excinfo, variable, captured)
-    if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
-        assert invalid not in captured.out + captured.err
+    if invalid:  # o valor nunca aparece na MENSAGEM (K2/WR-01) — o log carrega
+        # timestamp com dígitos, então a checagem vai na exceção, não na saída
+        assert invalid not in str(excinfo.value)
 
 
 def test_backup_hour_out_of_range_cites_range(monkeypatch, tmp_path, capsys):

@@ -67,6 +67,17 @@ class Settings:
     # env COOKIE_SECURE pelo molde WR-01 (vazio definido = inválido) é ligada
     # na Task 2 do plano 04-01.
     cookie_secure: str = "auto"
+    # Fase 6 (D-06/D-07): backup noturno — parte do produto, nasce LIGADO
+    # (backup_enabled True); desligar (BACKUP_ENABLED=0) é a exceção.
+    # backup_dir None significa "derivar <DATA_DIR>/backups" — a derivação é
+    # feita pelo consumidor (06-06), não aqui. Mesmo contrato WR-01 das fases
+    # anteriores: padrão só na ausência real; string vazia DEFINIDA é
+    # config_invalid nomeando a variável; valor nunca em log/erro (K2).
+    backup_enabled: bool = True
+    backup_dir: Path | None = None
+    backup_keep: int = 7
+    backup_hour: int = 4
+    backup_fail_notify_after: int = 2
     # Pares lidos via _FILE, separados dos campos comuns (fases 2–3 consomem
     # TELEGRAM_TOKEN etc. por aqui). Valores aqui NUNCA vão para log/erro (K2).
     secrets: dict[str, str] = field(default_factory=dict)
@@ -260,6 +271,57 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
     if cookie_secure not in _VALID_COOKIE_SECURE:
         _fail("COOKIE_SECURE", "use auto, sim ou nao")
 
+    # Fase 6 (D-06/D-07): backup noturno — molde WR-01 sem exceções. A ordem
+    # importa: DATA_DIR já foi resolvido acima; BACKUP_DIR derivado do padrão
+    # (<DATA_DIR>/backups) é papel do consumidor (06-06), nunca daqui.
+    # (1) BACKUP_ENABLED pelo molde de conjunto fechado do COOKIE_SECURE — o
+    #     backup nasce ligado (padrão "1" na ausência real); desligar é a
+    #     exceção documentada (D-07).
+    raw_backup_enabled = resolve("BACKUP_ENABLED")
+    if raw_backup_enabled is None:  # ausente → padrão; string vazia não está no conjunto
+        raw_backup_enabled = "1"
+    raw_backup_enabled = raw_backup_enabled.strip()
+    if raw_backup_enabled not in ("1", "0"):
+        _fail("BACKUP_ENABLED", "use 1 (ligado) ou 0 (desligado)")
+    backup_enabled = raw_backup_enabled == "1"
+
+    # (2) BACKUP_DIR pelo molde de caminho do DATA_DIR — None na ausência;
+    #     definido, a pasta nasce funcionando (mkdir parents exist_ok) e um
+    #     caminho impossível impede a subida nomeando a variável.
+    raw_backup_dir = resolve("BACKUP_DIR")
+    backup_dir: Path | None
+    if raw_backup_dir is None:
+        backup_dir = None  # consumidor (06-06) deriva <DATA_DIR>/backups
+    else:
+        if not raw_backup_dir.strip():
+            _fail("BACKUP_DIR", "o caminho não pode ser vazio")
+        backup_dir = Path(raw_backup_dir)
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _fail("BACKUP_DIR", "a pasta não pôde ser criada nem gravada")
+
+    # (3) BACKUP_KEEP e BACKUP_FAIL_NOTIFY_AFTER pelo molde positive_int
+    #     existente (dias de retenção e noites de falha até o aviso).
+    backup_keep = positive_int("BACKUP_KEEP", "7")
+    backup_fail_notify_after = positive_int("BACKUP_FAIL_NOTIFY_AFTER", "2")
+
+    # (4) BACKUP_HOUR por um molde-irmão do positive_int com faixa 0–23
+    #     (hora local do backup; meia-noite válida → 0 entra na faixa).
+    def hour_of_day(name: str, default: str) -> int:
+        raw = resolve(name)
+        if raw is None:  # ausente → padrão; string vazia definida falha no int abaixo
+            raw = default
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            _fail(name, "use um inteiro entre 0 e 23 (hora local)")
+        if not 0 <= value <= 23:
+            _fail(name, "use um inteiro entre 0 e 23 (hora local)")
+        return value
+
+    backup_hour = hour_of_day("BACKUP_HOUR", "4")
+
     # Pares de canal (D-08): configuração pela metade é config inválida —
     # fail-fast nomeando a variável que FALTA. NTFY_TOPIC sozinho é VÁLIDO
     # (o token é opcional). Sem NENHUM canal configurado o worker sobe normal
@@ -314,5 +376,10 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         ntfy_token=ntfy_token,
         notify_click_url=notify_click_url,
         cookie_secure=cookie_secure,
+        backup_enabled=backup_enabled,
+        backup_dir=backup_dir,
+        backup_keep=backup_keep,
+        backup_hour=backup_hour,
+        backup_fail_notify_after=backup_fail_notify_after,
         secrets=secrets,
     )
