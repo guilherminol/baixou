@@ -1,11 +1,14 @@
 """Disciplina de migrações: fresh, apply-once, refuse-newer e corrida (D-03, Pitfall 9).
 
 Cinco casos do <behavior> do plano 01-02, Task 2, estendidos pelo plano
-03-04 para a 0003 (tabela notify_episode — D-05/D-06). A corrida usa duas
-threads com conexões separadas (uma por chamada de apply_migrations) e
-largada sincronizada por Barrier — o árbitro do lock ``BEGIN IMMEDIATE`` +
-busy_timeout: ambas retornam sem exceção, ``schema_migrations`` fica com
-exatamente 1 linha por versão e as tabelas íntegras.
+03-04 para a 0003 (tabela notify_episode — D-05/D-06) e pelo plano 04-03
+para a 0004 (coluna watch.paused — D-09 — e quote reconstruída SEM a FK ON
+DELETE CASCADE — D-01: a cotação órfã sobrevive à remoção do item até o
+pruning do worker). A corrida usa duas threads com conexões separadas (uma
+por chamada de apply_migrations) e largada sincronizada por Barrier — o
+árbitro do lock ``BEGIN IMMEDIATE`` + busy_timeout: ambas retornam sem
+exceção, ``schema_migrations`` fica com exatamente 1 linha por versão e as
+tabelas íntegras.
 """
 
 from __future__ import annotations
@@ -47,24 +50,24 @@ def _schema_state(db_path) -> tuple[list[str], set[str]]:
 
 
 def test_fresh_database_applies_0001_once_with_event(settings, capsys):
-    """Banco vazio: tabelas do esquema completo, versões 0001–0003, evento emitido."""
+    """Banco vazio: tabelas do esquema completo, versões 0001–0004, evento emitido."""
     applied_now = apply_migrations(settings.db_path)
 
-    assert applied_now == ["0001", "0002", "0003"]
+    assert applied_now == ["0001", "0002", "0003", "0004"]
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002", "0003"]
+    assert versions == ["0001", "0002", "0003", "0004"]
     assert EXPECTED_TABLES <= tables
     assert "migration_applied" in capsys.readouterr().out
 
 
 def test_second_application_is_noop(settings):
-    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 3 linhas."""
+    """Segunda chamada no mesmo banco: sem DDL de novo, sem erro, 4 linhas."""
     apply_migrations(settings.db_path)
     applied_now = apply_migrations(settings.db_path)
 
     assert applied_now == []
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002", "0003"]
+    assert versions == ["0001", "0002", "0003", "0004"]
     assert EXPECTED_TABLES <= tables
 
 
@@ -117,9 +120,9 @@ def test_newer_schema_is_refused(settings, capsys):
     with pytest.raises(SystemExit):
         apply_migrations(settings.db_path)
     assert "newer_schema_refused" in capsys.readouterr().out
-    # Nada foi aplicado além da recusa: as versões continuam 0001–0003 e 9999.
+    # Nada foi aplicado além da recusa: as versões continuam 0001–0004 e 9999.
     versions, _ = _schema_state(settings.db_path)
-    assert sorted(versions) == ["0001", "0002", "0003", "9999"]
+    assert sorted(versions) == ["0001", "0002", "0003", "0004", "9999"]
 
 
 def test_concurrent_apply_race_is_exactly_once(settings):
@@ -142,7 +145,7 @@ def test_concurrent_apply_race_is_exactly_once(settings):
 
     assert failures == []  # ambas retornam sem exceção
     versions, tables = _schema_state(settings.db_path)
-    assert versions == ["0001", "0002", "0003"]  # exatamente 1 linha por versão
+    assert versions == ["0001", "0002", "0003", "0004"]  # exatamente 1 linha por versão
     assert EXPECTED_TABLES <= tables  # todas as tabelas íntegras
 
 
@@ -181,3 +184,65 @@ def test_watch_direction_column_defaults_to_below_and_refuses_others(settings):
             )
     finally:
         conn.close()
+
+
+# --- 04-03 Task 1 (D-01/D-09): pausa em watch e quote sem FK cascade ---
+
+
+def test_watch_gains_paused_column_defaulting_to_zero(settings):
+    """A migração 0004 acrescenta watch.paused INTEGER NOT NULL DEFAULT 0 (D-09).
+
+    O esquema 0001 não tem a coluna: o ALTER da 0004 a cria NOT NULL com o
+    padrão ATIVO (0) — INSERT sem paused nasce ativo, e a pausa é o estado
+    excepcional que o worker passa a obedecer antes de consultar a fonte.
+    """
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        columns = {
+            row["name"]: (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+            for row in conn.execute("PRAGMA table_info(watch)")
+        }
+        conn.execute(
+            "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', 10.0)"
+        )
+        row = conn.execute("SELECT paused FROM watch WHERE symbol = 'PETR4'").fetchone()
+    finally:
+        conn.close()
+    assert columns.get("paused") == ("INTEGER", 1, "0", 0)  # NOT NULL DEFAULT 0
+    assert row["paused"] == 0  # INSERT sem paused → linha ativa por padrão
+
+
+def test_quote_orphan_survives_watch_delete_with_alert_state(settings):
+    """A migração 0004 reconstrói quote SEM a FK ON DELETE CASCADE (D-01).
+
+    A web apaga SÓ watch: a cotação órfã — com alerted/notify_state —
+    permanece até o pruning do worker (Task 3 do plano). A reconstrução
+    (CREATE quote_new → INSERT SELECT → DROP → RENAME) preserva todas as
+    colunas de 0001 + last_fetch_error da 0002 e nenhuma chave estrangeira.
+    """
+    apply_migrations(settings.db_path)
+
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        conn.execute(
+            "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', 10.0)"
+        )
+        conn.execute(
+            "INSERT INTO quote (symbol, market, price, alerted, alerted_target, "
+            "notify_state, last_fetch_error) "
+            "VALUES ('PETR4', 'b3', 35.2, 1, 10.0, '{\"telegram\": \"ok\"}', NULL)"
+        )
+        conn.execute("DELETE FROM watch WHERE symbol = 'PETR4'")
+        orfa = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+        colunas = {row["name"] for row in conn.execute("PRAGMA table_info(quote)")}
+        chaves = conn.execute("PRAGMA foreign_key_list(quote)").fetchall()
+    finally:
+        conn.close()
+    assert orfa is not None  # a órfã NÃO é apagada junto com o pai (D-01)
+    assert orfa["alerted"] == 1  # o histórico de alerta sobrevive...
+    assert orfa["alerted_target"] == 10.0
+    assert orfa["notify_state"] == '{"telegram": "ok"}'  # ...até o pruning do worker
+    assert chaves == []  # SEM nenhuma FOREIGN KEY (a cascata da 0001 saiu)
+    assert "last_fetch_error" in colunas  # coluna da 0002 sobrevive à reconstrução

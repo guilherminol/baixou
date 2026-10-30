@@ -527,3 +527,35 @@ def test_environment_without_any_channel_loads(monkeypatch, tmp_path):
     assert settings.ntfy_topic == ""
     assert settings.ntfy_token == ""
     assert settings.ntfy_url == "https://ntfy.sh"  # padrão público, sem dado do autor
+
+
+# --- Fase 4 (plano 04-01, Task 2): COOKIE_SECURE (AUTH-01, molde WR-01/LOG_LEVEL) ---
+
+
+def test_phase4_default_cookie_secure(monkeypatch, tmp_path):
+    """Sem COOKIE_SECURE definida, o padrão é "auto" (Secure só em https)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+    assert load_settings().cookie_secure == "auto"
+
+
+@pytest.mark.parametrize("valor", ["auto", "sim", "nao", "  SIM  ", "Nao"])
+def test_cookie_secure_valid_value_is_normalized(monkeypatch, tmp_path, valor):
+    """Valor válido aparado em minúsculo — conjunto fechado auto/sim/nao."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("COOKIE_SECURE", valor)
+    assert load_settings().cookie_secure == valor.strip().lower()
+
+
+@pytest.mark.parametrize("invalid", ["abc", "always", ""])
+def test_cookie_secure_invalid_exits_naming_variable(monkeypatch, tmp_path, capsys, invalid):
+    """Fora do conjunto (ou string vazia DEFINIDA) impede a subida nomeando a variável."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("COOKIE_SECURE", invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, "COOKIE_SECURE", captured)
+    if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
+        assert invalid not in captured.out + captured.err

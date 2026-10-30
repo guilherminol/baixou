@@ -65,6 +65,50 @@ Sem login, sem dados no corpo, sem cabeçalhos de versão — serve ao healthche
 do Docker e a monitores externos (Uptime Kuma, healthchecks.io, etc.). A
 degradação de fontes/canais aparece na página, nunca derruba o `/healthz`.
 
+## Redefinição de senha
+
+Perdeu a senha (ou a sessão) do administrador? O comando abaixo roda **dentro
+do container** e não precisa de acesso à API:
+
+```bash
+docker compose exec web python -m baixou.web.reset_password
+# para um usuário diferente do padrão `admin`:
+docker compose exec web python -m baixou.web.reset_password --username outro
+```
+
+O comando pede a senha nova duas vezes (sem eco no terminal — a senha nunca
+passa por argumentos do shell, então não fica no histórico) e, num único
+passo:
+
+- troca a senha do usuário; e
+- **encerra todas as sessões dele** — nenhum login antigo sobrevive ao reset;
+  entre com a senha nova na página de login.
+
+A senha nova precisa ter pelo menos 12 caracteres.
+
+## Contrato da API
+
+O contrato completo da API vive congelado em **`backend/openapi.json`** — é a
+superfície `/api` da Fase 4 (setup, login/logout e gestão da lista), da qual a
+interface (Fase 5) gera os tipos TypeScript com
+[openapi-typescript](https://www.npmjs.com/package/openapi-typescript).
+
+O arquivo é **congelado**: o teste `backend/tests/test_openapi_contract.py`
+regenera o schema em memória e compara com o commitado — qualquer diferença
+(regra a mais, a menos ou alterada) reprova a suíte. Mudou uma rota de
+propósito? Regere o artefato e commite junto:
+
+```bash
+uv run python -c "import json,tempfile,pathlib;from baixou.core.config import Settings;from baixou.web.main import create_app;app=create_app(Settings(data_dir=pathlib.Path(tempfile.mkdtemp()),tz_market='America/Sao_Paulo',poll_minutes=15,log_level='info'));pathlib.Path('backend/openapi.json').write_text(json.dumps(app.openapi(),sort_keys=True,indent=2,ensure_ascii=False)+chr(10),encoding='utf-8')"
+```
+
+Detalhes do contrato:
+
+- O `/healthz` fica **fora** do contrato (sinal de vida, não API) e a
+  documentação automática do FastAPI permanece **desligada** — nenhum
+  `/docs`, `/redoc` ou `/openapi.json` é servido; o JSON é artefato de
+  build/CI, não rota.
+
 ## Variáveis de ambiente (Fase 1)
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a

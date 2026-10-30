@@ -323,7 +323,10 @@ def process_alerts(
     ``_evaluate_alerted`` — troca de alvo e rearme mudam estado sem mensagem,
     com ``alerted_at`` preservado; item aguardando com preço ≤ alvo (borda
     inclusiva) dispara a entrega multi-canal. ``now_utc`` (aware) vira o
-    ``alerted_at`` no formato de timestamp do banco.
+    ``alerted_at`` no formato de timestamp do banco. Pausados (``paused = 1``,
+    migração 0004 — D-09/WATCH-03) nem entram na leitura: não avaliam troca de
+    alvo, rearme nem cruzamento, e não notificam; retomado, o item volta a ser
+    avaliado normalmente na rodada seguinte.
     """
     rows = conn.execute(
         """
@@ -332,6 +335,7 @@ def process_alerts(
                q.alerted AS alerted, q.alerted_target AS alerted_target
         FROM watch w
         LEFT JOIN quote q ON q.symbol = w.symbol AND q.market = w.market
+        WHERE w.paused = 0
         ORDER BY w.symbol, w.market
         """
     ).fetchall()

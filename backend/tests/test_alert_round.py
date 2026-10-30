@@ -111,11 +111,14 @@ def alert_env_two_channels(tmp_path, monkeypatch) -> tuple[Settings, sqlite3.Con
     conn.close()
 
 
-def _seed_petr4(conn: sqlite3.Connection, target: float = 10.0) -> None:
-    """Semeia PETR4 na watch com o alvo do teste (isolation_level=None: autocommit)."""
+def _seed_petr4(conn: sqlite3.Connection, target: float = 10.0, paused: int = 0) -> None:
+    """Semeia PETR4 na watch com o alvo do teste (isolation_level=None: autocommit).
+
+    ``paused`` semeia a coluna da migração 0004 (04-03): default 0 = ativo.
+    """
     conn.execute(
-        "INSERT INTO watch (symbol, market, target_below) VALUES ('PETR4', 'b3', ?)",
-        (target,),
+        "INSERT INTO watch (symbol, market, target_below, paused) VALUES ('PETR4', 'b3', ?, ?)",
+        (target, paused),
     )
 
 
@@ -322,3 +325,66 @@ def test_round_rearm_full_cycle(alert_env, monkeypatch, fake_http):
     assert quote["alerted"] == 1
     assert quote["alerted_at"] == "2026-10-28T16:15:00Z"  # novo disparo atualiza o histórico
     assert quote["alerted_target"] == 15.0
+
+
+# --- 04-03 Task 3 (WATCH-03/D-09): pausado não avalia nem notifica; retomado volta ---
+
+
+def _seed_quote_abaixo_do_alvo(conn: sqlite3.Connection) -> None:
+    """Semeia a quote de PETR4 FRESCA e já abaixo do alvo (como uma rodada pré-pausa a deixou).
+
+    price_at 15:45 fica dentro do limite de frescor da B3 (75 min) contra os
+    relógios congelados dos testes (16:00/16:15) — sem a pausa, este estado
+    dispara o aviso na PRÓPRIA rodada; a pausa é a única razão de não sair.
+    """
+    conn.execute(
+        "INSERT INTO quote (symbol, market, price, price_at, change_pct, alerted) "
+        "VALUES ('PETR4', 'b3', 9.50, '2026-10-28T15:45:00Z', -6.0, 0)"
+    )
+
+
+def test_round_paused_item_below_target_never_notifies(alert_env, monkeypatch, fake_http):
+    """Pausado com preço abaixo do alvo: nenhuma notificação e alerted permanece 0 (WATCH-03).
+
+    A quote já nasce abaixo do alvo e fresca — sem a pausa a rodada notificaria
+    de imediato; a pausa é a ÚNICA razão de nada sair (não avalia: sem consulta
+    à fonte, sem cruzamento, sem notify_state).
+    """
+    settings, conn = alert_env
+    _seed_petr4(conn, target=10.0, paused=1)
+    _seed_quote_abaixo_do_alvo(conn)
+    fake_http.route(_brapi_price(9.50))
+    _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(conn, settings)
+
+    assert _telegram_requests(fake_http) == []  # pausado não notifica
+    assert [r for r in fake_http.requests if r.url.host == "brapi.dev"] == []  # nem consulta
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 0  # permanece aguardando
+    assert quote["alerted_at"] is None
+    assert quote["notify_state"] is None  # nenhuma tentativa de entrega foi gravada
+
+
+def test_round_resume_notifies_when_crossing_after_pause(alert_env, monkeypatch, fake_http):
+    """Pausado silencia; retomado, a rodada seguinte reconsulta e o cruzamento dispara (D-09)."""
+    settings, conn = alert_env
+    _seed_petr4(conn, target=10.0, paused=1)
+    _seed_quote_abaixo_do_alvo(conn)
+    fake_http.route(_brapi_price(9.50))
+    _freeze_clock(monkeypatch, _MARKET_OPEN_NOW)
+
+    worker_main.run_round(conn, settings)  # pausado: nada sai
+    assert _telegram_requests(fake_http) == []
+    quote = conn.execute("SELECT alerted FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 0
+
+    conn.execute("UPDATE watch SET paused = 0 WHERE symbol = 'PETR4'")
+    _freeze_clock(monkeypatch, datetime(2026, 10, 28, 16, 15, 0, tzinfo=UTC))
+    worker_main.run_round(conn, settings)  # retomado: consulta, avalia e notifica
+
+    assert len(_telegram_requests(fake_http)) == 1  # o cruzamento disparou na retomada
+    quote = conn.execute("SELECT * FROM quote WHERE symbol = 'PETR4'").fetchone()
+    assert quote["alerted"] == 1
+    assert quote["alerted_at"] == "2026-10-28T16:15:00Z"
+    assert quote["alerted_target"] == 10.0

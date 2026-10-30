@@ -4,16 +4,18 @@ O título é obrigatório e estável (arquitetura §Interfaces de fontes e
 notificadores) — "Baixou: <SÍMBOLO>" (D-03): o nome do projeto é o próprio
 evento; os números ficam no corpo. O corpo do aviso de preço é completo
 (D-01): preço atual, alvo, variação do dia e hora da cotação convertida para
-o fuso do pregão, com a moeda derivada do market/sufixo (D-02 — nasce aqui
-para a Fase 4 reaproveitar) e a nota de conferência quando a variação é
-suspeita (D-04/D-10) como linha extra, sem bloquear o alerta. Os
+o fuso do pregão, com a moeda derivada do market/sufixo (D-02 — vive no
+núcleo comum ``baixou.core.currency`` desde o 04-02; reexportada aqui para
+os imports da Fase 3 seguirem intactos) e a nota de conferência quando a
+variação é suspeita (D-04/D-10) como linha extra, sem bloquear o alerta. Os
 construtores de avisos operacionais (falha/recuperação de fonte, cota
 80%/esgotada — D-07, consumidos pelo plano 03-04) compartilham o formato
 título+corpo e NUNCA levam nota de suspeita. A mensagem fica restrita a
 dados do item — nunca linguagem de compra/venda (o aviso não é
 recomendação) — e nunca inclui URL, token, tópico ou chat_id (K2/T-03-02).
 Horários ficam em UTC no banco; conversão para fuso só aqui, na saída.
-Helpers puros, sem I/O — o molde é sources/base.py.
+A formatação de apresentação (format_money/format_pct) fica no worker —
+só a moeda é compartilhada. Helpers puros, sem I/O.
 """
 
 from __future__ import annotations
@@ -22,11 +24,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from baixou.core.config import Settings
+from baixou.core.currency import currency_for  # reexport (WATCH-02, D-02)
 
-_MARKET_B3 = "b3"
-_BRL_SUFFIX = "BRL"
-_CURRENCY_BRL = "R$"
-_CURRENCY_USD = "US$"
 # Simultânea: vírgula vira ponto e ponto vira vírgula (67,320.00 → 67.320,00).
 _PT_BR_DIGITS = str.maketrans(",.", ".,")
 
@@ -34,19 +33,6 @@ _PT_BR_DIGITS = str.maketrans(",.", ".,")
 def alert_title(symbol: str) -> str:
     """Título estável do aviso de preço (D-03) — idêntico em todos os canais."""
     return f"Baixou: {symbol}"
-
-
-def currency_for(symbol: str, market: str) -> str:
-    """Moeda do item (D-02): derivada do market e do sufixo do símbolo (FR-16).
-
-    B3 é em reais; no mercado cripto o sufixo manda — BRL → R$;
-    USDT/USDC/USD e sufixo desconhecido → US$, o padrão do mercado cripto.
-    """
-    if market == _MARKET_B3:
-        return _CURRENCY_BRL
-    if symbol.endswith(_BRL_SUFFIX):
-        return _CURRENCY_BRL
-    return _CURRENCY_USD
 
 
 def format_money(value: float, currency: str) -> str:
