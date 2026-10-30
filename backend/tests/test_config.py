@@ -559,3 +559,153 @@ def test_cookie_secure_invalid_exits_naming_variable(monkeypatch, tmp_path, caps
     _assert_exit_names_variable(excinfo, "COOKIE_SECURE", captured)
     if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
         assert invalid not in captured.out + captured.err
+
+
+# --- Fase 6 (plano 06-04, Task 1): envs de backup no Settings (D-06/D-07, WR-01) ---
+
+
+def test_phase6_backup_defaults_without_env(monkeypatch, tmp_path):
+    """Sem variáveis de backup definidas, valem os padrões: ligado, None/7/4/2 (D-06/D-07).
+
+    Backup é parte do produto: BACKUP_ENABLED nasce 1; backup_dir None significa
+    "derivar <DATA_DIR>/backups" — a derivação é do consumidor (06-06), não daqui.
+    """
+    _base_env(monkeypatch, tmp_path)
+    for variable in (
+        "BACKUP_ENABLED",
+        "BACKUP_DIR",
+        "BACKUP_KEEP",
+        "BACKUP_HOUR",
+        "BACKUP_FAIL_NOTIFY_AFTER",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    settings = load_settings()
+
+    assert settings.backup_enabled is True
+    assert settings.backup_dir is None
+    assert settings.backup_keep == 7
+    assert settings.backup_hour == 4
+    assert settings.backup_fail_notify_after == 2
+
+
+@pytest.mark.parametrize(("valor", "esperado"), [("1", True), ("0", False)])
+def test_backup_enabled_valid_value_is_parsed(monkeypatch, tmp_path, valor, esperado):
+    """Conjunto fechado "1"/"0" (molde COOKIE_SECURE): "1" → True, "0" → False."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BACKUP_ENABLED", valor)
+    assert load_settings().backup_enabled is esperado
+
+
+@pytest.mark.parametrize("invalid", ["sim", "true", "2", ""])
+def test_backup_enabled_invalid_exits_naming_variable(monkeypatch, tmp_path, capsys, invalid):
+    """Fora do conjunto (ou string vazia DEFINIDA) impede a subida nomeando a variável."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BACKUP_ENABLED", invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, "BACKUP_ENABLED", captured)
+    if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
+        assert invalid not in captured.out + captured.err
+
+
+def test_backup_dir_defined_creates_nested_directory(monkeypatch, tmp_path):
+    """BACKUP_DIR definido → Path com a pasta aninhada nova criada (mkdir parents)."""
+    _base_env(monkeypatch, tmp_path)
+    nested = tmp_path / "backups" / "noturno"
+    monkeypatch.setenv("BACKUP_DIR", str(nested))
+
+    settings = load_settings()
+
+    assert settings.backup_dir == nested
+    assert nested.is_dir()
+
+
+def test_backup_dir_unwritable_exits_naming_variable(monkeypatch, tmp_path, capsys):
+    """BACKUP_DIR apontando para arquivo regular (não-criável como pasta) impede a subida."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("não sou uma pasta", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BACKUP_DIR", str(blocker))
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    _assert_exit_names_variable(excinfo, "BACKUP_DIR", capsys.readouterr())
+
+
+@pytest.mark.parametrize("variable", ["BACKUP_ENABLED", "BACKUP_DIR"])
+def test_phase6_backup_empty_string_exits_naming_variable(monkeypatch, tmp_path, capsys, variable):
+    """String vazia DEFINIDA em flag/caminho de backup é inválida — contrato WR-01.
+
+    Vazio definido nunca vale ausente: o padrão (1 / <DATA_DIR>/backups derivado)
+    só se aplica na ausência real da variável (D-07).
+    """
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, variable, captured)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "expected"),
+    [
+        ("BACKUP_KEEP", "10", 10),
+        ("BACKUP_HOUR", "0", 0),
+        ("BACKUP_HOUR", "23", 23),
+        ("BACKUP_FAIL_NOTIFY_AFTER", "5", 5),
+    ],
+)
+def test_phase6_backup_int_valid_value_is_parsed(monkeypatch, tmp_path, variable, value, expected):
+    """Valor válido vira int no molde das ints (BACKUP_HOUR aceita as bordas 0 e 23)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, value)
+    settings = load_settings()
+    assert getattr(settings, variable.lower()) == expected
+
+
+@pytest.mark.parametrize(
+    ("variable", "invalid"),
+    [
+        ("BACKUP_KEEP", "0"),
+        ("BACKUP_KEEP", "-1"),
+        ("BACKUP_KEEP", "abc"),
+        ("BACKUP_KEEP", ""),
+        ("BACKUP_HOUR", "24"),
+        ("BACKUP_HOUR", "-1"),
+        ("BACKUP_HOUR", "abc"),
+        ("BACKUP_HOUR", ""),
+        ("BACKUP_FAIL_NOTIFY_AFTER", "0"),
+        ("BACKUP_FAIL_NOTIFY_AFTER", "abc"),
+        ("BACKUP_FAIL_NOTIFY_AFTER", ""),
+    ],
+)
+def test_phase6_backup_int_invalid_exits_naming_variable(
+    monkeypatch, tmp_path, capsys, variable, invalid
+):
+    """Int de backup fora do domínio (ou string vazia DEFINIDA) nomeia a variável (WR-01)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(variable, invalid)
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, variable, captured)
+    if invalid:  # o valor nunca aparece na mensagem (K2/WR-01)
+        assert invalid not in captured.out + captured.err
+
+
+def test_backup_hour_out_of_range_cites_range(monkeypatch, tmp_path, capsys):
+    """BACKUP_HOUR="24" cita a faixa 0–23 na mensagem (hint PT-BR próprio)."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BACKUP_HOUR", "24")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings()
+    captured = capsys.readouterr()
+    _assert_exit_names_variable(excinfo, "BACKUP_HOUR", captured)
+    assert "0 e 23" in captured.out + captured.err
