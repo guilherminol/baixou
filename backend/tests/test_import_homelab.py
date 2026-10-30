@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS watch (
 );
 """
 
+# DDL variante para a recusa de par duplicado, SEM a PRIMARY KEY do contrato:
+# o módulo valida duplicidade na LEITURA justamente porque um homelab real
+# pode não ter a PK — o fixture tira a restrição para construir o caso.
+_DDL_SEM_PK = """
+CREATE TABLE IF NOT EXISTS watch (
+    symbol        TEXT    NOT NULL,
+    market        TEXT    NOT NULL DEFAULT 'b3',
+    target        REAL    NOT NULL,
+    alerted       INTEGER NOT NULL DEFAULT 0,
+    atualizado_em TEXT
+);
+"""
+
 # 2 itens B3 + 2 cripto, com o estado "alertado" do homelab GRUDADO nas
 # linhas (alerted=1) — o import nunca o leva: as linhas do alvo nascem
 # direction='below'/paused=0 (fr-17).
@@ -92,13 +105,12 @@ def _cria_homelab(
     conn = sqlite3.connect(str(caminho))
     try:
         conn.executescript(ddl)
-        if coluna_extra is None:
+        if insercoes and coluna_extra is None:
             conn.executemany(
-                "INSERT INTO watch (symbol, market, target, alerted) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO watch (symbol, market, target, alerted) VALUES (?, ?, ?, ?)",
                 insercoes,
             )
-        else:
+        elif insercoes:  # coluna extra FORA do mapeamento (teste K2)
             conn.execute(f"ALTER TABLE watch ADD COLUMN {coluna_extra} TEXT")
             conn.executemany(
                 f"INSERT INTO watch (symbol, market, target, alerted, {coluna_extra}) "
@@ -130,9 +142,7 @@ def _roda_import(monkeypatch, caminho_homelab: Path) -> None:
 
     O caminho do homelab é o ÚNICO argumento — nada de segredo por flag (K2).
     """
-    monkeypatch.setattr(
-        sys, "argv", ["baixou.worker.import_homelab", str(caminho_homelab)]
-    )
+    monkeypatch.setattr(sys, "argv", ["baixou.worker.import_homelab", str(caminho_homelab)])
     _modulo().main()
 
 
@@ -168,9 +178,7 @@ def test_importacao_bem_sucedida_grava_4_itens_com_defaults_e_relata_moedas(
 
     linhas = _linhas_watch(settings)
     assert len(linhas) == 4
-    assert {
-        (linha["symbol"], linha["market"], linha["target_below"]) for linha in linhas
-    } == {
+    assert {(linha["symbol"], linha["market"], linha["target_below"]) for linha in linhas} == {
         ("PETR4", "b3", 32.5),
         ("VALE3", "b3", 55.0),
         ("BTCUSDT", "crypto", 50000.0),
@@ -226,7 +234,7 @@ def test_homelab_sem_coluna_do_mapeamento_recusada_antes_de_tocar_o_alvo(
 ):
     """Tabela existe, coluna de alvo não → recusa nomeando a coluna; alvo
     intocado (COUNT de watch 0)."""
-    caminho = _cria_homelab(tmp_path, ddl=_DDL_SEM_COLUNA_ALVO)
+    caminho = _cria_homelab(tmp_path, insercoes=[], ddl=_DDL_SEM_COLUNA_ALVO)
     with pytest.raises(SystemExit) as saida:
         _roda_import(monkeypatch, caminho)
     assert saida.value.code != 0
@@ -236,10 +244,12 @@ def test_homelab_sem_coluna_do_mapeamento_recusada_antes_de_tocar_o_alvo(
 
 def test_par_duplicado_recusado_antes_de_gravar(settings, monkeypatch, tmp_path, capsys):
     """Par (símbolo, mercado) repetido no homelab → recusa ANTES de gravar
-    (a PK (symbol, market) do alvo seria violada; a checagem é na leitura):
-    0 linhas em watch."""
+    (a PK (symbol, market) do alvo seria violada; a checagem é na leitura,
+    não no INSERT): 0 linhas em watch. O DDL do fixture tira a PK do contrato
+    — um homelab real pode não tê-la, e é por isso que o módulo valida."""
     caminho = _cria_homelab(
         tmp_path,
+        ddl=_DDL_SEM_PK,
         insercoes=[
             ("PETR4", "b3", 32.5, 1),
             ("PETR4", "b3", 40.0, 0),  # par duplicado
@@ -324,12 +334,13 @@ def test_insert_em_watch_nao_lista_direction_nem_paused():
 
 
 def test_modulo_na_fronteira_e_abre_homelab_somente_leitura():
-    """Fronteira do worker (TID251): sem fastapi/pydantic no fonte; o banco
-    do homelab é aberto por URI mode=ro — NUNCA pelo connect() do core, que
-    ativaria pragmas de escrita/WAL em banco de esquema alheio (D-01)."""
+    """Fronteira do worker (TID251): nenhum import de fastapi/pydantic no
+    fonte; o banco do homelab é aberto por URI mode=ro — NUNCA pelo connect()
+    do core, que ativaria pragmas de escrita/WAL em banco de esquema alheio
+    (D-01)."""
     fonte = Path(_modulo().__file__).read_text(encoding="utf-8")
-    assert "fastapi" not in fonte.lower()
-    assert "pydantic" not in fonte.lower()
+    proibidos = re.findall(r"^\s*(?:from|import)\s+(fastapi|pydantic)\b", fonte, re.MULTILINE)
+    assert proibidos == []
     assert "mode=ro" in fonte
     assert "uri=True" in fonte
 
