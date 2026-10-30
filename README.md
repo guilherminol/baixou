@@ -155,7 +155,7 @@ log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 
 ```
 backend/baixou/       pacote único: core (config/db/migrações/log), web, worker
-backend/migrations/   migrações SQL numeradas, aplicadas uma única vez
+backend/baixou/migrations/   migrações SQL numeradas, embutidas no pacote, aplicadas uma única vez
 backend/tests/        testes do backend (sem rede)
 frontend/             interface React + TypeScript + Vite (UI-01/UI-02, Fase 5)
 docker/               Dockerfile da imagem única

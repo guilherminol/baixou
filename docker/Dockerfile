@@ -30,7 +30,12 @@ COPY backend ./backend
 # O dist do build Vite entra no estágio final — é o web (FastAPI) quem o serve,
 # com fallback SPA (05-02); ANTES do chown, para o usuário dedicado o possuir.
 COPY --from=frontend /app/frontend/dist /app/frontend/dist
-RUN uv sync --frozen --no-dev
+# --no-editable instala a WHEEL construída a partir de backend/ (não uma
+# montagem editable do repositório): o runtime da imagem roda exatamente o que
+# a wheel contém — inclusive as migrações embutidas em baixou/migrations
+# (WR-01 da 01-REVIEW). O COPY backend ./backend acima fica: é a fonte a
+# partir da qual o uv constrói a wheel neste build.
+RUN uv sync --frozen --no-dev --no-editable
 
 # Usuário dedicado não-root; /data é o volume compartilhado por web e worker.
 RUN useradd --create-home baixou \
