@@ -144,6 +144,7 @@ def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_iden
     token = _migra_e_pega_token(settings, capsys)
     with _client(settings) as client:
         assert _cria_admin(client, token).status_code == 201
+        token_sessao_setup = client.cookies.get("baixou_session")
         # referência: caminho de senha errada (usuário EXISTENTE)
         errada = client.post(
             "/api/auth/login", json={"username": "admin", "password": SENHA_ERRADA}
@@ -156,8 +157,16 @@ def test_senha_literal_do_hash_ficticio_em_usuario_inexistente_responde_401_iden
     assert dummy.content == errada.content  # byte a byte — indistinguível (T-04-04)
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     try:
-        # nenhuma sessão aberta para usuário inexistente
-        assert conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+        # nenhuma sessão aberta para usuário inexistente — a ÚNICA sessão
+        # presente é a que o setup abre (D-13); as duas falhas de login não
+        # acrescentam nenhuma linha (contagem escopada fora do digest do setup)
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE token_hash != ?",
+                (token_digest(token_sessao_setup),),
+            ).fetchone()["n"]
+            == 0
+        )
         falhas = {
             row["key"]: row["failures"]
             for row in conn.execute("SELECT key, failures FROM login_attempt")
@@ -391,7 +400,16 @@ def test_sessao_expirada_responde_401_e_apaga_a_linha(settings, capsys):
     assert negado.status_code == 401
     conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
     try:
-        assert conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+        # a sessão EXPIRADA sob teste é apagada — contagem ESCOPADA ao digest
+        # dela (o mesmo token_digest do UPDATE acima); o setup D-13 abre OUTRA
+        # sessão dentro de _admin_logado e ela não entra nesta contagem
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?",
+                (token_digest(token_sessao),),
+            ).fetchone()["n"]
+            == 0
+        )
     finally:
         conn.close()
     client.close()
@@ -634,8 +652,6 @@ def test_log_do_admin_created_anuncia_sessao_aberta(settings, capsys):
     token = _migra_e_pega_token(settings, capsys)
     with _client(settings) as client:
         assert _cria_admin(client, token).status_code == 201
-    linha = next(
-        line for line in capsys.readouterr().out.splitlines() if "admin_created" in line
-    )
+    linha = next(line for line in capsys.readouterr().out.splitlines() if "admin_created" in line)
     assert "sessão aberta" in linha
     assert "faça login com a senha" not in linha

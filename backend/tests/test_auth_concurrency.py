@@ -7,7 +7,8 @@ REAL aqui é por THREADS: 6 threads disparam logins válidos ao MESMO tempo pelo
 MESMO TestClient (o portal anyio do contexto é thread-safe por contrato) e
 disputam o semáforo de verdade. Sem rede e com banco real em tmp_path (molde
 test_auth_api.py): 6 credenciais válidas não podem 5xx, não podem 429 (não há
-falha contada) e cada login abre a SUA sessão — 6 linhas com digests distintos.
+falha contada) e cada login abre a SUA sessão — 6 linhas + a sessão que o
+PRÓPRIO setup abre (D-13, plano 05-07), todas com digests distintos.
 """
 
 from __future__ import annotations
@@ -70,5 +71,5 @@ def test_seis_logins_validos_simultaneos_todos_200_e_sessoes_integras(settings, 
         conn.close()
     # Sessões íntegras: UMA linha por login, NENHUM digest repetido (cada
     # sessão tem token próprio de 256 bits — nenhuma corrida perdeu INSERT).
-    assert len(linhas) == LOGINS_SIMULTANEOS
-    assert len({row["token_hash"] for row in linhas}) == LOGINS_SIMULTANEOS
+    assert len(linhas) == LOGINS_SIMULTANEOS + 1  # +1: a sessão que o setup abre — D-13
+    assert len({row["token_hash"] for row in linhas}) == LOGINS_SIMULTANEOS + 1

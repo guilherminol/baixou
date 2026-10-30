@@ -178,6 +178,12 @@ def setup_status(request: Request) -> dict:
 @router.post("/api/setup")
 def setup(request: Request, corpo: SetupRequest) -> Response:
     """Cria o administrador com o token do log — só funciona sem usuário (T-04-06)."""
+    # D-13 (ao criar, já entra logado): a MESMA write_tx que cria o usuário
+    # abre a PRIMEIRA sessão — mesmo mecanismo do login — e o 201 seta o
+    # cookie; usuário e sessão nascem atômicos, sem janela de
+    # usuário-sem-sessão. (Nota: comentário e não docstring — a docstring vira
+    # description no openapi e o contrato congelado não muda.)
+    settings: Settings = request.app.state.settings
     conn = _open_db(request)
     try:
         if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
@@ -209,22 +215,54 @@ def setup(request: Request, corpo: SetupRequest) -> Response:
                 content={"erros": [erro_item(None, "username", "informe um nome de usuário")]},
             )
         password_hash = hash_password(corpo.password)  # FORA da transação (16 MiB)
+        token = new_token()  # token da primeira sessão (D-13) — fora do lock
         with write_tx(conn):
             # Re-checagem dentro do lock: duas subidas simultâneas não criam
-            # dois usuários (o produto é de usuário ÚNICO).
+            # dois usuários (o produto é de usuário ÚNICO). O raise aborta a tx
+            # INTEIRA: sem user, sem sessão, sem cookie (T-04-06).
             if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
                 raise HTTPException(
                     status_code=403, detail="o administrador já existe — use o login"
                 )
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
                 (corpo.username, password_hash, _ts(_now())),
             )
+            user_id = cursor.lastrowid
             conn.execute("DELETE FROM setup")  # token serve UMA vez (SC-1)
+            agora = _now()
+            # D-13: a PRIMEIRA sessão nasce na MESMA transação do usuário —
+            # um lock só (disciplina WAL). Microssegundos preservados
+            # (precedente WR-02); sem "lembrar": TTL de 12 h (D-10).
+            conn.execute(
+                """
+                INSERT INTO sessions
+                    (token_hash, user_id, created_at, expires_at, last_used_at, remember)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_digest(token),
+                    user_id,
+                    agora.isoformat(),
+                    (agora + _SESSION_TTL_SHORT).isoformat(),
+                    agora.isoformat(),
+                    0,
+                ),
+            )
     finally:
         conn.close()
-    log("info", "web", "admin_created", text="administrador criado — faça login com a senha")
-    return JSONResponse(status_code=201, content={"detail": "administrador criado"})
+    log("info", "web", "admin_created", text="administrador criado — sessão aberta no servidor")
+    response = JSONResponse(status_code=201, content={"detail": "administrador criado"})
+    response.set_cookie(
+        _COOKIE_NAME,
+        token,
+        httponly=True,
+        samesite="strict",
+        path="/",
+        secure=_secure_flag(settings, request),
+        max_age=None,
+    )
+    return response
 
 
 def _wait_seconds(failures: int) -> int:
