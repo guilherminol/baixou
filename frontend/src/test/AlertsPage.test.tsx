@@ -20,9 +20,9 @@ import type { WatchItem } from "../api/watch";
 import type { StatusResponse } from "../api/status";
 import AlertsPage from "../pages/AlertsPage";
 
-const { requestMock, onUnauthorizedMock, holder401 } = vi.hoisted(() => ({
+const { requestMock, pushUnauthorizedMock, holder401 } = vi.hoisted(() => ({
   requestMock: vi.fn(),
-  onUnauthorizedMock: vi.fn(),
+  pushUnauthorizedMock: vi.fn(),
   // Guarda o ÚLTIMO handler registrado — o mock de request dispara-o ANTES de
   // lançar um 401, replicando o contrato do client real (handler antes do throw).
   holder401: { handler: null as null | (() => void) },
@@ -55,9 +55,21 @@ vi.mock("../api/client", () => {
   }
   return {
     ApiError,
+    // RED→GREEN: a página fala o protocolo antigo até o feat trocar os
+    // importadores; o pushUnauthorized restaurativo já vive no mock (o teste
+    // de registro nasce vermelho contra a árvore intocada).
     onUnauthorized: (handler: (() => void) | null) => {
       holder401.handler = handler;
-      onUnauthorizedMock(handler);
+    },
+    // Protocolo restaurativo (D-10): o registro EMPILHA e devolve o restore,
+    // que limpa o holder só se o topo é o próprio handler — o unmount da
+    // página devolve o dono anterior em vez de esvaziar o slot.
+    pushUnauthorized: (handler: () => void) => {
+      holder401.handler = handler;
+      pushUnauthorizedMock(handler);
+      return () => {
+        if (holder401.handler === handler) holder401.handler = null;
+      };
     },
     parseErrosEnvelope: (body: unknown): { campo: string; problema: string }[] => {
       if (typeof body !== "object" || body === null || !("erros" in body)) return [];
@@ -213,7 +225,8 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   requestMock.mockReset();
-  onUnauthorizedMock.mockReset();
+  pushUnauthorizedMock.mockReset();
+  holder401.handler = null;
 });
 
 describe("AlertsPage — lista real agrupada (tracer UI-01)", () => {
@@ -932,7 +945,7 @@ describe("AlertsPage — polling de 60 s e re-login no lugar (D-10)", () => {
     expect(screen.getByText("Sessão expirada")).toBeInTheDocument(); // segue aberto
   });
 
-  it("o handler de 401 é registrado no mount e desregistrado com null no unmount — sem vazamento", async () => {
+  it("o handler de 401 é EMPILHADO no mount (pushUnauthorized devolve o restore) e o unmount INVOCa o restore — o dono anterior volta", async () => {
     vi.useFakeTimers();
     requestMock.mockImplementation(async (path, init) => {
       const metodo = init?.method ?? "GET";
@@ -942,9 +955,12 @@ describe("AlertsPage — polling de 60 s e re-login no lugar (D-10)", () => {
     });
     const { unmount } = renderAlertasComRotas();
     await act(async () => {});
-    expect(onUnauthorizedMock).toHaveBeenCalledWith(expect.any(Function));
+    expect(pushUnauthorizedMock).toHaveBeenCalledWith(expect.any(Function));
+    expect(holder401.handler).not.toBeNull(); // o registro empilhou o handler da página
     unmount();
-    expect(onUnauthorizedMock).toHaveBeenLastCalledWith(null);
+    // O restore INVOCADO devolve o dono anterior (o holder volta a null aqui —
+    // mock de página única; no app real o default do App volta ao topo).
+    expect(holder401.handler).toBeNull();
   });
 
   it("nenhum dado de edição vai a localStorage/sessionStorage (proibição do plano, arquitetura)", async () => {
