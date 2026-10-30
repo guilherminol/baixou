@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from baixou.core import schedule
 from baixou.core.schedule import next_slot
 
 _TIMEOUT_S = 120
@@ -67,3 +68,46 @@ def test_next_slot_recusa_minutes_nao_positivo():
     now = datetime(2026, 10, 29, 15, 0, 0, tzinfo=UTC)
     with pytest.raises(ValueError):
         next_slot(now, 0, tz)
+
+
+# --- Fase 6 (plano 06-04, Task 2): is_backup_due — relógio puro do backup ---
+
+
+def test_is_backup_due_before_local_hour_is_false():
+    """Agora antes da hora local de hoje → ainda não vence (03:00 locais < 4h)."""
+    tz = ZoneInfo("America/Sao_Paulo")  # UTC-3 o ano todo (sem DST desde 2019)
+    now = datetime(2026, 10, 29, 6, 0, 0, tzinfo=UTC)  # 03:00 locais
+    assert schedule.is_backup_due(now, 4, tz) is False
+
+
+def test_is_backup_due_exactly_at_local_hour_is_true():
+    """Borda inclusiva (D-10/D-12): exatamente na hora local → True."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    now = datetime(2026, 10, 29, 7, 0, 0, tzinfo=UTC)  # 04:00 locais exatos
+    assert schedule.is_backup_due(now, 4, tz) is True
+
+
+def test_is_backup_due_after_local_hour_same_day_is_true():
+    """Depois da hora no mesmo dia → True (a janela do dia já venceu)."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    now = datetime(2026, 10, 29, 12, 30, 0, tzinfo=UTC)  # 09:30 locais
+    assert schedule.is_backup_due(now, 4, tz) is True
+
+
+def test_is_backup_due_new_day_resets_until_hour():
+    """Virada de dia recomeça: 00:30 local → False; 04:00 local do novo dia → True."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    before = datetime(2026, 10, 30, 3, 30, 0, tzinfo=UTC)  # 00:30 locais do dia 30
+    assert schedule.is_backup_due(before, 4, tz) is False
+    due = datetime(2026, 10, 30, 7, 0, 0, tzinfo=UTC)  # 04:00 locais do dia 30
+    assert schedule.is_backup_due(due, 4, tz) is True
+
+
+def test_is_backup_due_recusa_hour_fora_da_faixa():
+    """Molde next_slot: hour fora de 0–23 é ValueError (contrato do docstring)."""
+    tz = ZoneInfo("UTC")
+    now = datetime(2026, 10, 29, 15, 0, 0, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        schedule.is_backup_due(now, 24, tz)
+    with pytest.raises(ValueError):
+        schedule.is_backup_due(now, -1, tz)
