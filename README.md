@@ -8,6 +8,54 @@ produção e sem proxy específico.
 > **Aviso:** o Baixou não é recomendação de investimento. Os dados de mercado
 > têm atraso e podem errar.
 
+## Instalar (produção)
+
+Sem clonar o repositório — são só dois comandos (Docker instalado):
+
+```bash
+curl -O https://raw.githubusercontent.com/guilherminol/baixou/main/compose.install.yaml
+docker compose -f compose.install.yaml up -d
+```
+
+Com isso o Baixou **sobe sem configurar nada**: nenhuma variável de ambiente é
+obrigatória. A página abre em **http://127.0.0.1:8000** — o cadastro do
+administrador é feito pelo próprio navegador no primeiro acesso. Sem canal
+configurado, a tela de status mostra a faixa de **"nenhum canal configurado"**:
+o sistema está no ar, a lista funciona — só não avisa.
+
+### Para alertar de verdade
+
+O aviso no celular precisa de um **`.env`** criado ao lado do
+`compose.install.yaml` com **`BRAPI_TOKEN`** (dados da B3 — token gratuito em
+[brapi.dev](https://brapi.dev)) **e um canal** de notificação. O compose lê o
+`.env` automaticamente (ele é opcional justamente para a subida sem
+configuração). Exemplo com valores-placeholders — descomente e troque pelos
+seus:
+
+```bash
+# .env — valores de exemplo; nunca use tokens de terceiros
+# BRAPI_TOKEN=seu-token-da-brapi
+# Canal 1 — Telegram:
+# TELEGRAM_TOKEN=123456:ABC-exemplo-de-token
+# TELEGRAM_CHAT_ID=123456789
+# Canal 2 — ntfy (alternativa ao Telegram):
+# NTFY_TOPIC=um-topico-exemplo-so-seu
+```
+
+Sem canal o sistema sobe, mas não avisa; com o `.env` criado, recrie os
+contêineres com o mesmo `docker compose -f compose.install.yaml up -d` de
+cima para a configuração valer. Criptomoedas não precisam de token — os dados
+da Binance são públicos.
+
+### Atualizar
+
+```bash
+docker compose -f compose.install.yaml pull && docker compose -f compose.install.yaml up -d
+```
+
+A lista, o histórico e o banco vivem no volume nomeado `baixou-data` —
+atualizar a imagem preserva tudo.
+
 ## Como funciona
 
 Dois serviços rodam da mesma imagem e só se falam pelo banco SQLite (modo WAL)
