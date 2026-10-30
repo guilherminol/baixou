@@ -560,3 +560,82 @@ def test_log_de_falha_nunca_contem_username_nem_senha_tentada(settings, capsys):
     # K2/T-04-01: entrada de atacante não vira log — nem username nem senha
     assert "admin-silencioso" not in saida
     assert SENHA_ERRADA not in saida
+
+
+# --- Fase 5 (plano 05-07, gap G-05-1): D-13 — criar o administrador É entrar ---
+# Repro do teste 2 do 05-UAT capturado como teste permanente: o 201 do setup tem
+# de abrir a sessão EXATAMENTE como o login faz (linha em sessions + cookie
+# baixou_session HttpOnly/SameSite=Strict) — o operador cai logado em /.
+
+
+def test_setup_201_setta_cookie_baixou_session_httponly_strict_sem_max_age(settings, capsys):
+    """D-13: o 201 do setup nasce com o cookie de sessão — molde do login sem lembrar."""
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        resposta = _cria_admin(client, token)
+    assert resposta.status_code == 201
+    cookie = resposta.headers.get("set-cookie", "")
+    assert "baixou_session=" in cookie.lower()
+    assert "httponly" in cookie.lower()
+    assert "samesite=strict" in cookie.lower()
+    # setup não tem "lembrar de mim": cookie de SESSÃO, sem Max-Age (D-10)
+    assert "max-age=" not in cookie.lower()
+
+
+def test_setup_abre_exatamente_uma_sessao_remember_0_validade_12_horas(settings, capsys):
+    """A primeira sessão nasce no banco: 1 linha pelo digest do token, TTL de 12 h."""
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        token_sessao = client.cookies.get("baixou_session")
+    # RED: None hoje — o repro do UAT (o setup não seta cookie)
+    assert token_sessao
+    linha = _linha_sessao(settings, token_sessao)
+    assert linha is not None
+    assert linha["remember"] == 0  # setup sem "lembrar" (D-10)
+    restante = datetime.fromisoformat(linha["expires_at"]) - datetime.now(UTC)
+    assert timedelta(hours=11) < restante <= timedelta(hours=12)
+
+
+def test_cookie_do_setup_autentica_rota_protegida_num_client_fresco(settings, capsys):
+    """O cookie do setup autentica DE VERDADE: client fresco com ele lê /api/watch."""
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        resposta = _cria_admin(client, token)
+        assert resposta.status_code == 201
+        token_sessao = client.cookies.get("baixou_session")
+    assert token_sessao  # RED: None hoje — cookie nunca foi setado
+    with _client(settings) as fresco:
+        lista = fresco.get("/api/watch", cookies={"baixou_session": token_sessao})
+    assert lista.status_code == 200
+    assert lista.json() == {"itens": []}
+
+
+def test_replay_do_setup_com_usuario_existente_403_sem_sessao_nova_nem_cookie(settings, capsys):
+    """T-04-06 preservado: só o caminho de sucesso emite credencial — replay 403."""
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+        token_sessao = client.cookies.get("baixou_session")
+        replay = _cria_admin(client, token, username="outro")
+    assert replay.status_code == 403
+    # nenhuma sessão nova: a do setup continua sendo a ÚNICA linha
+    conn = connect(settings.db_path, timeout_s=WORKER_TIMEOUT_S)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 1
+    finally:
+        conn.close()
+    # o replay não seta cookie: a jarra continua com o token do setup
+    assert client.cookies.get("baixou_session") == token_sessao
+
+
+def test_log_do_admin_created_anuncia_sessao_aberta(settings, capsys):
+    """O log novo anuncia a sessão aberta — a instrução de login manual sai."""
+    token = _migra_e_pega_token(settings, capsys)
+    with _client(settings) as client:
+        assert _cria_admin(client, token).status_code == 201
+    linha = next(
+        line for line in capsys.readouterr().out.splitlines() if "admin_created" in line
+    )
+    assert "sessão aberta" in linha
+    assert "faça login com a senha" not in linha
