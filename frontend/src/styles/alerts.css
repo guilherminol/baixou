@@ -1,0 +1,150 @@
+/*
+ * CSS da página de alertas (05-03) — consome as variáveis do design system
+ * (global.css, D-01). A tabela densa do mockup (table-wrap/th/td,
+ * .symbol-cell, .tag-state/.state-hit/.state-stale, .row-undo, .action-bar,
+ * .add-block) já vive no global.css; aqui vive só o que a página acrescenta:
+ * a sub-linha D-06 do celular e os destaques de estado do item (D-07).
+ */
+
+/* Sub-linha D-06: segundo <tr> por item com distância + atualização +
+   disparo empilhados. Nasce oculta (desktop mostra a tabela completa) e a
+   media query <= 600px a revela ao esconder as três colunas dobráveis. */
+.sub-linha-row {
+  display: none;
+}
+
+.sub-linha {
+  height: auto;
+  padding: 4px 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: normal;
+}
+
+.sub-linha span {
+  display: inline-block;
+  margin-right: 12px;
+}
+
+/* Detalhes do item sob o estado (D-07): linha curta de variação suspeita e
+   falha de canal ("telegram: erro") — texto always, 11px muted, quebra a
+   linha dentro da célula. */
+.estado-extra {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+}
+
+/* Problema do envelope D-08 renderizado inline junto ao item nomeado. */
+.erro-item {
+  color: var(--error-text);
+  font-size: 12px;
+  white-space: normal;
+}
+
+/* Rótulos visualmente ocultos (contrato de interação: todo input com
+   <label>) — o bloco "Novo alerta" usa placeholders como o mockup. */
+.rotulo-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Modal de re-login no lugar (D-10): véu sobre a página, o .add-block como
+   molde — a edição continua em memória por trás, inacessível até reentrar. */
+.modal-fundo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 20;
+}
+
+.modal-relogin {
+  width: 100%;
+  max-width: 360px;
+  margin-top: 0;
+}
+
+.modal-relogin h2 {
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.modal-relogin .meta-line {
+  margin-bottom: 12px;
+}
+
+.modal-relogin .btn-primario {
+  width: 100%;
+}
+
+/* D-06 (SC-5): em telas estreitas as 3 colunas dobráveis (Distância,
+   Atualização, Disparo) saem e a sub-linha entra — as 4 colunas (Ticker ·
+   Preço · Alvo · Estado) + ações permanecem visíveis em 360px, sem rolagem
+   lateral. Acima de 600px a tabela completa volta. */
+@media (max-width: 600px) {
+  .col-dobra {
+    display: none;
+  }
+
+  .sub-linha-row {
+    display: table-row;
+  }
+}
+
+/* Piso de 360 px da tabela de alertas (SC-5, critério travado do ROADMAP;
+   fechamento do gap G-05-2): a 360 px exatos a linha visível a ≤600 px
+   (5 td + input de alvo de 90 px + 2 botões de ação) media scrollWidth
+   434/446 — excesso de 74-86 px. Este bloco compacta o piso DECLARADO com
+   economia ≥ 90 px contra as bases do global.css (input 90, td/th 8 px por
+   lado, botão 8 px por lado): (input −30) + td −40 + th −40 + botões −16 =
+   126 declarados, dos quais a linha de dados responde 86 = pior excesso
+   medido e o th é margem. Dentro da decisão de design D-01/D-06 (CSS
+   próprio, sub-linha e media query de 600 px intocadas); alvos de toque de
+   44×44 px e rótulos PT-BR (Pausar/Retomar/Remover) PRESERVADOS — D-07
+   proíbe icon-only, então aqui NUNCA há min-width/min-height/display para
+   .btn-action (fica o mínimo de 44 px da base) e nenhum TSX muda. A cascade
+   vence pela ordem de import (alerts.css depois de global.css) sem
+   !important; o orçamento é travado pelo teste estrutural
+   AlertsCompacto360.test.tsx.
+   Efeito colateral DECLARADO no irmão: a .sub-linha D-06 é um td de
+   .table-wrap, então o override (0,1,1) vence o padding 4px 8px 10px dela a
+   ≤400 px — a célula passa a 6px 4px: horizontal 8→4 por lado (mesma
+   direção do conserto, a favor do orçamento SC-5), vertical 4/10→6/6
+   (deslocamento cosmético de 2 px); a regra .sub-linha e a media query de
+   600 px NÃO são editadas — o efeito vem da cascade, não de edição. */
+@media (max-width: 400px) {
+  .input-target {
+    width: 60px;
+  }
+
+  .table-wrap td {
+    padding: 6px 4px;
+  }
+
+  .table-wrap th {
+    padding: 8px 4px;
+  }
+
+  .btn-action {
+    padding: 0 4px;
+    font-size: 11px;
+  }
+}

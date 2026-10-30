@@ -52,6 +52,25 @@ Notas da Opção 1 (Docker):
 - Os serviços reiniciam sozinhos após um crash (política `unless-stopped`);
   uma parada explícita com `docker stop` continua sendo respeitada.
 
+### Frontend (dev)
+
+A interface vive em `frontend/` (React + TypeScript + Vite). Com o backend no
+ar (`uv run python -m baixou.web.main`, porta 8000):
+
+```bash
+cd frontend
+npm ci        # dependências EXATAS do package-lock.json (mesmo caminho do CI e da imagem)
+npm run dev   # dev server com proxy de /api e /healthz para 127.0.0.1:8000 — sem CORS
+```
+
+Os demais comandos são a mesma malha exigida no CI (`.github/workflows/ci.yml`,
+job `frontend`): `npm run lint` (eslint), `npm run typecheck`
+(`tsc --noEmit`), `npm run test` (Vitest + Testing Library, sem rede) e
+`npm run build` (o `dist/` que o FastAPI serve em produção). Os tipos
+TypeScript da API são **gerados, nunca editados à mão**: `npm run
+generate-types` regera `src/api/generated/schema.ts` a partir de
+`backend/openapi.json` — o CI regenera e reprova o PR se o commitado divergir.
+
 ## Contrato do `/healthz`
 
 `GET /healthz` mede a vida do **worker**, não do mercado:
@@ -109,7 +128,7 @@ Detalhes do contrato:
   `/docs`, `/redoc` ou `/openapi.json` é servido; o JSON é artefato de
   build/CI, não rota.
 
-## Variáveis de ambiente (Fase 1)
+## Variáveis de ambiente
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a
 subida, com a mensagem nomeando a variável** (o valor nunca aparece em logs ou
@@ -124,12 +143,13 @@ nomeando a variável `NOME_FILE`. O valor lido de um `_FILE` nunca aparece em
 log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 `TELEGRAM_TOKEN_FILE`), inclusive os que chegam em fases futuras.
 
-| Variável     | Padrão              | Função                          |
+| Variável     | Padrão                | Função                          |
 | ------------ | ------------------- | ------------------------------- |
 | `DATA_DIR`   | `/data`             | Pasta do banco SQLite           |
 | `TZ_MARKET`  | `America/Sao_Paulo` | Fuso do pregão da B3 (nome de zona IANA, nunca offset) |
 | `POLL_MINUTES` | `15`              | Intervalo das rodadas do worker (inteiro > 0) |
 | `LOG_LEVEL`  | `info`              | Nível do log (`debug`, `info`, `warning`, `error`) |
+| `FRONTEND_DIST` | *(opcional)* `<repo>/frontend/dist` | Diretório do build do frontend servido pelo web. Ausente ou vazia usa o padrão — que, dentro da imagem, é `/app/frontend/dist` |
 
 ## Estrutura
 
@@ -137,7 +157,7 @@ log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 backend/baixou/       pacote único: core (config/db/migrações/log), web, worker
 backend/migrations/   migrações SQL numeradas, aplicadas uma única vez
 backend/tests/        testes do backend (sem rede)
-frontend/             interface React + TypeScript + Vite (chega na Fase 5)
+frontend/             interface React + TypeScript + Vite (UI-01/UI-02, Fase 5)
 docker/               Dockerfile da imagem única
 docs/                 documentação
 ```
