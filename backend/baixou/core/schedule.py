@@ -9,7 +9,9 @@ web podem importá-lo sem puxar um ao outro — o teste de fronteira
 (test_import_boundary.py) e o ruff TID251 cobram isso. ``worker/scheduler.py``
 mantém o reexport e ``wait_until``; slots perdidos nunca são recuperados
 (Anti-Pattern 3) — ``next_slot`` sempre devolve o próximo slot estritamente
-futuro.
+futuro. ``is_backup_due`` (Fase 6, 06-04) é consumida apenas pelo worker
+(06-06), mas vive no core pelo mesmo motivo de ``next_slot``: relógio civil é
+cálculo puro da fronteira, fonte única testável sem rede.
 """
 
 from __future__ import annotations
@@ -36,3 +38,17 @@ def next_slot(now_utc: datetime, minutes: int, tz: ZoneInfo) -> datetime:
         candidate_local = candidate_local + step
         candidate = candidate_local.astimezone(UTC)
     return candidate
+
+
+def is_backup_due(now_utc: datetime, hour: int, tz: ZoneInfo) -> bool:
+    """Backup noturno já vence nesta virada de dia? (molde ``next_slot`` — pura, sem I/O).
+
+    A conta é feita na HORA CIVIL de ``now_utc`` convertida para o fuso ``tz``
+    (não no UTC): a borda é INCLUSIVA — exatamente na hora marcada já vence
+    (precedente D-10/D-12). Depois da hora, no mesmo dia, segue vencendo;
+    a virada de dia recomeça o ciclo até a hora. ``hour`` fora de 0–23 é
+    erro de programação: ValueError no molde de ``next_slot``.
+    """
+    if not 0 <= hour <= 23:
+        raise ValueError("hour deve estar entre 0 e 23")
+    return now_utc.astimezone(tz).hour >= hour
