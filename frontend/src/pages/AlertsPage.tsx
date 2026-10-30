@@ -557,21 +557,40 @@ export default function AlertsPage() {
     setSalvando(true);
     setErroBarra(null);
     try {
-      // T-05-11: DELETE item a item, em sequência; qualquer falha interrompe
+      // T-05-11: DELETE item a item, em sequência; falha NÃO-404 interrompe
       // ANTES do PUT — remoção persiste SÓ por DELETE, NUNCA por PUT menor.
+      // 404 é resposta legítima do contrato (watch.py: rowcount 0 → 404) =
+      // remoção JÁ SATISFEITA (SC-1): segue o lote e a chave sai de
+      // pendências NO ATO — o próximo Salvar não re-DELETE o que já sumiu.
       for (const chaveApagada of chavesApagadas) {
         const [symbolApagado, marketApagado] = chaveApagada.split("|");
-        await removerItem(symbolApagado, marketApagado as Market);
+        try {
+          await removerItem(symbolApagado, marketApagado as Market);
+        } catch (e) {
+          if (!(e instanceof ApiError && e.status === 404)) throw e;
+        }
+        setPendenciasRemocao((anterior) => {
+          const proximo = new Set(anterior);
+          proximo.delete(chaveApagada);
+          return proximo;
+        });
       }
-      const resposta = await salvarLote(
-        itensRestantes.map((i) => ({
-          symbol: i.symbol,
-          market: i.market,
-          target_below: edicoes.get(chave(i)) ?? i.target_below,
-        })),
-      );
-      // A resposta do PUT É a nova lista renderizada (watch.py devolve a lista completa).
-      setItens(resposta.itens);
+      if (itensRestantes.length > 0) {
+        const resposta = await salvarLote(
+          itensRestantes.map((i) => ({
+            symbol: i.symbol,
+            market: i.market,
+            target_below: edicoes.get(chave(i)) ?? i.target_below,
+          })),
+        );
+        // A resposta do PUT É a nova lista renderizada (watch.py devolve a lista completa).
+        setItens(resposta.itens);
+      } else {
+        // Save só-de-remoção: o lote vazio nem sai (o 422 do min_length=1 do
+        // PutWatch fica impossível) — a lista local esvazia e o save termina
+        // satisfeito sem falar com o PUT.
+        setItens([]);
+      }
       setNovos(new Set());
       setPendenciasRemocao(new Set());
       setEmUndo(new Set());
@@ -583,13 +602,21 @@ export default function AlertsPage() {
       if (e instanceof ApiError && e.status === 422) {
         // Envelope D-08: o problema de cada item renderiza inline junto ao
         // ticker nomeado; o estado permanece dirty (parser ÚNICO do client).
+        // Entrada SEM symbol (recusa do lote inteiro, ex. itens: [] do save
+        // só-de-remoção) vai para a BARRA — nenhuma recusa fica invisível.
         const erros = new Map<string, string>();
+        const semSymbol: string[] = [];
         for (const entrada of parseErrosEnvelope(e.body)) {
           if (entrada.symbol !== null) {
             erros.set(entrada.symbol, `${entrada.campo}: ${entrada.problema}`);
+          } else {
+            semSymbol.push(entrada.problema);
           }
         }
         setErrosSalvar(erros);
+        if (semSymbol.length > 0) {
+          setErroBarra(semSymbol.join("; "));
+        }
       } else if (e instanceof ApiError) {
         setErroBarra(e.message);
       } else {
