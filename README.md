@@ -56,6 +56,34 @@ docker compose -f compose.install.yaml pull && docker compose -f compose.install
 A lista, o histórico e o banco vivem no volume nomeado `baixou-data` —
 atualizar a imagem preserva tudo.
 
+## Importar a lista do homelab
+
+Vindo do homelab? O fluxo de adoção é **subir → criar o admin → importar →
+usar**. O import só funciona com a lista **vazia** — já cadastrou algum item?
+Remova-o (ou comece com um banco novo) antes de importar.
+
+Copie o banco antigo para dentro do container do worker e rode o import:
+
+```bash
+docker compose -f compose.install.yaml cp ./stock.db worker:/mnt/homelab.db
+docker compose -f compose.install.yaml exec worker python -m baixou.worker.import_homelab /mnt/homelab.db
+```
+
+Alternativa, sem copiar: monte o arquivo **somente-leitura** num container
+descartável:
+
+```bash
+docker compose -f compose.install.yaml run --rm -v ./stock.db:/mnt/homelab.db:ro worker python -m baixou.worker.import_homelab /mnt/homelab.db
+```
+
+De qualquer forma o módulo abre o arquivo antigo somente-leitura (modo `ro`
+do sqlite3) — o banco do homelab nunca é modificado. O relatório mostra os
+itens importados por mercado, com a moeda de cada um (R$ na B3, US$ no
+cripto).
+
+> Itens que já estão abaixo do alvo disparam um aviso na primeira rodada —
+> isso é esperado.
+
 ## Como funciona
 
 Dois serviços rodam da mesma imagem e só se falam pelo banco SQLite (modo WAL)
