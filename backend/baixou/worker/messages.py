@@ -134,3 +134,17 @@ def quota_exhausted_message() -> tuple[str, str]:
         "pausa até a virada do mês."
     )
     return title, body
+
+
+def backup_failure_message(consecutive: int) -> tuple[str, str]:
+    """Aviso operacional do backup noturno falhando (D-08): título + corpo."""
+    title = "Baixou: backup noturno com falha"
+    body = f"O backup noturno do banco falha há {consecutive} noites seguidas."
+    return title, body
+
+
+def backup_recovery_message() -> tuple[str, str]:
+    """Aviso operacional de volta ao normal do backup noturno (D-08): título + corpo."""
+    title = "Baixou: backup noturno normalizado"
+    body = "O backup noturno voltou a funcionar — o banco foi copiado com sucesso."
+    return title, body

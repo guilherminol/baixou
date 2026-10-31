@@ -26,8 +26,16 @@ _WAL_SET_RETRY_PAUSE_S = 0.02
 
 
 def default_migrations_dir() -> Path:
-    """Diretório de migrações relativo ao pacote (funciona no repo e na imagem)."""
-    return Path(__file__).resolve().parents[2] / "migrations"
+    """Diretório de migrações DENTRO do pacote (WR-01 da 01-REVIEW).
+
+    Os .sql vivem em ``baixou/migrations/``, ao lado de ``core/`` — o MESMO
+    cálculo ``parents[1]`` funciona no repositório (instalação editable) e na
+    wheel instalada não-editável (``uv sync --no-editable`` da imagem), onde o
+    diretório vira ``site-packages/baixou/migrations``. Assim uma instalação
+    não-editável encontra e aplica as migrações sem o diretório ``backend/``
+    fora do pacote.
+    """
+    return Path(__file__).resolve().parents[1] / "migrations"
 
 
 def _utc_now_iso() -> str:

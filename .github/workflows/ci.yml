@@ -2,11 +2,12 @@
 # Escolha explícita do autor (01-CONTEXT D-05): nada de execução em empurrão
 # direto de branch. Crescimento por fase — o job do frontend entrou na Fase 5
 # (05-05): lint, tsc, testes, build, cheque de desatualização dos tipos
-# gerados do openapi.json e npm audit de produção; audit, varredura de
-# segredos e publicação continuam na Fase 6. O pytest daqui executa
-# a suíte completa do backend, incluindo migrações, config, fronteira de
-# importação (D-07) e o /healthz. `uv sync --frozen` nunca re-resolve o
-# uv.lock (T-01-SC).
+# gerados do openapi.json e npm audit de produção. Na Fase 6 (06-02) a
+# varredura de segredos ENTROU como job próprio (gitleaks, abaixo) e a
+# publicação virou workflow próprio (.github/workflows/release.yml,
+# disparado por tag vX.Y.Z — D-09). O pytest daqui executa a suíte completa
+# do backend, incluindo migrações, config, fronteira de importação (D-07) e
+# o /healthz. `uv sync --frozen` nunca re-resolve o uv.lock (T-01-SC).
 
 name: ci
 
@@ -90,3 +91,23 @@ jobs:
 
       - name: Audit das dependências de produção
         run: npm audit --omit=dev --audit-level=high
+
+  # Fase 6 (06-02): varredura de segredos em TODO PR — a privacidade do
+  # repositório (PROJECT.md) proíbe domínio, IP, chat ID, tópico ntfy ou
+  # token do autor no repositório E no histórico, então o checkout traz o
+  # histórico completo (fetch-depth: 0) e a varredura cobre tudo ANTES de
+  # qualquer publicação pública. Action oficial pinada na tag imutável
+  # completa corrente (mesmo padrão do astral-sh/setup-uv@v10.3.2: nunca tag
+  # móvel de major, nunca @main — T-06-SC). Job independente, sem needs.
+  gitleaks:
+    name: varredura de segredos (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Varredura de segredos (gitleaks)
+        uses: gitleaks/gitleaks-action@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

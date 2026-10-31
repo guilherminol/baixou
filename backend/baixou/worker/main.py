@@ -27,7 +27,7 @@ from baixou.core.config import Settings, load_settings
 from baixou.core.db import WORKER_TIMEOUT_S, check_sqlite_version, connect, write_tx
 from baixou.core.log import configure, log
 from baixou.core.migrations import apply_migrations
-from baixou.worker import alerts, quota
+from baixou.worker import alerts, backup, quota
 from baixou.worker.scheduler import next_slot, wait_until
 from baixou.worker.sources import binance, brapi
 from baixou.worker.sources.base import QuoteResult, SourceError, b3_market_open
@@ -382,18 +382,41 @@ def _log_round_completed(duration_s: float) -> None:
     )
 
 
+def _finish_round(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Fecha a rodada: log de conclusão + backup noturno (SC-3 — nunca propaga).
+
+    O backup roda LOGO APÓS cada rodada concluída (D-05): ``run_backup``
+    captura as próprias exceções; o try/except aqui é a SEGUNDA cinta — uma
+    falha inesperada no gancho loga e segue, nunca derruba a rodada nem o
+    laço (os avisos de preço das rodadas seguintes continuam).
+    """
+    _log_round_completed(run_round(conn, settings))
+    try:
+        backup.run_backup(conn, settings, datetime.now(UTC))
+    except Exception as exc:  # a cinta do SC-3 é deliberada (run_backup já captura)
+        log(
+            "error",
+            "backup",
+            "backup_hook_error",
+            kind=type(exc).__name__,
+            text="falha inesperada no gancho do backup noturno — a rodada segue",
+        )
+
+
 def serve_until(conn: sqlite3.Connection, settings: Settings, stop: threading.Event) -> None:
     """Rodada de subida + laço alinhado ao relógio até ``stop`` ser acionado.
 
     O alvo é sempre recalculado do relógio civil no fuso TZ_MARKET
     (Anti-Pattern 2) e slots perdidos não são recuperados (Anti-Pattern 3).
+    Após CADA rodada concluída o backup noturno é tentado (D-05/06-06) —
+    desligável por ``BACKUP_ENABLED=0`` e sem nunca afetar a rodada (SC-3).
     """
-    _log_round_completed(run_round(conn, settings))  # ao subir: rodada imediata
+    _finish_round(conn, settings)  # ao subir: rodada imediata
     tz = ZoneInfo(settings.tz_market)
     while not stop.is_set():
         target = next_slot(datetime.now(UTC), settings.poll_minutes, tz)
         if wait_until(target, stop):
-            _log_round_completed(run_round(conn, settings))
+            _finish_round(conn, settings)
 
 
 def main() -> None:

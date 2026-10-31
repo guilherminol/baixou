@@ -8,6 +8,82 @@ produção e sem proxy específico.
 > **Aviso:** o Baixou não é recomendação de investimento. Os dados de mercado
 > têm atraso e podem errar.
 
+## Instalar (produção)
+
+Sem clonar o repositório — são só dois comandos (Docker instalado):
+
+```bash
+curl -O https://raw.githubusercontent.com/guilherminol/baixou/master/compose.install.yaml
+docker compose -f compose.install.yaml up -d
+```
+
+Com isso o Baixou **sobe sem configurar nada**: nenhuma variável de ambiente é
+obrigatória. A página abre em **http://127.0.0.1:8000** — o cadastro do
+administrador é feito pelo próprio navegador no primeiro acesso. Sem canal
+configurado, a tela de status mostra a faixa de **"nenhum canal configurado"**:
+o sistema está no ar, a lista funciona — só não avisa.
+
+### Para alertar de verdade
+
+O aviso no celular precisa de um **`.env`** criado ao lado do
+`compose.install.yaml` com **`BRAPI_TOKEN`** (dados da B3 — token gratuito em
+[brapi.dev](https://brapi.dev)) **e um canal** de notificação. O compose lê o
+`.env` automaticamente (ele é opcional justamente para a subida sem
+configuração). Exemplo com valores-placeholders — descomente e troque pelos
+seus:
+
+```bash
+# .env — valores de exemplo; nunca use tokens de terceiros
+# BRAPI_TOKEN=seu-token-da-brapi
+# Canal 1 — Telegram:
+# TELEGRAM_TOKEN=123456:ABC-exemplo-de-token
+# TELEGRAM_CHAT_ID=123456789
+# Canal 2 — ntfy (alternativa ao Telegram):
+# NTFY_TOPIC=um-topico-exemplo-so-seu
+```
+
+Sem canal o sistema sobe, mas não avisa; com o `.env` criado, recrie os
+contêineres com o mesmo `docker compose -f compose.install.yaml up -d` de
+cima para a configuração valer. Criptomoedas não precisam de token — os dados
+da Binance são públicos.
+
+### Atualizar
+
+```bash
+docker compose -f compose.install.yaml pull && docker compose -f compose.install.yaml up -d
+```
+
+A lista, o histórico e o banco vivem no volume nomeado `baixou-data` —
+atualizar a imagem preserva tudo.
+
+## Importar a lista do homelab
+
+Vindo do homelab? O fluxo de adoção é **subir → criar o admin → importar →
+usar**. O import só funciona com a lista **vazia** — já cadastrou algum item?
+Remova-o (ou comece com um banco novo) antes de importar.
+
+Copie o banco antigo para dentro do container do worker e rode o import:
+
+```bash
+docker compose -f compose.install.yaml cp ./stock.db worker:/mnt/homelab.db
+docker compose -f compose.install.yaml exec worker python -m baixou.worker.import_homelab /mnt/homelab.db
+```
+
+Alternativa, sem copiar: monte o arquivo **somente-leitura** num container
+descartável:
+
+```bash
+docker compose -f compose.install.yaml run --rm -v ./stock.db:/mnt/homelab.db:ro worker python -m baixou.worker.import_homelab /mnt/homelab.db
+```
+
+De qualquer forma o módulo abre o arquivo antigo somente-leitura (modo `ro`
+do sqlite3) — o banco do homelab nunca é modificado. O relatório mostra os
+itens importados por mercado, com a moeda de cada um (R$ na B3, US$ no
+cripto).
+
+> Itens que já estão abaixo do alvo disparam um aviso na primeira rodada —
+> isso é esperado.
+
 ## Como funciona
 
 Dois serviços rodam da mesma imagem e só se falam pelo banco SQLite (modo WAL)
@@ -128,6 +204,32 @@ Detalhes do contrato:
   `/docs`, `/redoc` ou `/openapi.json` é servido; o JSON é artefato de
   build/CI, não rota.
 
+## Backup noturno
+
+O worker faz backup do banco por conta própria — parte do produto, **ligado
+por padrão**. Na primeira rodada após a hora marcada (`BACKUP_HOUR`, padrão
+4h no fuso `TZ_MARKET`), o banco é copiado por `VACUUM INTO` para um arquivo
+datado **`baixou-YYYY-MM-DD.db`** em `BACKUP_DIR` (padrão:
+`<DATA_DIR>/backups`, dentro do volume). O `VACUUM INTO` produz um snapshot
+consistente e compactado do banco — não é uma cópia do WAL — e roda fora da
+transação das rodadas, sem segurar o lock do SQLite.
+
+- **Um backup por dia:** o arquivo do dia É o estado — o worker reinicia no
+  meio do dia, o backup não é refeito (destino existente é pulado). A
+  **tentativa é única por dia**: a que falha não se repete no mesmo dia e o
+  backup volta a tentar na noite seguinte.
+- **Retenção:** `BACKUP_KEEP` dias (padrão 7) — excedentes com o padrão
+  `baixou-YYYY-MM-DD.db` são apagados; **arquivos que não casam com o padrão
+  (cópia manual, etc.) não são tocados**.
+- **Aviso de falha:** se o backup falha em `BACKUP_FAIL_NOTIFY_AFTER`
+  noites seguidas (padrão 2), chega **um aviso no canal** (o mesmo do
+  Telegram/ntfy dos preços), e **um único "volta ao normal"** quando o
+  backup recuperar — um aviso por episódio, sem repetição. Falha de backup
+  **nunca para as rodadas nem os avisos de preço** — fica no log
+  (`backup_failed`) e no contador do episódio.
+- **Desligar:** `BACKUP_ENABLED=0` — o backup para de roda por completo;
+  nenhum arquivo é criado ou apagado.
+
 ## Variáveis de ambiente
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a
@@ -150,12 +252,17 @@ log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 | `POLL_MINUTES` | `15`              | Intervalo das rodadas do worker (inteiro > 0) |
 | `LOG_LEVEL`  | `info`              | Nível do log (`debug`, `info`, `warning`, `error`) |
 | `FRONTEND_DIST` | *(opcional)* `<repo>/frontend/dist` | Diretório do build do frontend servido pelo web. Ausente ou vazia usa o padrão — que, dentro da imagem, é `/app/frontend/dist` |
+| `BACKUP_ENABLED` | `1` | Backup noturno ligado; `"0"` desliga (a exceção documentada) |
+| `BACKUP_DIR` | *(vazio)* `<DATA_DIR>/backups` | Pasta dos arquivos de backup — no padrão, dentro do volume |
+| `BACKUP_KEEP` | `7` | Dias de retenção dos backups noturnos |
+| `BACKUP_HOUR` | `4` | Hora local (fuso `TZ_MARKET`) a partir da qual o backup do dia vale (0–23) |
+| `BACKUP_FAIL_NOTIFY_AFTER` | `2` | Noites seguidas de falha do backup até o aviso no canal |
 
 ## Estrutura
 
 ```
 backend/baixou/       pacote único: core (config/db/migrações/log), web, worker
-backend/migrations/   migrações SQL numeradas, aplicadas uma única vez
+backend/baixou/migrations/   migrações SQL numeradas, embutidas no pacote, aplicadas uma única vez
 backend/tests/        testes do backend (sem rede)
 frontend/             interface React + TypeScript + Vite (UI-01/UI-02, Fase 5)
 docker/               Dockerfile da imagem única

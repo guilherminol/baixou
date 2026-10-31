@@ -1,0 +1,172 @@
+# Release do Baixou (Fase 6 — D-09/D-10/D-12): marcar a tag vX.Y.Z é o ÚNICO
+# gesto de release. O gatilho é APENAS push de tag v*.*.* (D-09): o build
+# multi-arch (amd64+arm64) é lento e não roda a cada merge — pull requests e
+# empurrões de branch continuam no ci.yml, sem workflow_dispatch aqui.
+#
+# PROVA ANTES DE PUBLICAR (D-12): o job smoke constrói a imagem no runner,
+# sobe o compose.install.yaml — o MESMO artefato que o README ensina a
+# instalar — com a imagem LOCAL (--pull never: falha alto se a imagem local
+# não existir; nunca baixa uma imagem já publicada por engano), espera o
+# /healthz responder 200 E o HEALTHCHECK do container web chegar a "healthy",
+# e PROVA QUE A UI SERVE: GET / → 200 com o shell da SPA (a palavra Baixou
+# no corpo). O UAT de 31/10 provou uma imagem com /healthz verde e TODA a UI
+# em 404 (fallback SPA não registrado na wheel) — os dois cheques de boot
+# passavam com a página quebrada; essa imagem NÃO publica mais.
+# Só então o job publish roda (needs: [smoke]) — imagem quebrada publicada é
+# o pior cenário para o usuário de fora. A prova é de ponta a ponta: a imagem
+# é instalada com `uv sync --no-editable` (a wheel), então o smoke verde
+# também prova o fix WR-01 da Fase 1 — a wheel leva as migrações do pacote.
+#
+# O build NUNCA roda no servidor do usuário — só neste runner. O publish
+# constrói linux/amd64 E linux/arm64 (buildx + QEMU) e empurra
+# ghcr.io/guilherminol/baixou:<versão da tag> E :latest no GHCR (D-10) com o
+# GITHUB_TOKEN efêmero do próprio workflow (permissões contents: read +
+# packages: write — nada mais). Nenhum segredo do AUTOR entra no build: sem
+# build-args com valores, sem montagem de .env (T-06-03) — a imagem é
+# exatamente o que o Dockerfile constrói a partir do repositório.
+#
+# A versão chega ao publish pelo env VERSION do job, mapeando
+# github.ref_name NUNCA interpolada dentro de um script de shell (T-06-02).
+#
+# Todas as actions pinadas (T-06-SC): majors correntes da documentação do
+# Docker (setup-qemu-action@v4, setup-buildx-action@v4, login-action@v4,
+# build-push-action@v7) e checkout@v4 — sem @main/@master. Sem GitHub Release
+# com notas (ideia deferred no 06-CONTEXT) e sem cache type=gha: workflow
+# mínimo e legível.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Job 1 — smoke (D-12): provar que a imagem sobe pelo compose de instalação
+  # antes de qualquer publicação. Um único estágio de execução: build amd64
+  # local → compose up --pull never → /healthz 200 → HEALTHCHECK healthy.
+  smoke:
+    name: smoke do compose de instalação (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Constrói a imagem com a MESMA referência do compose.install.yaml
+      # (ghcr.io/guilherminol/baixou:latest) e a carrega no Docker local do
+      # runner (load: true exige plataforma única — amd64 aqui; o multi-arch
+      # é só no publish, depois do smoke passar).
+      - name: Construir a imagem amd64 local com a referência do compose
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ghcr.io/guilherminol/baixou:latest
+
+      # --pull never: o compose usa SOMENTE a imagem construída acima. Se ela
+      # não existir no runner, a subida falha alto — nunca baixa silenciosamente
+      # uma imagem publicada por engano e testa outra coisa.
+      - name: Subir o compose de instalação com a imagem local
+        run: docker compose -f compose.install.yaml up -d --pull never
+
+      - name: Esperar o /healthz responder 200 (até 120 s)
+        run: |
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz || true)
+            if [ "$code" = "200" ]; then
+              echo "/healthz 200 na tentativa $i"
+              exit 0
+            fi
+            echo "tentativa $i: /healthz=$code; aguardando 5 s"
+            sleep 5
+          done
+          echo "::error::/healthz não respondeu 200 em 120 s"
+          docker compose -f compose.install.yaml logs --tail=50
+          exit 1
+
+      # O HEALTHCHECK do serviço web (compose.install.yaml) mede o sinal de
+      # vida REAL do worker via /healthz — healthy é a prova final do boot.
+      - name: Esperar o HEALTHCHECK do container web chegar a healthy (até 180 s)
+        run: |
+          WEB_ID=$(docker compose -f compose.install.yaml ps -q web)
+          if [ -z "$WEB_ID" ]; then
+            echo "::error::o serviço web não está rodando no compose"
+            exit 1
+          fi
+          for i in $(seq 1 36); do
+            estado=$(docker inspect --format '{{.State.Health.Status}}' "$WEB_ID" || true)
+            if [ "$estado" = "healthy" ]; then
+              echo "container web healthy na tentativa $i"
+              exit 0
+            fi
+            echo "tentativa $i: health=$estado; aguardando 5 s"
+            sleep 5
+          done
+          echo "::error::HEALTHCHECK do web não chegou a healthy em 180 s"
+          docker inspect "$WEB_ID"
+          exit 1
+
+      # Prova positiva de CONTEÚDO, não de boot: aqui o web já está healthy.
+      # O UAT de 31/10 provou uma imagem com /healthz verde e TODA a UI em 404
+      # (fallback SPA não registrado dentro da wheel) — este passo reprova
+      # exatamente esse modo de falha antes de qualquer publicação.
+      - name: Provar que a UI serve (GET / → 200 com o shell)
+        run: |
+          code=$(curl -s -o /tmp/baixou-index.html -w '%{http_code}' http://127.0.0.1:8000/ || true)
+          if [ "$code" != "200" ]; then
+            echo "::error::a UI não serve (GET / fora de 200 — o modo de falha do gap do UAT de 31/10): código=$code"
+            exit 1
+          fi
+          if ! grep -q "Baixou" /tmp/baixou-index.html; then
+            echo "::error::GET / respondeu sem o shell da SPA (corpo sem a palavra Baixou — sem dist a resposta é o JSON de detalhe)"
+            exit 1
+          fi
+          echo "GET / → 200 com o shell da SPA"
+
+      - name: Descer o compose e limpar o runner
+        run: docker compose -f compose.install.yaml down -v
+
+  # Job 2 — publish (D-09/D-10): só depois do smoke verde (needs: [smoke]).
+  # Multi-arch de verdade (amd64+arm64 via QEMU), empurrando a versão exata
+  # da tag e atualizando :latest — instalar do README continua sendo a última
+  # estável; atualizar = docker compose pull + up -d.
+  publish:
+    name: publicar amd64+arm64 no GHCR (versão + latest)
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    env:
+      # A versão NUNCA é interpolada dentro de um script de shell (T-06-02):
+      # chega aqui por expressão do github.ref_name e só entra como entrada
+      # da action de build.
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Entrar no GHCR com o GITHUB_TOKEN efêmero do workflow
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir e publicar linux/amd64 + linux/arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/guilherminol/baixou:${{ env.VERSION }}
+            ghcr.io/guilherminol/baixou:latest

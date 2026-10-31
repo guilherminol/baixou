@@ -1,0 +1,64 @@
+# Compose de INSTALAÇÃO do Baixou (D-10/D-11, Fase 6) — o artefato que o
+# README publica: `curl -O` deste arquivo + `docker compose -f compose.install.yaml up -d`,
+# sem clonar o repositório. NENHUMA chave de build aqui: o build NUNCA roda no
+# servidor — a imagem pronta vem do GHCR (ghcr.io/guilherminol/baixou:latest,
+# a última estável; atualizar = `docker compose pull` + `up -d`).
+#
+# Zero-config: sem nenhum .env a subida é verde — a página abre em
+# http://127.0.0.1:8000 (login/setup pelo navegador). Para alertar de verdade,
+# crie um .env ao lado deste arquivo (o compose o lê automaticamente; veja o
+# README): BRAPI_TOKEN + um canal (TELEGRAM_TOKEN/TELEGRAM_CHAT_ID ou NTFY_TOPIC).
+#
+# Dois serviços da MESMA imagem; a única comunicação entre eles é o SQLite em
+# /data (modo WAL). Ambos aplicam as migrações na subida — a corrida é
+# resolvida pelo lock do banco (BEGIN IMMEDIATE + busy_timeout), então não há
+# ordenação entre serviços nem serviço migrate one-shot (mesma disciplina do
+# compose de desenvolvimento).
+services:
+  web:
+    image: ghcr.io/guilherminol/baixou:latest
+    command: ["python", "-m", "baixou.web.main"]
+    ports:
+      # Somente em 127.0.0.1 (constraint do PROJECT.md): a exposição na
+      # internet é papel de um proxy HTTPS na rede doméstica, nunca do compose.
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    env_file:
+      # OPCIONAL: sem o arquivo a subida segue verde (zero-config); com um
+      # .env ao lado, os canais e o BRAPI_TOKEN entram sem editar este arquivo.
+      - path: .env
+        required: false
+    volumes:
+      - baixou-data:/data
+    healthcheck:
+      # Mede a vida do worker via /healthz (sem login, sem dados no corpo).
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      retries: 3
+
+  worker:
+    image: ghcr.io/guilherminol/baixou:latest
+    command: ["python", "-m", "baixou.worker.main"]
+    restart: unless-stopped
+    env_file:
+      # Mesmo .env opcional do web — uma única fonte de configuração.
+      - path: .env
+        required: false
+    volumes:
+      - baixou-data:/data
+
+volumes:
+  baixou-data:
+
+# Por que volume NOMEADO e não diretório do host (CR-01 da revisão da Fase 1):
+# em Linux — o alvo de referência — o daemon cria o diretório de um bind mount
+# inexistente como root:root, e o contêiner roda como usuário não-root (baixou);
+# o probe de escrita do DATA_DIR recebe PermissionError e o fail-fast encerra os
+# dois serviços na primeira subida. O volume nomeado não tem esse problema: o
+# primeiro uso copia para o volume o dono do ponto de montagem da imagem —
+# baixou:baixou, pelo chown de /data na imagem. Volume é armazenamento LOCAL
+# por definição (driver local padrão): WAL não funciona em NFS/mount de rede.
+# A política unless-stopped devolve o serviço após crash; um `docker stop`
+# explícito continua sendo respeitado. Sem ordenação entre os serviços:
+# a política cobre recuperação pós-crash, não ordem de subida.
+# A lista e o histórico vivem no volume: atualizar (pull + up -d) preserva tudo.
