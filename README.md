@@ -215,16 +215,18 @@ consistente e compactado do banco — não é uma cópia do WAL — e roda fora 
 transação das rodadas, sem segurar o lock do SQLite.
 
 - **Um backup por dia:** o arquivo do dia É o estado — o worker reinicia no
-  meio do dia, o backup não é refeito (destino existente é pulado).
+  meio do dia, o backup não é refeito (destino existente é pulado). A
+  **tentativa é única por dia**: a que falha não se repete no mesmo dia e o
+  backup volta a tentar na noite seguinte.
 - **Retenção:** `BACKUP_KEEP` dias (padrão 7) — excedentes com o padrão
   `baixou-YYYY-MM-DD.db` são apagados; **arquivos que não casam com o padrão
   (cópia manual, etc.) não são tocados**.
-- **Aviso de falha:** se o backup falha em `BACKUP_FAIL_NOTIFY_AFTER` noites
-  seguidas (padrão 2), chega **um aviso no canal** (o mesmo do Telegram/ntfy
-  dos preços), e **um único "volta ao normal"** quando o backup recuperar —
-  um aviso por episódio, sem repetição. Falha de backup **nunca para as
-  rodadas nem os avisos de preço** — fica no log (`backup_failed`) e no
-  contador do episódio.
+- **Aviso de falha:** se o backup falha em `BACKUP_FAIL_NOTIFY_AFTER`
+  noites seguidas (padrão 2), chega **um aviso no canal** (o mesmo do
+  Telegram/ntfy dos preços), e **um único "volta ao normal"** quando o
+  backup recuperar — um aviso por episódio, sem repetição. Falha de backup
+  **nunca para as rodadas nem os avisos de preço** — fica no log
+  (`backup_failed`) e no contador do episódio.
 - **Desligar:** `BACKUP_ENABLED=0` — o backup para de roda por completo;
   nenhum arquivo é criado ou apagado.
 
