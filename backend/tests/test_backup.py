@@ -86,9 +86,7 @@ def _reset_backup_state():
     backup._consecutive_failures = 0
 
 
-def _canal_falso(
-    monkeypatch, requests: list[httpx.Request], *, ok: bool = True
-) -> None:
+def _canal_falso(monkeypatch, requests: list[httpx.Request], *, ok: bool = True) -> None:
     """Injeta MockTransport no httpx.Client que o módulo backup cria localmente.
 
     O cliente de aviso nasce DENTRO do módulo (envio FORA de transação, fechado
@@ -314,25 +312,23 @@ def test_failure_threshold_sends_one_channel_notice_and_does_not_repeat(
     settings, conn = backup_env
     bloqueio = tmp_path / "bloqueio.txt"
     bloqueio.write_text("não é uma pasta", encoding="utf-8")
-    falho = _com_canal(
-        settings, backup_dir=bloqueio, backup_fail_notify_after=2
-    )
+    falho = _com_canal(settings, backup_dir=bloqueio, backup_fail_notify_after=2)
     pedidos: list[httpx.Request] = []
     _canal_falso(monkeypatch, pedidos)
 
     backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 1: counter 1 < 2
-    assert _pedidos_com(pedidos, "backup") == []
+    assert _pedidos_com(pedidos, "com falha") == []
     assert backup._consecutive_failures == 1
 
     backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 2: counter 2 ≥ 2 → aviso
-    avisos = _pedidos_com(pedidos, "backup")
+    avisos = _pedidos_com(pedidos, "com falha")
     assert len(avisos) == 1
     corpo = json.loads(avisos[0].content)["text"]
     assert "2 noites seguidas" in corpo  # corpo PT-BR do backup_failure_message
     assert _episodio(conn, "backup:failure")["delivered"] == 1  # canal aceitou
 
     backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 3: mesmo episódio — NÃO repete
-    assert len(_pedidos_com(pedidos, "backup")) == 1
+    assert len(_pedidos_com(pedidos, "com falha")) == 1
     assert backup._consecutive_failures == 3
 
 
@@ -363,7 +359,7 @@ def test_success_after_failure_episode_sends_recovery_and_second_cycle_repeats_b
 
     backup.run_backup(conn, falho, dia1)  # noite 1
     backup.run_backup(conn, falho, dia1)  # noite 2 → aviso de falha entregue
-    assert len(_pedidos_com(pedidos, "backup")) == 1
+    assert len(_pedidos_com(pedidos, "com falha")) == 1
     backup.run_backup(conn, bom, dia2)  # noite 3: sucesso → volta ao normal
     recuperacoes = _pedidos_com(pedidos, "normalizado")
     assert len(recuperacoes) == 1
@@ -376,7 +372,7 @@ def test_success_after_failure_episode_sends_recovery_and_second_cycle_repeats_b
     # SEGUNDO ciclo falha→sucesso NO MESMO banco: os dois avisos DE NOVO.
     backup.run_backup(conn, falho, dia3)  # noite 1 do ciclo 2
     backup.run_backup(conn, falho, dia3)  # noite 2 → NOVO aviso de falha
-    assert len(_pedidos_com(pedidos, "backup")) == 2
+    assert len(_pedidos_com(pedidos, "com falha")) == 2
     backup.run_backup(conn, bom, dia4)  # sucesso → NOVA recuperação
     assert len(_pedidos_com(pedidos, "normalizado")) == 2
     assert _episodio(conn, "backup:failure") is None
