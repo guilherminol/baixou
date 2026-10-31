@@ -44,7 +44,14 @@ RUN useradd --create-home baixou \
 
 USER baixou
 
-ENV DATA_DIR=/data
+# Na wheel --no-editable o default de _dist_frontend() calcula parents[3]
+# DENTRO de .venv (/app/.venv/lib/python3.14/frontend/dist — inexistente) e
+# toda a UI dá 404 — gap do UAT de 31/10. A env de override já existe no
+# código (baixou/web/main.py:44-47) e aponta o dist copiado na linha 32 —
+# mesma família do fix WR-01: o runtime embalado precisa dos caminhos
+# absolutos da imagem.
+ENV DATA_DIR=/data \
+    FRONTEND_DIST=/app/frontend/dist
 EXPOSE 8000
 
 # Sem HEALTHCHECK no Dockerfile: o worker não atende HTTP. O healthcheck fica
