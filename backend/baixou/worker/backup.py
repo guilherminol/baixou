@@ -12,15 +12,23 @@ destino é ``baixou-YYYY-MM-DD.db`` com a data LOCAL no fuso ``TZ_MARKET``;
 (4) destino existente → skip: O ARQUIVO DATADO É O ESTADO (D-06) — reinício
 do worker no meio do dia não duplica e NÃO há migração/coluna nova porque o
 estado "backup de hoje já foi feito" é derivado do SISTEMA DE ARQUIVOS, não
-do banco; (5) antes da hora local marcada → nada acontece (``is_backup_due``,
-borda inclusiva); (6) ``VACUUM INTO`` REAL com binding de parâmetro, FORA de
+do banco; (5) marcador de tentativa do dia existente → skip: UMA TENTATIVA
+POR NOITE civil (D-08) — o ``.backup-attempt-YYYY-MM-DD`` em DATA_DIR é o
+estado da tentativa e é gravado ANTES do trabalho de backup, então a noite
+que FALHOU também registrou a tentativa e não re-tenta nas rodadas de 15 min
+seguintes do mesmo dia (sem isso o destino falho nunca nasce, cada rodada
+re-tentaria e o contador contaria RODADAS, não noites — gap CR-04); (6)
+antes da hora local marcada → nada acontece (``is_backup_due``, borda
+inclusiva); (7) ``VACUUM INTO`` REAL com binding de parâmetro, FORA de
 qualquer ``write_tx`` — disciplina WAL (T-02-01/T-06-06): o I/O de disco do
 backup NUNCA segura o lock do SQLite (a conexão do worker nasce em
-``isolation_level=None``, então o execute é autocommit direto); (7) no
-sucesso, retenção por NOME (abaixo) e a transição de recovery do episódio;
-(8) em exceção QUALQUER: log ``backup_failed`` com kind, contador consecutivo
-em memória de módulo (REINÍCIO ZERA — aceito: backup é noturno, D-08) e, no
-limiar ``BACKUP_FAIL_NOTIFY_AFTER``, UM aviso no canal.
+``isolation_level=None``, então o execute é autocommit direto); (8) no
+sucesso, limpeza best-effort dos marcadores de dias anteriores, retenção por
+NOME (abaixo) e a transição de recovery do episódio; (9) em exceção
+QUALQUER: log ``backup_failed`` com kind, contador consecutivo de NOITES em
+memória de módulo (auxiliado pelo marcador persistido no volume: REINÍCIO
+ZERA a memória — aceito: backup é noturno, D-08 — mas NÃO re-tenta o dia) e,
+no limiar ``BACKUP_FAIL_NOTIFY_AFTER``, UM aviso no canal.
 
 Falha de backup NUNCA derruba a rodada nem o worker (SC-3): o módulo captura
 a própria exceção e o call-site do ``serve_until`` é a segunda cinta. O aviso
@@ -73,6 +81,13 @@ _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # toca arquivos que casam EXATAMENTE com o padrão; o resto é intocado.
 _BACKUP_NAME_RE = re.compile(r"^baixou-(\d{4}-\d{2}-\d{2})\.db$")
 
+# Marcador da tentativa do dia (D-08): <DATA_DIR>/.backup-attempt-YYYY-MM-DD —
+# a EXISTÊNCIA do arquivo (0 bytes, só o nome importa) diz "a tentativa de
+# hoje — sucesso OU falha — já aconteceu". É o estado que limita o backup a
+# UMA tentativa por dia civil mesmo quando o destino falho nunca nasce
+# (arquivo datado é o estado do SUCESSO; o marcador é o estado da TENTATIVA).
+_ATTEMPT_PREFIX = ".backup-attempt-"
+
 # Chaves do episódio de aviso (D-08) — mesmas da docstring do must_have.
 _FAILURE_KEY = "backup:failure"
 _RECOVERY_KEY = "backup:recovery"
@@ -81,9 +96,12 @@ _RECOVERY_KEY = "backup:recovery"
 # transação; o cliente é criado localmente e fechado no finally).
 _NOTIFY_TIMEOUT_S = 10.0
 
-# Contador consecutivo de noites com falha — memória de MÓDULO: um reinício
-# do worker zera o contador (aceito em D-08: backup é noturno, o episódio no
-# banco continua e o limiar reencontra o episódio pendente/entregue).
+# Contador consecutivo de NOITES com falha — memória de MÓDULO auxiliada pelo
+# marcador persistido (o gate ``.backup-attempt-<dia>`` limita a UMA tentativa
+# por dia civil, então cada incremento é uma NOITE, não uma rodada — gap
+# CR-04). Um reinício do worker zera a memória (aceito em D-08: backup é
+# noturno, o episódio no banco continua e o limiar reencontra o episódio
+# pendente/entregue) mas NÃO re-tenta o dia.
 _consecutive_failures = 0
 
 
@@ -261,6 +279,40 @@ def _prune_old_backups(backup_dir: Path, today_local: date, keep_days: int) -> i
     return pruned
 
 
+def _attempt_marker(data_dir: Path, local_date: date) -> Path:
+    """Caminho do marcador da tentativa do dia em DATA_DIR (D-08).
+
+    ``<DATA_DIR>/.backup-attempt-<data local>`` — a MESMA data local no fuso
+    ``TZ_MARKET`` já computada para o nome do destino. O ARQUIVO DATADO É O
+    ESTADO da TENTATIVA: gravado DENTRO do try e ANTES do mkdir do
+    backup_dir, registra a noite mesmo quando o backup falha — o cenário
+    exato do gap (destino que nunca nasce re-tentaria a cada rodada de 15
+    min e inflaria o contador a "noites" inexistentes).
+    """
+    return data_dir / f"{_ATTEMPT_PREFIX}{local_date.isoformat()}"
+
+
+def _prune_attempt_markers(data_dir: Path, today_local: date) -> None:
+    """Apaga marcadores de tentativa de dias anteriores — limpeza best-effort (T-06-10).
+
+    O nome DATADO limita a um marcador por dia no máximo (T-06-10: DoS por
+    acúmulo); a limpeza mantém DATA_DIR enxuto sem tabela nem migração. NUNCA
+    propaga: falha de limpeza não vira ``backup_failed`` nem incrementa o
+    contador — é higiene, não estado de segurança (T-06-10).
+    """
+    try:
+        for candidate in data_dir.glob(f"{_ATTEMPT_PREFIX}*"):
+            suffix = candidate.name[len(_ATTEMPT_PREFIX) :]
+            try:
+                marker_date = date.fromisoformat(suffix)
+            except ValueError:
+                continue  # nome fora do padrão: não é nosso — intocado
+            if marker_date != today_local:
+                candidate.unlink(missing_ok=True)
+    except OSError:
+        pass  # limpeza falhada: silêncio — nunca entra na conta de falhas
+
+
 def run_backup(conn: sqlite3.Connection, settings: Settings, now_utc: datetime) -> None:
     """Backup noturno da rodada: VACUUM INTO fora de write_tx + retenção + episódio (SC-4).
 
@@ -270,6 +322,10 @@ def run_backup(conn: sqlite3.Connection, settings: Settings, now_utc: datetime) 
     contador de episódio e, no limiar, avisada no canal — a rodada que chamou
     NUNCA é afetada (SC-3). ``now_utc`` (aware) define o dia local do arquivo
     e os timestamps do episódio — injetável para testes sem relógio congelado.
+    UMA tentativa por NOITE civil: o marcador ``.backup-attempt-<dia>`` em
+    DATA_DIR bloqueia a re-tentativa no mesmo dia (sucesso ou falha), então o
+    contador conta NOITES — o problema consertado no meio do dia só gera
+    backup na noite seguinte.
     """
     global _consecutive_failures
 
@@ -289,10 +345,33 @@ def run_backup(conn: sqlite3.Connection, settings: Settings, now_utc: datetime) 
         # duplica e nenhuma migração/coluna nova é necessária. Além disso o
         # VACUUM INTO EXIGE destino inexistente (D-06): o skip é obrigatório.
         return
+    marker = _attempt_marker(settings.data_dir, local_date)
+    if marker.exists():
+        # A TENTATIVA DE HOJE — sucesso OU falha — já aconteceu (D-08: UMA
+        # tentativa por NOITE civil). Sem este gate, um backup falho nunca
+        # cria o destino e cada rodada de 15 min re-tentaria: o contador
+        # contaria RODADAS, não NOITES (gap CR-04), e o aviso "N noites
+        # seguidas" chegaria ~30 min dentro da primeira noite ruim, com uma
+        # noite inteira de outage inflando a conta a ~80. O marcador persiste
+        # no volume: reinício zera a memória do contador (aceito, D-08) mas
+        # NÃO re-tenta o dia.
+        return
     if not is_backup_due(now_utc, settings.backup_hour, tz):
         return  # antes da hora local marcada: nada acontece (borda inclusiva, 06-04)
 
     try:
+        # Limpeza best-effort dos marcadores de dias anteriores (T-06-10):
+        # try/except PRÓPRIO e silencioso dentro do helper — nunca vira
+        # backup_failed nem incrementa o contador.
+        _prune_attempt_markers(settings.data_dir, local_date)
+        # O MARCADOR É O ESTADO DA TENTATIVA: gravado DENTRO do try e ANTES
+        # do mkdir do backup_dir — a falha de backup_dir (o cenário exato do
+        # gap) também registra a tentativa do dia e para de re-tentar na
+        # mesma noite. Único caso em que a conta por noite degrada a
+        # por-rodada: DATA_DIR indisponível depois do boot faz o marcador
+        # não nascer e as rodadas voltam a contar — aceito: storage do
+        # worker morto é falha real e o aviso cedo é o correto.
+        marker.touch()
         backup_dir.mkdir(parents=True, exist_ok=True)  # no primeiro uso (D-05)
         # VACUUM INTO FORA de write_tx (T-06-06 — mitigação do T-06-06 do plano):
         # o I/O de disco do backup NUNCA segura o lock do SQLite (disciplina WAL,
@@ -327,7 +406,9 @@ def run_backup(conn: sqlite3.Connection, settings: Settings, now_utc: datetime) 
             kind=kind,
             text=f"backup noturno falhou ({kind}); a rodada segue — o aviso de preço não é afetado",
         )
-        _consecutive_failures += 1  # reinício zera — aceito (backup é noturno, D-08)
+        # +1 NOITE (não rodada): o gate do marcador limita a uma tentativa por
+        # dia civil. Reinício zera a memória — aceito (backup é noturno, D-08).
+        _consecutive_failures += 1
         try:
             _notify_failure(conn, settings, now_utc)
         except Exception:  # a segunda cinta do aviso: episódio nunca derruba nada
