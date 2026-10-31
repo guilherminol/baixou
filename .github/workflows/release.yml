@@ -7,7 +7,11 @@
 # sobe o compose.install.yaml — o MESMO artefato que o README ensina a
 # instalar — com a imagem LOCAL (--pull never: falha alto se a imagem local
 # não existir; nunca baixa uma imagem já publicada por engano), espera o
-# /healthz responder 200 E o HEALTHCHECK do container web chegar a "healthy".
+# /healthz responder 200 E o HEALTHCHECK do container web chegar a "healthy",
+# e PROVA QUE A UI SERVE: GET / → 200 com o shell da SPA (a palavra Baixou
+# no corpo). O UAT de 31/10 provou uma imagem com /healthz verde e TODA a UI
+# em 404 (fallback SPA não registrado na wheel) — os dois cheques de boot
+# passavam com a página quebrada; essa imagem NÃO publica mais.
 # Só então o job publish roda (needs: [smoke]) — imagem quebrada publicada é
 # o pior cenário para o usuário de fora. A prova é de ponta a ponta: a imagem
 # é instalada com `uv sync --no-editable` (a wheel), então o smoke verde
@@ -108,6 +112,23 @@ jobs:
           echo "::error::HEALTHCHECK do web não chegou a healthy em 180 s"
           docker inspect "$WEB_ID"
           exit 1
+
+      # Prova positiva de CONTEÚDO, não de boot: aqui o web já está healthy.
+      # O UAT de 31/10 provou uma imagem com /healthz verde e TODA a UI em 404
+      # (fallback SPA não registrado dentro da wheel) — este passo reprova
+      # exatamente esse modo de falha antes de qualquer publicação.
+      - name: Provar que a UI serve (GET / → 200 com o shell)
+        run: |
+          code=$(curl -s -o /tmp/baixou-index.html -w '%{http_code}' http://127.0.0.1:8000/ || true)
+          if [ "$code" != "200" ]; then
+            echo "::error::a UI não serve (GET / fora de 200 — o modo de falha do gap do UAT de 31/10): código=$code"
+            exit 1
+          fi
+          if ! grep -q "Baixou" /tmp/baixou-index.html; then
+            echo "::error::GET / respondeu sem o shell da SPA (corpo sem a palavra Baixou — sem dist a resposta é o JSON de detalhe)"
+            exit 1
+          fi
+          echo "GET / → 200 com o shell da SPA"
 
       - name: Descer o compose e limpar o runner
         run: docker compose -f compose.install.yaml down -v
