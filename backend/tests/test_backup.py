@@ -16,8 +16,9 @@ Contratos provados aqui (must_haves do plano 06-06):
 - retenção decide pela DATA NO NOME (nunca mtime) e arquivos fora do padrão
   ``baixou-YYYY-MM-DD.db`` ficam intocados;
 - falha de backup NUNCA propaga (SC-3) — log ``backup_failed`` com kind,
-  contador consecutivo sobe em memória de módulo (reinício zera — aceito,
-  backup é noturno);
+  contador consecutivo conta NOITES (uma tentativa por dia civil, gate do
+  marcador ``.backup-attempt-<dia>`` em DATA_DIR; reinício zera a memória —
+  aceito, backup é noturno — mas NÃO re-tenta o dia);
 - ``BACKUP_FAIL_NOTIFY_AFTER`` noites seguidas → UM aviso no canal
   (``backup:failure``) e um único volta-ao-normal na recuperação
   (``backup:recovery``) — molde de episódio da Fase 3 (ALERT-03): um SEGUNDO
@@ -275,7 +276,12 @@ def test_retention_by_name_keeps_recent_and_spares_foreign_files(backup_env, tmp
 
 
 def test_vacuum_failure_logs_kind_counts_and_never_raises(backup_env, tmp_path, capsys):
-    """Falha do backup: log backup_failed com kind, contador sobe, NADA propaga (SC-3)."""
+    """Falha do backup: log backup_failed com kind, contador sobe POR NOITE, NADA propaga (SC-3).
+
+    Molde das datas distintas (gap CR-04): a re-tentativa no MESMO dia civil
+    não executa nada nem incrementa — o contador conta NOITES, não rodadas de
+    15 min. Só uma DATA DISTINTA sobe o contador.
+    """
     from baixou.worker import backup
 
     settings, conn = backup_env
@@ -288,13 +294,17 @@ def test_vacuum_failure_logs_kind_counts_and_never_raises(backup_env, tmp_path, 
         telegram_token="",
         telegram_chat_id="",
     )
+    dia2 = datetime(2026, 10, 25, 8, 0, 0, tzinfo=UTC)
 
-    backup.run_backup(conn, falho, _AFTER_HOUR)  # NENHUMA exceção propaga
-    backup.run_backup(conn, falho, _AFTER_HOUR)
+    backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 1 (2026-10-24): falha — NADA propaga
+    assert backup._consecutive_failures == 1
+    backup.run_backup(conn, falho, _LATER_SAME_DAY)  # MESMO dia 1, hora maior: NADA re-executa
+    assert backup._consecutive_failures == 1  # uma tentativa por noite: sem incremento
+    backup.run_backup(conn, falho, dia2)  # dia 2 DISTINTO: segunda noite com falha
+    assert backup._consecutive_failures == 2  # duas noites, não duas rodadas
 
-    assert backup._consecutive_failures == 2  # contador consecutivo sobe
     saida = capsys.readouterr().out
-    assert saida.count("backup_failed") == 2
+    assert saida.count("backup_failed") == 2  # UMA entrada por noite
     assert "FileExistsError" in saida  # o kind vai no log
     assert str(bloqueio) not in saida  # caminho nunca no log (K2)
     assert _episodio(conn, "backup:failure") is None  # abaixo do limiar: sem episódio
@@ -303,9 +313,12 @@ def test_vacuum_failure_logs_kind_counts_and_never_raises(backup_env, tmp_path, 
 def test_failure_threshold_sends_one_channel_notice_and_does_not_repeat(
     backup_env, tmp_path, monkeypatch
 ):
-    """BACKUP_FAIL_NOTIFY_AFTER noites: UM aviso no canal; o episódio não repete (D-08).
+    """BACKUP_FAIL_NOTIFY_AFTER NOITES: UM aviso no canal; o episódio não repete (D-08).
 
-    Chaves EXATAS do episódio lidas de notify_episode: backup:failure.
+    O limiar é alcançado com DATAS DISTINTAS (duas noites civis), nunca com
+    duas rodadas da mesma noite — o aviso NUNCA dispara dentro da primeira
+    noite ruim (gap CR-04). Chaves EXATAS do episódio lidas de
+    notify_episode: backup:failure.
     """
     from baixou.worker import backup
 
@@ -316,20 +329,71 @@ def test_failure_threshold_sends_one_channel_notice_and_does_not_repeat(
     pedidos: list[httpx.Request] = []
     _canal_falso(monkeypatch, pedidos)
 
-    backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 1: counter 1 < 2
+    dia1 = datetime(2026, 10, 24, 8, 0, 0, tzinfo=UTC)
+    dia2 = datetime(2026, 10, 25, 8, 0, 0, tzinfo=UTC)
+    mesmo_dia2_mais_tarde = datetime(2026, 10, 25, 13, 0, 0, tzinfo=UTC)
+    dia3 = datetime(2026, 10, 26, 8, 0, 0, tzinfo=UTC)
+
+    backup.run_backup(conn, falho, dia1)  # noite 1 (data própria): counter 1 < 2
     assert _pedidos_com(pedidos, "com falha") == []
     assert backup._consecutive_failures == 1
 
-    backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 2: counter 2 ≥ 2 → aviso
+    backup.run_backup(conn, falho, dia2)  # noite 2 (data DISTINTA): counter 2 ≥ 2 → aviso
     avisos = _pedidos_com(pedidos, "com falha")
     assert len(avisos) == 1
     corpo = json.loads(avisos[0].content)["text"]
     assert "2 noites seguidas" in corpo  # corpo PT-BR do backup_failure_message
     assert _episodio(conn, "backup:failure")["delivered"] == 1  # canal aceitou
 
-    backup.run_backup(conn, falho, _AFTER_HOUR)  # noite 3: mesmo episódio — NÃO repete
+    backup.run_backup(conn, falho, mesmo_dia2_mais_tarde)  # MESMO dia 2: nada re-tenta
+    assert backup._consecutive_failures == 2  # o gate do mesmo dia bloqueia o incremento
+    assert len(_pedidos_com(pedidos, "com falha")) == 1  # e o aviso não repete
+
+    backup.run_backup(conn, falho, dia3)  # noite 3: episódio já entregue — NÃO repete
     assert len(_pedidos_com(pedidos, "com falha")) == 1
     assert backup._consecutive_failures == 3
+
+    # a noite 3 registrou a tentativa (marcador do dia em DATA_DIR)
+    assert (settings.data_dir / ".backup-attempt-2026-10-26").exists()
+
+
+def test_same_day_attempt_marker_blocks_retry_and_fix_lands_next_night(
+    backup_env, tmp_path, capsys
+):
+    """Uma tentativa por NOITE: conserto no meio do dia só gera backup na noite seguinte.
+
+    Falha no dia 1 grava o marcador ``.backup-attempt-2026-10-24`` em
+    DATA_DIR; a chamada no MESMO dia com settings bons (backup_dir válido,
+    hora maior) NÃO cria backup nem incrementa o contador; no dia 2 o backup
+    nasce (``baixou-2026-10-25.db``). No fim resta UM único marcador em
+    DATA_DIR — o de hoje (limpeza best-effort dos marcadores antigos).
+    """
+    from baixou.worker import backup
+
+    settings, conn = backup_env
+    bloqueio = tmp_path / "bloqueio.txt"
+    bloqueio.write_text("não é uma pasta", encoding="utf-8")
+    boa = tmp_path / "backups-ok"
+    falho = replace(settings, backup_dir=bloqueio, backup_fail_notify_after=99)
+    bom = replace(settings, backup_dir=boa)
+    dia2 = datetime(2026, 10, 25, 8, 0, 0, tzinfo=UTC)
+
+    backup.run_backup(conn, falho, _AFTER_HOUR)  # dia 1: a falha registra a tentativa
+    assert backup._consecutive_failures == 1
+    assert (settings.data_dir / ".backup-attempt-2026-10-24").exists()
+
+    backup.run_backup(conn, bom, _LATER_SAME_DAY)  # MESMO dia 1 com conserto: bloqueado
+    assert not (boa / f"baixou-{_BACKUP_DAY}.db").exists()  # nenhum backup nasce no mesmo dia
+    assert backup._consecutive_failures == 1  # sem re-tentativa: contador parado
+    saida = capsys.readouterr().out
+    assert "backup_completed" not in saida
+
+    backup.run_backup(conn, bom, dia2)  # noite seguinte, conserto vigente: o backup nasce
+    assert (boa / "baixou-2026-10-25.db").exists()
+    assert backup._consecutive_failures == 0  # sucesso zera a conta de noites
+
+    marcadores = sorted(p.name for p in settings.data_dir.glob(".backup-attempt-*"))
+    assert marcadores == [".backup-attempt-2026-10-25"]  # só o marcador de hoje resta
 
 
 def test_success_after_failure_episode_sends_recovery_and_second_cycle_repeats_both(
@@ -337,9 +401,11 @@ def test_success_after_failure_episode_sends_recovery_and_second_cycle_repeats_b
 ):
     """Sucesso após episódio de falha ENTREGUE: UM volta-ao-normal; 2º ciclo repete os DOIS.
 
-    Molde ALERT-03 (um aviso por EPISÓDIO): a transição de recuperação apaga a
-    chave de falha e grava backup:recovery — o ciclo seguinte falha→sucesso
-    emite os dois avisos DE NOVO.
+    Cada noite do episódio é uma DATA DISTINTA (molde do gap CR-04: o limiar
+    só é alcançável em dias civis diferentes, nunca em duas rodadas da mesma
+    noite). Molde ALERT-03 (um aviso por EPISÓDIO): a transição de recuperação
+    apaga a chave de falha e grava backup:recovery — o ciclo seguinte
+    falha→sucesso emite os dois avisos DE NOVO.
     """
     from baixou.worker import backup
 
@@ -355,25 +421,30 @@ def test_success_after_failure_episode_sends_recovery_and_second_cycle_repeats_b
     dia1 = datetime(2026, 10, 24, 8, 0, 0, tzinfo=UTC)
     dia2 = datetime(2026, 10, 25, 8, 0, 0, tzinfo=UTC)
     dia3 = datetime(2026, 10, 26, 8, 0, 0, tzinfo=UTC)
+    mesmo_dia3_mais_tarde = datetime(2026, 10, 26, 13, 0, 0, tzinfo=UTC)
     dia4 = datetime(2026, 10, 27, 8, 0, 0, tzinfo=UTC)
+    dia5 = datetime(2026, 10, 28, 8, 0, 0, tzinfo=UTC)
+    dia6 = datetime(2026, 10, 29, 8, 0, 0, tzinfo=UTC)
 
     backup.run_backup(conn, falho, dia1)  # noite 1
-    backup.run_backup(conn, falho, dia1)  # noite 2 → aviso de falha entregue
+    assert backup._consecutive_failures == 1
+    backup.run_backup(conn, falho, dia2)  # noite 2 (data distinta) → aviso de falha entregue
     assert len(_pedidos_com(pedidos, "com falha")) == 1
-    backup.run_backup(conn, bom, dia2)  # noite 3: sucesso → volta ao normal
+    backup.run_backup(conn, bom, dia3)  # noite 3: sucesso → volta ao normal
     recuperacoes = _pedidos_com(pedidos, "normalizado")
     assert len(recuperacoes) == 1
     assert _episodio(conn, "backup:failure") is None  # chave de falha APAGADA
     assert _episodio(conn, "backup:recovery")["delivered"] == 1
 
-    backup.run_backup(conn, bom, dia2)  # sucesso repetido no dia: episódio fechado
-    assert len(_pedidos_com(pedidos, "normalizado")) == 1
+    backup.run_backup(conn, bom, mesmo_dia3_mais_tarde)  # sucesso repetido no dia: destino existe
+    assert len(_pedidos_com(pedidos, "normalizado")) == 1  # episódio fechado — não repete
 
-    # SEGUNDO ciclo falha→sucesso NO MESMO banco: os dois avisos DE NOVO.
-    backup.run_backup(conn, falho, dia3)  # noite 1 do ciclo 2
-    backup.run_backup(conn, falho, dia3)  # noite 2 → NOVO aviso de falha
+    # SEGUNDO ciclo falha→sucesso NO MESMO banco, cada noite em sua data: os
+    # dois avisos DE NOVO.
+    backup.run_backup(conn, falho, dia4)  # noite 1 do ciclo 2
+    backup.run_backup(conn, falho, dia5)  # noite 2 (data distinta) → NOVO aviso de falha
     assert len(_pedidos_com(pedidos, "com falha")) == 2
-    backup.run_backup(conn, bom, dia4)  # sucesso → NOVA recuperação
+    backup.run_backup(conn, bom, dia6)  # sucesso → NOVA recuperação
     assert len(_pedidos_com(pedidos, "normalizado")) == 2
     assert _episodio(conn, "backup:failure") is None
     assert _episodio(conn, "backup:recovery")["delivered"] == 1
