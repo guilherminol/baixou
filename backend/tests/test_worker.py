@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -165,12 +166,33 @@ def test_clean_stop_finishes_startup_round_and_releases_lock(settings, db):
     assert worker_main.acquire_instance_lock(db, "host-a:111", _TTL_S) is True
     stop = threading.Event()
     stop.set()  # como após SIGTERM: uma rodada de subida e sai limpo
-    worker_main.serve_until(db, settings, stop)
+    # BACKUP_ENABLED=0 (plano 06-06): determinismo — o teste não depende do
+    # relógio civil; com o backup ligado a rodada de subida dispararia o
+    # backup real sempre que a hora local >= BACKUP_HOUR.
+    worker_main.serve_until(db, replace(settings, backup_enabled=False), stop)
     worker_main.release_instance_lock(db, "host-a:111")  # o finally do main()
     row = db.execute("SELECT worker_id, worker_lock_at, last_run FROM run WHERE id = 1").fetchone()
     assert row["worker_id"] is None
     assert row["worker_lock_at"] is None
     assert row["last_run"] is not None  # rodada de subida terminou (não pela metade)
+
+
+def test_serve_until_runs_backup_after_each_round(tmp_path, monkeypatch, settings, db):
+    """Gancho do backup (06-06): run_backup roda APÓS CADA rodada do serve_until.
+
+    BACKUP_HOUR=0 (borda inclusiva — qualquer hora local já vence) e
+    BACKUP_DIR isolado em tmp_path: com o backup HABILITADO (padrão), o
+    arquivo datado do dia tem de existir após o serve_until — prova da
+    chamada no laço com relógio após a hora marcada, sem congelar relógio.
+    """
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setenv("BACKUP_HOUR", "0")
+    live = load_settings()  # mesmo db_path do conn (DATA_DIR vem do fixture settings)
+    stop = _SlicingEvent(stop_after_slices=1)  # rodada de subida + 1 do laço
+    worker_main.serve_until(db, live, stop)
+
+    hoje = datetime.now(UTC).astimezone(ZoneInfo("America/Sao_Paulo")).date().isoformat()
+    assert (tmp_path / "backups" / f"baixou-{hoje}.db").exists()
 
 
 def test_main_in_conflict_exits_nonzero_with_single_instance_conflict(tmp_path, monkeypatch):
