@@ -204,6 +204,30 @@ Detalhes do contrato:
   `/docs`, `/redoc` ou `/openapi.json` é servido; o JSON é artefato de
   build/CI, não rota.
 
+## Backup noturno
+
+O worker faz backup do banco por conta própria — parte do produto, **ligado
+por padrão**. Na primeira rodada após a hora marcada (`BACKUP_HOUR`, padrão
+4h no fuso `TZ_MARKET`), o banco é copiado por `VACUUM INTO` para um arquivo
+datado **`baixou-YYYY-MM-DD.db`** em `BACKUP_DIR` (padrão:
+`<DATA_DIR>/backups`, dentro do volume). O `VACUUM INTO` produz um snapshot
+consistente e compactado do banco — não é uma cópia do WAL — e roda fora da
+transação das rodadas, sem segurar o lock do SQLite.
+
+- **Um backup por dia:** o arquivo do dia É o estado — o worker reinicia no
+  meio do dia, o backup não é refeito (destino existente é pulado).
+- **Retenção:** `BACKUP_KEEP` dias (padrão 7) — excedentes com o padrão
+  `baixou-YYYY-MM-DD.db` são apagados; **arquivos que não casam com o padrão
+  (cópia manual, etc.) não são tocados**.
+- **Aviso de falha:** se o backup falha em `BACKUP_FAIL_NOTIFY_AFTER` noites
+  seguidas (padrão 2), chega **um aviso no canal** (o mesmo do Telegram/ntfy
+  dos preços), e **um único "volta ao normal"** quando o backup recuperar —
+  um aviso por episódio, sem repetição. Falha de backup **nunca para as
+  rodadas nem os avisos de preço** — fica no log (`backup_failed`) e no
+  contador do episódio.
+- **Desligar:** `BACKUP_ENABLED=0` — o backup para de roda por completo;
+  nenhum arquivo é criado ou apagado.
+
 ## Variáveis de ambiente
 
 Toda a configuração vem de variáveis de ambiente; **valor inválido impede a
@@ -226,6 +250,11 @@ log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 | `POLL_MINUTES` | `15`              | Intervalo das rodadas do worker (inteiro > 0) |
 | `LOG_LEVEL`  | `info`              | Nível do log (`debug`, `info`, `warning`, `error`) |
 | `FRONTEND_DIST` | *(opcional)* `<repo>/frontend/dist` | Diretório do build do frontend servido pelo web. Ausente ou vazia usa o padrão — que, dentro da imagem, é `/app/frontend/dist` |
+| `BACKUP_ENABLED` | `1` | Backup noturno ligado; `"0"` desliga (a exceção documentada) |
+| `BACKUP_DIR` | *(vazio)* `<DATA_DIR>/backups` | Pasta dos arquivos de backup — no padrão, dentro do volume |
+| `BACKUP_KEEP` | `7` | Dias de retenção dos backups noturnos |
+| `BACKUP_HOUR` | `4` | Hora local (fuso `TZ_MARKET`) a partir da qual o backup do dia vale (0–23) |
+| `BACKUP_FAIL_NOTIFY_AFTER` | `2` | Noites seguidas de falha do backup até o aviso no canal |
 
 ## Estrutura
 
