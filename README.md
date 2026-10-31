@@ -13,7 +13,7 @@ produção e sem proxy específico.
 Sem clonar o repositório — são só dois comandos (Docker instalado):
 
 ```bash
-curl -O https://raw.githubusercontent.com/guilherminol/baixou/main/compose.install.yaml
+curl -O https://raw.githubusercontent.com/guilherminol/baixou/master/compose.install.yaml
 docker compose -f compose.install.yaml up -d
 ```
 
