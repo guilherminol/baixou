@@ -166,9 +166,9 @@ Perdeu a senha (ou a sessão) do administrador? O comando abaixo roda **dentro
 do container** e não precisa de acesso à API:
 
 ```bash
-docker compose exec web python -m baixou.web.reset_password
+docker compose -f compose.install.yaml exec web python -m baixou.web.reset_password
 # para um usuário diferente do padrão `admin`:
-docker compose exec web python -m baixou.web.reset_password --username outro
+docker compose -f compose.install.yaml exec web python -m baixou.web.reset_password --username outro
 ```
 
 O comando pede a senha nova duas vezes (sem eco no terminal — a senha nunca
