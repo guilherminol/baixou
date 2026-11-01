@@ -30,7 +30,7 @@
 #
 # Todas as actions pinadas (T-06-SC): majors correntes da documentação do
 # Docker (setup-qemu-action@v4, setup-buildx-action@v4, login-action@v4,
-# build-push-action@v7) e checkout@v4 — sem @main/@master. Sem GitHub Release
+# build-push-action@v7) e checkout@v7 — sem @main/@master. Sem GitHub Release
 # com notas (ideia deferred no 06-CONTEXT) e sem cache type=gha: workflow
 # mínimo e legível.
 
