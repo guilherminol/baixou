@@ -36,6 +36,7 @@ import os
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -329,6 +330,88 @@ def test_poison_date_file_never_turns_night_into_backup_failed(backup_env, tmp_p
     assert f"baixou-{_BACKUP_DAY}.db" in nomes  # a noite completou: backup nasceu
     assert "baixou-2026-13-99.db" in nomes  # veneno: INTOCADO
     assert "baixou-2026-10-20.db" not in nomes  # legítimo vencido: apagado
+    saida = capsys.readouterr().out
+    assert "backup_completed" in saida
+    assert "backup_failed" not in saida
+
+
+def test_retention_survives_failing_unlink_and_counts_only_removed(
+    tmp_path, monkeypatch
+):
+    """Vencido que NÃO pode ser apagado: intocado, a retenção segue e conta 1 (WR-08).
+
+    O unlink do ``baixou-2026-10-20.db`` (4 dias > KEEP=2) é sabotado por
+    monkeypatch de ``Path.unlink`` por NOME (PermissionError) — injeção de
+    falha multiplataforma no precedente do 06-06: bits só-leitura e bloqueio
+    de arquivo divergem entre Windows e Linux. Sem o fix, a PermissionError
+    propaga do ``_prune_old_backups``; com o fix (molde
+    ``_prune_attempt_markers``), a varredura SEGUE em qualquer ordem de
+    iterdir, só o legítimo vencido entra na conta e o não-apagável fica
+    intocado. O wrapper aceita ``missing_ok`` como keyword: a limpeza de
+    marcadores chama ``unlink(missing_ok=True)`` e NÃO pode ser afetada.
+    """
+    from baixou.worker import backup
+
+    pasta = tmp_path / "backups"
+    pasta.mkdir()
+    protegido = pasta / "baixou-2026-10-20.db"  # vencido: unlink DELE levanta
+    protegido.write_bytes(b"sqlite de teste")
+    vencido = pasta / "baixou-2026-10-19.db"  # 5 dias — vencido, unlink normal
+    vencido.write_bytes(b"sqlite de teste")
+    (pasta / "baixou-2026-10-23.db").write_bytes(b"sqlite de teste")  # borda: fica
+
+    unlink_real = Path.unlink
+
+    def unlink_sabotado(self, *, missing_ok: bool = False):
+        if self.name == protegido.name:
+            raise PermissionError(13, "simulado: arquivo de outro dono")
+        return unlink_real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink_sabotado)
+
+    apagados = backup._prune_old_backups(pasta, date(2026, 10, 24), 2)
+
+    assert apagados == 1  # só o 10-19 entrou na conta (remoção REAL)
+    assert not vencido.exists()  # legítimo vencido: APAGADO
+    assert protegido.exists()  # não-apagável: INTOCADO
+    assert (pasta / "baixou-2026-10-23.db").exists()  # borda inclusiva: FICA
+
+
+def test_undeletable_old_file_never_turns_night_into_backup_failed(
+    backup_env, tmp_path, capsys, monkeypatch
+):
+    """Noite com vencido não-apagável na pasta: backup_completed, nunca backup_failed.
+
+    Molde do teste do veneno de data impossível (WR-05) — MESMA família de
+    falso ``backup_failed``, agora com gatilho no unlink (WR-08): o vencido
+    existe ANTES da noite e só o unlink DELE levanta PermissionError. Sem o
+    fix, o OSError estoura DEPOIS do VACUUM INTO — ``backup_completed`` nunca
+    sai, a noite entra no contador e fabrica o aviso falso de "noites
+    seguidas". Com o fix, a noite completa: backup nasce e o não-apagável
+    fica intocado.
+    """
+    from baixou.worker import backup
+
+    settings, conn = backup_env
+    pasta = tmp_path / "backups"
+    pasta.mkdir()
+    protegido = pasta / "baixou-2026-10-20.db"  # vencido: 4 dias > KEEP=2
+    protegido.write_bytes(b"sqlite de teste")
+
+    unlink_real = Path.unlink
+
+    def unlink_sabotado(self, *, missing_ok: bool = False):
+        if self.name == protegido.name:
+            raise PermissionError(13, "simulado: arquivo de outro dono")
+        return unlink_real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink_sabotado)
+
+    backup.run_backup(conn, replace(settings, backup_dir=pasta, backup_keep=2), _AFTER_HOUR)
+
+    nomes = {p.name for p in pasta.iterdir()}
+    assert f"baixou-{_BACKUP_DAY}.db" in nomes  # a noite completou: backup nasceu
+    assert protegido.exists()  # vencido não-apagável: INTOCADO
     saida = capsys.readouterr().out
     assert "backup_completed" in saida
     assert "backup_failed" not in saida
