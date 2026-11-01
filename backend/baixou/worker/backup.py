@@ -265,7 +265,10 @@ def _prune_old_backups(backup_dir: Path, today_local: date, keep_days: int) -> i
     fica, precedente D-10/D-12) é apagado; nomes fora do padrão (cópia manual,
     .env no mesmo diretório) e nomes com data IMPOSSÍVEL que o regex deixa
     passar (fromisoformat guardado, molde de ``_prune_attempt_markers``) ficam
-    INTOCADOS. Devolve quantos apagou.
+    INTOCADOS. Vencido que não pode ser apagado (OSError — outro dono, montagem
+    só-leitura, antivírus) fica intocado e a varredura segue — falha de apagar
+    não vira ``backup_failed`` nem entra na conta de noites (WR-08). Devolve
+    quantos apagou DE VERDADE.
     """
     pruned = 0
     for candidate in backup_dir.iterdir():
@@ -281,8 +284,15 @@ def _prune_old_backups(backup_dir: Path, today_local: date, keep_days: int) -> i
         except ValueError:
             continue  # data impossível no nome: não é arquivo datado nosso — intocado
         if (today_local - file_date).days > keep_days:
-            candidate.unlink()
-            pruned += 1
+            # Retenção é higiene de disco (T-06-10), não estado de segurança:
+            # vencido que NÃO pode ser apagado fica intocado e a varredura
+            # segue — no molde de _prune_attempt_markers, falha de apagar não
+            # vira backup_failed nem entra na conta de noites (WR-08).
+            try:
+                candidate.unlink()
+            except OSError:
+                continue  # limpeza falhada: silêncio — nunca entra na conta de falhas
+            pruned += 1  # conta SÓ remoção real — nunca o que "devia" ser apagado
     return pruned
 
 

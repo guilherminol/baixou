@@ -335,9 +335,7 @@ def test_poison_date_file_never_turns_night_into_backup_failed(backup_env, tmp_p
     assert "backup_failed" not in saida
 
 
-def test_retention_survives_failing_unlink_and_counts_only_removed(
-    tmp_path, monkeypatch
-):
+def test_retention_survives_failing_unlink_and_counts_only_removed(tmp_path, monkeypatch):
     """Vencido que NÃO pode ser apagado: intocado, a retenção segue e conta 1 (WR-08).
 
     O unlink do ``baixou-2026-10-20.db`` (4 dias > KEEP=2) é sabotado por
