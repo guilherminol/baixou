@@ -23,6 +23,10 @@ services:
       # internet é papel de um proxy HTTPS na rede doméstica, nunca do compose.
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
+    # SIGTERM com graça de 5 m: requisições em voo (o scrypt do login)
+    # terminam antes do SIGKILL — teto, não espera: o shutdown do uvicorn sai
+    # em sub-segundo.
+    stop_grace_period: 5m
     env_file:
       # OPCIONAL: sem o arquivo a subida segue verde (zero-config); com um
       # .env ao lado, os canais e o BRAPI_TOKEN entram sem editar este arquivo.
@@ -40,6 +44,12 @@ services:
     image: ghcr.io/guilherminol/baixou:latest
     command: ["python", "-m", "baixou.worker.main"]
     restart: unless-stopped
+    # SIGTERM com graça de 5 m (WR-07): a rodada termina inteira e o lock é
+    # liberado no finally (design do main.py) — sem isso o SIGKILL aos 10 s
+    # deixa lock fresco que bloqueia o container recriado (pull && up -d) até
+    # o TTL (2× POLL_MINUTES). Teto da pior rodada (brapi serial, 10 s por
+    # chamada), não espera — acima dele o TTL domina o canto SIGKILL.
+    stop_grace_period: 5m
     env_file:
       # Mesmo .env opcional do web — uma única fonte de configuração.
       - path: .env
