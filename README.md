@@ -257,6 +257,19 @@ log, mensagem de erro ou exceção. Qualquer nome aceita o sufixo (ex.:
 | `BACKUP_KEEP` | `7` | Dias de retenção dos backups noturnos |
 | `BACKUP_HOUR` | `4` | Hora local (fuso `TZ_MARKET`) a partir da qual o backup do dia vale (0–23) |
 | `BACKUP_FAIL_NOTIFY_AFTER` | `2` | Noites seguidas de falha do backup até o aviso no canal |
+| `COOKIE_SECURE` | `auto` | Cookie `Secure` da sessão — `auto`, `sim` ou `nao`; use `nao` no acesso por `http://IP:porta`, onde o navegador descarta cookie Secure (e o login falha sem explicação) |
+| `NTFY_TOKEN` | *(vazio)* | Token de acesso ao servidor ntfy próprio — opcional; definido, exige o `NTFY_TOPIC` |
+| `NTFY_URL` | `https://ntfy.sh` | Endereço do servidor ntfy (`http://` ou `https://`) |
+| `NOTIFY_CLICK_URL` | *(vazio)* | URL que abre ao tocar no aviso — a única variável em que vazia definida também é válida |
+| `B3_EVERY_N_ROUNDS` | `1` | Consulta a B3 a cada N rodadas do worker (inteiro ≥ 1) |
+| `BRAPI_MONTHLY_LIMIT` | `15000` | Limite mensal de chamadas à brapi (inteiro > 0) |
+| `FAIL_NOTIFY_AFTER` | `3` | Rodadas seguidas com erro numa fonte até o aviso no canal — distinta de `BACKUP_FAIL_NOTIFY_AFTER`, que trata do backup |
+| `REARM_PCT` | `1` | Margem % acima do alvo para rearmar o alerta depois do cruzamento |
+| `SUSPECT_PCT` | `20` | Variação do dia (%) que acrescenta a nota de conferência ao aviso |
+| `STALE_MINUTES_B3` | `75` | Minutos até a cotação da B3 virar "desatualizada" na página |
+| `STALE_MINUTES_CRYPTO` | `30` | Minutos até a cotação de cripto virar "desatualizada" na página |
+
+Os segredos de canal — `BRAPI_TOKEN` e os pares `TELEGRAM_TOKEN`/`TELEGRAM_CHAT_ID` e `NTFY_TOPIC` (com NTFY_TOKEN opcional) — têm exemplo pronto na seção **Para alertar de verdade**; a tabela não duplica segredos.
 
 ## Estrutura
 
