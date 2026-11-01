@@ -81,9 +81,9 @@ exige_inteiro() {
   fi
 }
 
-# Container do serviço do compose (web/worker) — nomes reais via docker compose ps -q.
+# Container do serviço do compose (web/worker) — projeto resolvido PELO ARQUIVO nomeado (-f compose.install.yaml), o mesmo que o cabeçalho (linhas 22-24) exige na pasta corrente.
 id_do_servico() {
-  docker compose ps -q "$1" 2>/dev/null | head -n 1 || true
+  docker compose -f compose.install.yaml ps -q "$1" 2>/dev/null | head -n 1 || true
 }
 
 CID_WEB="$(id_do_servico web)"
