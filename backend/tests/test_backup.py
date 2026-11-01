@@ -35,7 +35,7 @@ import json
 import os
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -273,6 +273,67 @@ def test_retention_by_name_keeps_recent_and_spares_foreign_files(backup_env, tmp
     assert ".env" in nomes
     saida = capsys.readouterr().out
     assert "backup_pruned" in saida
+
+
+def test_retention_skips_impossible_date_in_name_and_keeps_pruning(tmp_path):
+    """Nome que casa no regex com data IMPOSSÍVEL: intocado, a retenção segue (WR-05).
+
+    ``baixou-2026-13-99.db`` casa com ``baixou-YYYY-MM-DD.db`` e o mês 13 não
+    existe — sem guard, o ``date.fromisoformat`` estoura ValueError no meio
+    do iterdir e a retenção inteira aborta. MESMO molde de
+    ``_prune_attempt_markers``: nome com data inválida não é arquivo datado
+    nosso — fica intocado como os fora do padrão, e os legítimos seguem a
+    conta (borda inclusiva: 1 dia fica; 4 dias > KEEP=2 apaga).
+    """
+    from baixou.worker import backup
+
+    pasta = tmp_path / "backups"
+    pasta.mkdir()
+    vencido = pasta / "baixou-2026-10-20.db"  # legítimo vencido: 4 dias > KEEP=2
+    vencido.write_bytes(b"sqlite de teste")
+    (pasta / "baixou-2026-10-23.db").write_bytes(b"sqlite de teste")  # 1 dia: borda — fica
+    (pasta / "baixou-2026-13-99.db").write_bytes(b"veneno: mes 13")  # data impossível
+    (pasta / "copia-manual.db").write_bytes(b"fora do padrao")  # fora do padrão
+
+    apagados = backup._prune_old_backups(pasta, date(2026, 10, 24), 2)
+
+    assert apagados == 1  # só o legítimo vencido entrou na conta
+    assert not vencido.exists()  # legítimo vencido: APAGADO
+    assert (pasta / "baixou-2026-13-99.db").exists()  # data impossível: INTOCADO
+    assert (pasta / "baixou-2026-10-23.db").exists()  # borda inclusiva: FICA
+    assert (pasta / "copia-manual.db").exists()  # fora do padrão: INTOCADO
+
+
+def test_poison_date_file_never_turns_night_into_backup_failed(backup_env, tmp_path, capsys):
+    """Noite com o veneno de data impossível na pasta: backup_completed, nunca backup_failed.
+
+    Molde do teste de retenção (fixture backup_env + replace, KEEP=2): o
+    ``baixou-2026-13-99.db`` existe ANTES da noite. Sem o guard o ValueError
+    estoura DEPOIS do VACUUM INTO — backup_completed nunca sai, a noite entra
+    no contador e fabrica o aviso falso de "noites seguidas" (WR-05,
+    reproduzido em 31/10). Com o guard a noite completa: backup nasce, o
+    legítimo vencido é apagado e o veneno fica intocado.
+    """
+    from baixou.worker import backup
+
+    settings, conn = backup_env
+    pasta = tmp_path / "backups"
+    pasta.mkdir()
+    (pasta / "baixou-2026-13-99.db").write_bytes(b"veneno: mes 13")
+    vencido = pasta / "baixou-2026-10-20.db"  # legítimo vencido: 4 dias > KEEP=2
+    vencido.write_bytes(b"sqlite de teste")
+
+    backup.run_backup(
+        conn, replace(settings, backup_dir=pasta, backup_keep=2), _AFTER_HOUR
+    )
+
+    nomes = {p.name for p in pasta.iterdir()}
+    assert f"baixou-{_BACKUP_DAY}.db" in nomes  # a noite completou: backup nasceu
+    assert "baixou-2026-13-99.db" in nomes  # veneno: INTOCADO
+    assert "baixou-2026-10-20.db" not in nomes  # legítimo vencido: apagado
+    saida = capsys.readouterr().out
+    assert "backup_completed" in saida
+    assert "backup_failed" not in saida
 
 
 def test_vacuum_failure_logs_kind_counts_and_never_raises(backup_env, tmp_path, capsys):
