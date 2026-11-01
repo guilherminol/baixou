@@ -85,7 +85,13 @@ chamada); padrão sistemático de diferença é ajuste antes da troca (seção 5
 ## 4. Medir a memória
 
 A medição é um comando — `scripts/medir-memoria.sh` — no servidor de
-referência, na pasta onde o `compose.install.yaml` está:
+referência, na pasta onde o `compose.install.yaml` está. O script NÃO faz
+parte da instalação de 2 comandos: baixe-o do repositório pela MESMA origem
+do compose (raw na master), mantendo o caminho `scripts/`:
+
+```bash
+mkdir -p scripts && curl -o scripts/medir-memoria.sh https://raw.githubusercontent.com/guilherminol/baixou/master/scripts/medir-memoria.sh
+```
 
 ```bash
 bash scripts/medir-memoria.sh --antes    # antes da troca (lado novo em paralelo)
