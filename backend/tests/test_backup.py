@@ -323,9 +323,7 @@ def test_poison_date_file_never_turns_night_into_backup_failed(backup_env, tmp_p
     vencido = pasta / "baixou-2026-10-20.db"  # legítimo vencido: 4 dias > KEEP=2
     vencido.write_bytes(b"sqlite de teste")
 
-    backup.run_backup(
-        conn, replace(settings, backup_dir=pasta, backup_keep=2), _AFTER_HOUR
-    )
+    backup.run_backup(conn, replace(settings, backup_dir=pasta, backup_keep=2), _AFTER_HOUR)
 
     nomes = {p.name for p in pasta.iterdir()}
     assert f"baixou-{_BACKUP_DAY}.db" in nomes  # a noite completou: backup nasceu

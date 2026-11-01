@@ -263,7 +263,9 @@ def _prune_old_backups(backup_dir: Path, today_local: date, keep_days: int) -> i
     Só arquivos que casam com ``baixou-YYYY-MM-DD.db`` entram na conta: o nome
     mais antigo que ``keep_days`` dias (borda INCLUSIVA — exatamente no limite
     fica, precedente D-10/D-12) é apagado; nomes fora do padrão (cópia manual,
-    .env no mesmo diretório) ficam INTOCADOS. Devolve quantos apagou.
+    .env no mesmo diretório) e nomes com data IMPOSSÍVEL que o regex deixa
+    passar (fromisoformat guardado, molde de ``_prune_attempt_markers``) ficam
+    INTOCADOS. Devolve quantos apagou.
     """
     pruned = 0
     for candidate in backup_dir.iterdir():
@@ -272,7 +274,12 @@ def _prune_old_backups(backup_dir: Path, today_local: date, keep_days: int) -> i
         matched = _BACKUP_NAME_RE.match(candidate.name)
         if matched is None:
             continue  # fora do padrão: não é nosso — intocado (D-06)
-        file_date = date.fromisoformat(matched.group(1))
+        # Casar no regex não torna o nome uma data válida (mês 13 estoura o
+        # fromisoformat — WR-05): guard no molde de _prune_attempt_markers.
+        try:
+            file_date = date.fromisoformat(matched.group(1))
+        except ValueError:
+            continue  # data impossível no nome: não é arquivo datado nosso — intocado
         if (today_local - file_date).days > keep_days:
             candidate.unlink()
             pruned += 1
