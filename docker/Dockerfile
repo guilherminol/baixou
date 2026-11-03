@@ -37,6 +37,29 @@ COPY --from=frontend /app/frontend/dist /app/frontend/dist
 # partir da qual o uv constrói a wheel neste build.
 RUN uv sync --frozen --no-dev --no-editable
 
+# SQLite 3.51.3 do amalgamation oficial: a base python:3.14-slim (trixie) traz
+# libsqlite3 3.46.1, dentro da faixa do bug de corrupção em WAL corrigido na
+# 3.51.3 (#13) — é o caso exato que o cheque de subida em db.py existe para
+# pegar. O _sqlite3 do CPython linka o soname libsqlite3.so.0: com ldconfig,
+# /usr/local/lib passa a fornecer a versão nova em runtime, sem reconstruir o
+# Python — e o fix fica imune a drift da base (trixie → próxima estável).
+# Build deps, arquivo estático e listas do apt morrem na MESMA RUN (a imagem
+# continua slim); o CLI sqlite3 fica — é quem depura o banco no volume.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential wget \
+    && wget -q https://sqlite.org/2026/sqlite-autoconf-3510300.tar.gz \
+    && tar xzf sqlite-autoconf-3510300.tar.gz \
+    && cd sqlite-autoconf-3510300 \
+    && ./configure --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && cd .. \
+    && rm -rf sqlite-autoconf-3510300 sqlite-autoconf-3510300.tar.gz \
+    && rm -f /usr/local/lib/libsqlite3.a \
+    && ldconfig \
+    && apt-get purge -y --auto-remove build-essential wget libidn2-0 libunistring5 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Usuário dedicado não-root; /data é o volume compartilhado por web e worker.
 RUN useradd --create-home baixou \
     && mkdir -p /data \
