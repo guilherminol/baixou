@@ -1,7 +1,7 @@
 """POST /api/notifiers/{canal}/test (plano 05-01, D-05, NOTIF-02): aviso real sem gravação.
 
 Sem rede real (molde test_watch_api.py: MockTransport na emenda
-``notifier_test._cliente``) e com banco real em tmp_path: admin criado e
+``notifier_routes._cliente``) e com banco real em tmp_path: admin criado e
 logado pelas PRÓPRIAS rotas de auth. O canal simulado aceita/recusa/falha de
 transporte — o MÓDULO do canal converte em NotificationResult e o teste prova
 o MAPEAMENTO (falha de entrega é RESULTADO, nunca erro HTTP — D-05). Zero
@@ -104,8 +104,8 @@ def _snapshot(settings) -> dict[str, list[tuple]]:
 
 
 def _injeta_cliente(monkeypatch, handler) -> list[httpx.Request]:
-    """Substitui ``notifier_test._cliente`` por MockTransport (emenda de teste)."""
-    from baixou.web import notifier_test
+    """Substitui ``notifier_routes._cliente`` por MockTransport (emenda de teste)."""
+    from baixou.web import notifier_routes
 
     requisicoes: list[httpx.Request] = []
 
@@ -114,7 +114,7 @@ def _injeta_cliente(monkeypatch, handler) -> list[httpx.Request]:
         return handler(request)
 
     monkeypatch.setattr(
-        notifier_test,
+        notifier_routes,
         "_cliente",
         lambda: httpx.Client(transport=httpx.MockTransport(recording)),
     )
@@ -262,8 +262,8 @@ def test_duas_chamadas_concorrentes_respondem_e_nada_gravam(settings, capsys, mo
 
 def test_modulo_do_endpoint_nao_tem_escrita_de_banco():
     """Backstop estático do NOTIF-02: o módulo não importa connect/write_tx nem grava SQL."""
-    from baixou.web import notifier_test
+    from baixou.web import notifier_routes
 
-    fonte = inspect.getsource(notifier_test)
+    fonte = inspect.getsource(notifier_routes)
     for proibido in ("write_tx", "INSERT INTO", "UPDATE ", "DELETE FROM"):
         assert proibido not in fonte, f"endpoint de teste de canal não pode gravar: {proibido}"
