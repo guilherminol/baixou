@@ -84,6 +84,22 @@ def test_fetch_one_with_token_sends_it_as_query_param():
     assert requests[0].url.params["token"] == "tok-123"
 
 
+def test_fetch_one_iso_string_market_time_is_accepted():
+    """A brapi trocou regularMarketTime de epoch para ISO 8601 em 03/11/2026 —
+    payload real capturado no dia deve parsear sem falhar."""
+
+    payload = _happy_payload()
+    payload["results"][0]["regularMarketTime"] = "2026-11-03T13:45:30.000Z"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _mock_client(handler, []) as client:
+        result = brapi.fetch_one(client, "PETR4", "")
+
+    assert result.price_at == "2026-11-03T13:45:30Z"  # ISO com fuso → UTC do banco
+
+
 @pytest.mark.parametrize("payload", [{"results": []}, {"foo": "bar"}])
 def test_fetch_one_results_empty_or_missing_is_symbol_not_found(payload):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -100,6 +116,14 @@ def test_fetch_one_results_empty_or_missing_is_symbol_not_found(payload):
         [{"symbol": "PETR4"}],  # array na raiz
         {"results": [{"symbol": "PETR4"}]},  # sem regularMarketPrice/regularMarketTime
         {"results": [{"regularMarketPrice": "38,25"}]},  # preço não numérico
+        {
+            "results": [{"regularMarketPrice": 38.25, "regularMarketTime": "ontem"}]
+        },  # string de tempo não ISO
+        {
+            "results": [
+                {"regularMarketPrice": 38.25, "regularMarketTime": "2026-11-03T13:45:30"}
+            ]
+        },  # ISO sem fuso: viraria UTC errado, rejeita
     ],
 )
 def test_fetch_one_unexpected_shape_is_typed_unexpected(payload):

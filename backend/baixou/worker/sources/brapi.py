@@ -14,6 +14,8 @@ T-02-04).
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 
 from baixou.worker.sources.base import (
@@ -36,6 +38,24 @@ _RATE_LIMIT_STATUS = frozenset({429})
 def _is_number(value: object) -> bool:
     """Aceita int/float e rejeita bool (subclasse de int) — shape estrito."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _epoch_from_market_time(value: object) -> float | None:
+    """Epoch do regularMarketTime: número (contrato antigo) ou ISO 8601 com fuso.
+
+    A brapi trocou o tipo do campo de epoch para string ISO 8601 em 03/11/2026 —
+    aceitar os dois formatos mantém as duas respostas válidas. String sem fuso
+    é rejeitada: viraria timestamp errado na conversão para UTC.
+    """
+    if _is_number(value):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return None if parsed.tzinfo is None else parsed.timestamp()
+    return None
 
 
 def _raise_for_status(response: httpx.Response, symbol: str) -> None:
@@ -88,10 +108,12 @@ def fetch_one(client: httpx.Client, symbol: str, token: str) -> QuoteResult:
     if not isinstance(quote, dict):
         raise UnexpectedResponseError("shape inesperado do resultado da brapi", symbol=symbol)
     price = quote.get("regularMarketPrice")
-    epoch = quote.get("regularMarketTime")
-    if not _is_number(price) or not _is_number(epoch):
+    if not _is_number(price):
+        raise UnexpectedResponseError("regularMarketPrice ausente ou não numérico", symbol=symbol)
+    epoch = _epoch_from_market_time(quote.get("regularMarketTime"))
+    if epoch is None:
         raise UnexpectedResponseError(
-            "regularMarketPrice/regularMarketTime ausentes ou não numéricos", symbol=symbol
+            "regularMarketTime nem epoch nem ISO 8601 com fuso", symbol=symbol
         )
     change_pct = quote.get("regularMarketChangePercent")
     if change_pct is not None and not _is_number(change_pct):
